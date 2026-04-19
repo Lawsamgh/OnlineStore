@@ -1,0 +1,188 @@
+@import "tailwindcss";
+
+body {
+  margin: 0;
+  min-height: 100svh;
+}
+
+/* Marketing / shell motion — respects prefers-reduced-motion */
+@keyframes ui-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes ui-blur-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+    filter: blur(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    filter: blur(0);
+  }
+}
+
+@keyframes ui-float-blob {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+    opacity: 1;
+  }
+  40% {
+    transform: translate(-12px, 10px) scale(1.04);
+    opacity: 0.95;
+  }
+  70% {
+    transform: translate(8px, -6px) scale(0.98);
+    opacity: 1;
+  }
+}
+
+.ui-anim-fade-up {
+  animation: ui-fade-up 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ui-anim-blur-in {
+  animation: ui-blur-in 0.85s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.ui-anim-float {
+  animation: ui-float-blob 18s ease-in-out infinite;
+}
+
+.ui-delay-0 {
+  animation-delay: 0ms;
+}
+.ui-delay-1 {
+  animation-delay: 70ms;
+}
+.ui-delay-2 {
+  animation-delay: 140ms;
+}
+.ui-delay-3 {
+  animation-delay: 210ms;
+}
+.ui-delay-4 {
+  animation-delay: 280ms;
+}
+.ui-delay-5 {
+  animation-delay: 350ms;
+}
+.ui-delay-6 {
+  animation-delay: 420ms;
+}
+
+.ui-reveal {
+  opacity: 0;
+  transform: translateY(22px) scale(0.985);
+  transition:
+    opacity 0.65s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.65s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform;
+}
+
+.ui-reveal.is-in {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  will-change: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-anim-fade-up,
+  .ui-anim-blur-in,
+  .ui-anim-float {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+    filter: none !important;
+  }
+
+  .ui-reveal {
+    opacity: 1;
+    transform: none;
+    filter: none;
+    transition: none;
+    will-change: auto;
+  }
+}
+
+/* Skeleton shimmer — used by UiSkeleton */
+@keyframes ui-skel-wave {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
+.ui-skel {
+  display: block;
+  background: linear-gradient(
+    105deg,
+    rgb(228 228 231 / 0.72) 0%,
+    rgb(244 244 245 / 0.95) 42%,
+    rgb(228 228 231 / 0.72) 84%
+  );
+  background-size: 200% 100%;
+  animation: ui-skel-wave 1.35s ease-in-out infinite;
+}
+
+.ui-skel-muted {
+  background: linear-gradient(
+    105deg,
+    rgb(226 232 240 / 0.75) 0%,
+    rgb(241 245 249 / 0.95) 42%,
+    rgb(226 232 240 / 0.75) 84%
+  );
+  background-size: 200% 100%;
+  animation: ui-skel-wave 1.35s ease-in-out infinite;
+}
+
+.ui-skel-delay-1 {
+  animation-delay: 90ms;
+}
+.ui-skel-delay-2 {
+  animation-delay: 180ms;
+}
+.ui-skel-delay-3 {
+  animation-delay: 270ms;
+}
+.ui-skel-delay-4 {
+  animation-delay: 360ms;
+}
+.ui-skel-delay-5 {
+  animation-delay: 450ms;
+}
+.ui-skel-delay-6 {
+  animation-delay: 540ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ui-skel,
+  .ui-skel-muted {
+    animation: none;
+    background: rgb(228 228 231 / 0.85);
+  }
+
+  .ui-skel-muted {
+    background: rgb(226 232 240 / 0.9);
+  }
+
+  .ui-skel-delay-1,
+  .ui-skel-delay-2,
+  .ui-skel-delay-3,
+  .ui-skel-delay-4,
+  .ui-skel-delay-5,
+  .ui-skel-delay-6 {
+    animation-delay: 0ms;
+  }
+}
