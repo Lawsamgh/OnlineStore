@@ -2,13 +2,14 @@
 import {
   computed,
   defineAsyncComponent,
+  nextTick,
   onMounted,
   onUnmounted,
   ref,
   watch,
   watchEffect,
 } from "vue";
-import { RouterLink } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 import { storeToRefs } from "pinia";
 import { getSupabaseBrowser, isSupabaseConfigured } from "../../lib/supabase";
 import { useAuthStore } from "../../stores/auth";
@@ -16,7 +17,7 @@ import { useUiStore } from "../../stores/ui";
 import { useToastStore } from "../../stores/toast";
 import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefresh";
 import { planLabelFromSignupId } from "../../lib/planLabel";
-import { PRICING_PLANS } from "../../constants/pricingPlans";
+import { formatGhsWhole, PRICING_PLANS } from "../../constants/pricingPlans";
 import {
   PLAN_FEATURE_LIMITS,
   resolvePricingPlanId,
@@ -31,8 +32,12 @@ import {
   saveKpiHistory,
   type KpiSample,
 } from "../../lib/dashboardKpiHistory";
+import { formatFunctionsInvokeError } from "../../lib/formatFunctionsInvokeError";
+import { refreshSessionForEdgeFunctions } from "../../lib/refreshSessionForEdgeFunctions";
 
 const auth = useAuthStore();
+const router = useRouter();
+const route = useRoute();
 const { sessionUserId } = storeToRefs(auth);
 const toast = useToastStore();
 const ui = useUiStore();
@@ -76,6 +81,268 @@ const isSellerPlanUnset = computed(() => {
 });
 
 const upgradePricingLink = { name: "home" as const, hash: "#pricing" };
+
+const planPickerOpen = ref(false);
+
+function openPlanPicker() {
+  planPickerOpen.value = true;
+}
+
+function closePlanPicker() {
+  planPickerOpen.value = false;
+}
+
+const paystackPlanVerifyBusy = ref(false);
+
+function paystackReturnReference(): string {
+  const raw = route.query.reference ?? route.query.trxref;
+  const one = Array.isArray(raw) ? raw[0] : raw;
+  return typeof one === "string" ? one.trim() : "";
+}
+
+/** After Paystack redirects back with `reference` / `trxref`, confirm payment and unlock the tier. */
+async function consumePaystackPlanReturn() {
+  const reference = paystackReturnReference();
+  if (!reference.startsWith("plan_")) return;
+  if (!isSupabaseConfigured() || !sessionUserId.value) return;
+  if (paystackPlanVerifyBusy.value) return;
+
+  const lockKey = `paystack_plan_verify_${reference}`;
+  if (sessionStorage.getItem(lockKey) === "1") {
+    await router.replace({ name: "dashboard", query: {} });
+    return;
+  }
+
+  paystackPlanVerifyBusy.value = true;
+  try {
+    const sb = getSupabaseBrowser();
+    const prep = await refreshSessionForEdgeFunctions(sb);
+    if (!prep.ok) {
+      toast.error(prep.message);
+      await router.replace({ name: "dashboard", query: {} });
+      return;
+    }
+    auth.syncSession(prep.session);
+    const { data, error } = await sb.functions.invoke("paystack-verify-plan", {
+      body: { reference },
+      headers: prep.headers,
+    });
+    if (error) {
+      const bodyErr =
+        data && typeof data === "object" && "error" in data
+          ? String((data as { error?: unknown }).error ?? "")
+          : "";
+      toast.error(
+        bodyErr ||
+          formatFunctionsInvokeError(error, "paystack-verify-plan") ||
+          "Could not verify payment.",
+      );
+      await router.replace({ name: "dashboard", query: {} });
+      return;
+    }
+    sessionStorage.setItem(lockKey, "1");
+    const { data: refData, error: refErr } = await sb.auth.refreshSession();
+    if (!refErr && refData.session) auth.syncSession(refData.session);
+    else await auth.refreshSessionFromSupabase();
+    toast.success(
+      "Your seller account plan is active. Each shop you own is updated with the same plan for platform billing records.",
+    );
+    await router.replace({ name: "dashboard", query: {} });
+  } finally {
+    paystackPlanVerifyBusy.value = false;
+  }
+}
+
+async function choosePlanAndDismiss(planId: string) {
+  const plan = PRICING_PLANS.find((p) => p.id === planId);
+  if (!plan) return;
+
+  closePlanPicker();
+  await nextTick();
+
+  if (!isSupabaseConfigured()) {
+    toast.error("Sign in is required to change your plan.");
+    return;
+  }
+  if (!auth.user) {
+    toast.error("Sign in required.");
+    return;
+  }
+
+  const sb = getSupabaseBrowser();
+
+  if (plan.id === "free") {
+    const { error } = await sb.auth.updateUser({
+      data: { ...auth.user.user_metadata, signup_plan: "free" },
+    });
+    if (error) {
+      toast.error(error.message);
+      return;
+    }
+    await auth.refreshSessionFromSupabase();
+    toast.success("You are on the Free plan.");
+    await router.replace({ name: "dashboard", query: {} });
+    return;
+  }
+
+  if (plan.monthlyGhs <= 0) return;
+
+  const prep = await refreshSessionForEdgeFunctions(sb);
+  if (!prep.ok) {
+    toast.error(prep.message);
+    return;
+  }
+  auth.syncSession(prep.session);
+  const { data, error } = await sb.functions.invoke("paystack-init", {
+    body: { plan_id: plan.id },
+    headers: prep.headers,
+  });
+  if (error) {
+    const bodyErr =
+      data && typeof data === "object" && "error" in data
+        ? String((data as { error?: unknown }).error ?? "")
+        : "";
+    toast.error(
+      bodyErr ||
+        formatFunctionsInvokeError(error, "paystack-init") ||
+        "Could not start checkout.",
+    );
+    return;
+  }
+  const url =
+    data && typeof data === "object" && "authorization_url" in data
+      ? String((data as { authorization_url?: unknown }).authorization_url ?? "")
+      : "";
+  if (!url) {
+    toast.error("Could not start checkout.");
+    return;
+  }
+  window.location.assign(url);
+}
+
+watch(
+  () =>
+    [route.query.reference, route.query.trxref, sessionUserId.value] as const,
+  () => {
+    void consumePaystackPlanReturn();
+  },
+  { immediate: true },
+);
+
+/** Only when `signup_plan` is set — avoids marking Free as “current” when plan is “Not set”. */
+const currentPlanIdForPicker = computed(() => {
+  const raw = auth.user?.user_metadata?.signup_plan;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  return resolvePricingPlanId(raw);
+});
+
+const planSlideIndex = ref(0);
+const planSlideDragStartX = ref<number | null>(null);
+
+const planSlideCount = PRICING_PLANS.length;
+
+const activePlanSlide = computed(
+  () => PRICING_PLANS[planSlideIndex.value] ?? PRICING_PLANS[0]!,
+);
+
+/**
+ * Track is `n × 100%` of the viewport; each slide is `100/n %` of the track.
+ * `translateX` % is relative to the track, so `-index × (100/n) %` moves one slide.
+ */
+const planSlideTransformPct = computed(
+  () => (100 / planSlideCount) * planSlideIndex.value,
+);
+
+const planSlideTrackStyle = computed(() => ({
+  width: `${planSlideCount * 100}%`,
+  transform: `translate3d(-${planSlideTransformPct.value}%, 0, 0)`,
+}));
+
+const planSlideItemWidthPct = 100 / planSlideCount;
+
+function syncPlanSlideToContext() {
+  const cur = currentPlanIdForPicker.value;
+  if (cur) {
+    const idx = PRICING_PLANS.findIndex((p) => p.id === cur);
+    planSlideIndex.value = idx >= 0 ? idx : 0;
+    return;
+  }
+  const hi = PRICING_PLANS.findIndex((p) => p.highlighted);
+  planSlideIndex.value = hi >= 0 ? hi : 0;
+}
+
+function planSlideGo(i: number) {
+  planSlideIndex.value = Math.max(0, Math.min(planSlideCount - 1, i));
+}
+
+function planSlideNext() {
+  planSlideGo(planSlideIndex.value + 1);
+}
+
+function planSlidePrev() {
+  planSlideGo(planSlideIndex.value - 1);
+}
+
+function onPlanSlidePointerDown(e: PointerEvent) {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  const t = e.target as HTMLElement | null;
+  // Clicks on "Choose …" / dots / links must not run swipe capture — capture steals
+  // pointerup from the button and the click often never fires (Paystack never starts).
+  if (t?.closest("button, a, input, select, textarea")) return;
+  planSlideDragStartX.value = e.clientX;
+  try {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  } catch {
+    /* older browsers */
+  }
+}
+
+function onPlanSlidePointerUp(e: PointerEvent) {
+  const start = planSlideDragStartX.value;
+  planSlideDragStartX.value = null;
+  try {
+    (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+  } catch {
+    /* noop */
+  }
+  if (start == null) return;
+  const dx = e.clientX - start;
+  if (dx < -40) planSlideNext();
+  else if (dx > 40) planSlidePrev();
+}
+
+function onPlanSlidePointerCancel() {
+  planSlideDragStartX.value = null;
+}
+
+function onPlanPickerDocKeydown(e: KeyboardEvent) {
+  if (!planPickerOpen.value) return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    closePlanPicker();
+    return;
+  }
+  if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    planSlidePrev();
+    return;
+  }
+  if (e.key === "ArrowRight") {
+    e.preventDefault();
+    planSlideNext();
+  }
+}
+
+watch(planPickerOpen, async (open) => {
+  document.body.style.overflow = open ? "hidden" : "";
+  if (open) {
+    document.addEventListener("keydown", onPlanPickerDocKeydown);
+    await nextTick();
+    syncPlanSlideToContext();
+  } else {
+    document.removeEventListener("keydown", onPlanPickerDocKeydown);
+  }
+});
 
 const filteredStores = computed(() => {
   const q = sellerDashboardSearch.value.trim().toLowerCase();
@@ -398,6 +665,10 @@ onUnmounted(() => {
     clearInterval(kpiSampleTimer);
     kpiSampleTimer = null;
   }
+  document.removeEventListener("keydown", onPlanPickerDocKeydown);
+  if (planPickerOpen.value) {
+    document.body.style.overflow = "";
+  }
 });
 </script>
 
@@ -707,12 +978,13 @@ onUnmounted(() => {
                 accountPlanLabel ?? "Not set"
               }}</span>
             </div>
-            <RouterLink
-              :to="upgradePricingLink"
+            <button
+              type="button"
               class="inline-flex items-center rounded-2xl border border-indigo-200/90 bg-white px-3 py-1.5 text-[11px] font-bold uppercase tracking-wide text-indigo-900 shadow-sm ring-1 ring-indigo-100 transition hover:border-indigo-300 hover:bg-indigo-50/60"
+              @click="openPlanPicker"
             >
               {{ isSellerPlanUnset ? "Choose plan" : "Upgrade plan" }}
-            </RouterLink>
+            </button>
           </div>
 
           <ul class="mt-auto space-y-4 pt-5">
@@ -887,4 +1159,372 @@ onUnmounted(() => {
       </div>
     </template>
   </div>
+
+  <Teleport to="body">
+    <Transition name="dash-plan-picker">
+      <div
+        v-if="planPickerOpen"
+        class="fixed inset-0 z-[340] flex items-center justify-center p-3 sm:p-5"
+        role="presentation"
+      >
+        <div
+          class="absolute inset-0 bg-zinc-900/50 backdrop-blur-sm"
+          aria-hidden="true"
+        />
+        <div
+          class="relative z-10 flex max-h-[min(94dvh,64rem)] w-full max-w-lg flex-col overflow-hidden rounded-3xl border border-zinc-200/90 bg-white shadow-[0_28px_90px_-28px_rgba(15,23,42,0.45)] ring-1 ring-zinc-900/[0.04] sm:max-w-xl"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="dash-plan-picker-title"
+        >
+          <div
+            class="flex shrink-0 items-start justify-between gap-4 border-b border-zinc-200/80 bg-white px-4 py-4 sm:px-6 sm:py-5"
+          >
+            <div class="min-w-0">
+              <h2
+                id="dash-plan-picker-title"
+                class="text-lg font-bold tracking-tight text-zinc-900 sm:text-xl"
+              >
+                Plans &amp; pricing
+              </h2>
+              <p class="mt-1 text-sm leading-relaxed text-zinc-600">
+                Swipe or use arrows and dots. Keys: ← → · Esc closes.
+              </p>
+            </div>
+            <button
+              type="button"
+              class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-500 shadow-sm transition hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-900"
+              aria-label="Close"
+              @click="closePlanPicker"
+            >
+              <svg
+                class="h-5 w-5"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="2"
+                aria-hidden="true"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M6 18L18 6M6 6l12 12"
+                />
+              </svg>
+            </button>
+          </div>
+
+          <div
+            class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-zinc-50/80"
+          >
+            <div
+              class="shrink-0 border-b border-zinc-200/80 bg-white px-4 py-4 sm:px-6"
+            >
+              <div class="flex items-center gap-3">
+                <button
+                  type="button"
+                  class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-zinc-200/90 bg-zinc-50 text-zinc-700 shadow-sm transition hover:border-indigo-200 hover:bg-white hover:text-indigo-900 disabled:pointer-events-none disabled:opacity-30"
+                  aria-label="Previous plan"
+                  :disabled="planSlideIndex <= 0"
+                  @click="planSlidePrev"
+                >
+                  <svg
+                    class="h-5 w-5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M15.75 19.5L8.25 12l7.5-7.5"
+                    />
+                  </svg>
+                </button>
+                <div
+                  class="flex min-w-0 flex-1 justify-center gap-1.5 sm:gap-2"
+                  role="tablist"
+                  aria-label="Pricing plans"
+                >
+                  <button
+                    v-for="(p, i) in PRICING_PLANS"
+                    :key="`dot-${p.id}`"
+                    type="button"
+                    role="tab"
+                    :aria-selected="i === planSlideIndex"
+                    :aria-label="`Show ${p.name} plan`"
+                    class="h-2 rounded-full transition-all duration-300 ease-out"
+                    :class="
+                      i === planSlideIndex
+                        ? 'w-7 bg-indigo-600 shadow-sm sm:w-9'
+                        : 'w-2 bg-zinc-300 hover:bg-zinc-400'
+                    "
+                    @click="planSlideGo(i)"
+                  />
+                </div>
+                <button
+                  type="button"
+                  class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-zinc-200/90 bg-zinc-50 text-zinc-700 shadow-sm transition hover:border-indigo-200 hover:bg-white hover:text-indigo-900 disabled:pointer-events-none disabled:opacity-30"
+                  aria-label="Next plan"
+                  :disabled="planSlideIndex >= planSlideCount - 1"
+                  @click="planSlideNext"
+                >
+                  <svg
+                    class="h-5 w-5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M8.25 4.5l7.5 7.5-7.5 7.5"
+                    />
+                  </svg>
+                </button>
+              </div>
+              <p
+                class="mt-3 text-center text-[11px] font-medium uppercase tracking-wider text-zinc-400"
+                aria-live="polite"
+              >
+                Plan {{ planSlideIndex + 1 }} of {{ planSlideCount }}
+              </p>
+              <p
+                class="mt-1 truncate text-center text-lg font-bold tracking-tight text-zinc-900"
+              >
+                {{ activePlanSlide.name }}
+              </p>
+            </div>
+
+            <div class="min-h-0 flex-1 px-4 pb-5 pt-3 sm:px-6 sm:pb-6 sm:pt-4">
+              <div
+                class="plan-slide-viewport relative isolate w-full overflow-hidden rounded-2xl border border-zinc-200/90 bg-white shadow-sm"
+                @pointerdown="onPlanSlidePointerDown"
+                @pointerup="onPlanSlidePointerUp"
+                @pointercancel="onPlanSlidePointerCancel"
+              >
+                <div
+                  class="plan-slide-track flex min-h-[min(32rem,58dvh)] sm:min-h-[min(36rem,60dvh)]"
+                  :style="planSlideTrackStyle"
+                >
+                  <article
+                    v-for="(plan, slideIdx) in PRICING_PLANS"
+                    :key="plan.id"
+                    class="box-border flex min-h-[min(32rem,58dvh)] shrink-0 flex-col overflow-hidden sm:min-h-[min(36rem,60dvh)]"
+                    :style="{ width: `${planSlideItemWidthPct}%` }"
+                    :class="[
+                      plan.id === currentPlanIdForPicker
+                        ? 'ring-2 ring-inset ring-indigo-400/45'
+                        : plan.highlighted
+                          ? 'ring-2 ring-inset ring-lime-400/50'
+                          : '',
+                      slideIdx !== planSlideIndex ? 'pointer-events-none' : '',
+                    ]"
+                  >
+                    <div
+                      class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overscroll-y-contain p-5 sm:p-6"
+                    >
+                      <div class="flex flex-wrap items-start justify-between gap-2">
+                        <p
+                          class="text-[11px] font-bold uppercase tracking-wide text-zinc-500"
+                        >
+                          {{ plan.name }}
+                        </p>
+                        <span
+                          v-if="plan.id === currentPlanIdForPicker"
+                          class="rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-indigo-900"
+                        >
+                          Current
+                        </span>
+                        <span
+                          v-else-if="plan.highlighted"
+                          class="rounded-full bg-lime-300/90 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-zinc-900"
+                        >
+                          Popular
+                        </span>
+                      </div>
+                      <p
+                        v-if="plan.audience"
+                        class="text-sm leading-relaxed text-zinc-600"
+                      >
+                        {{ plan.audience }}
+                      </p>
+                      <p class="flex flex-wrap items-baseline gap-1.5">
+                        <span
+                          v-if="plan.monthlyGhs === 0"
+                          class="text-3xl font-semibold tracking-tight text-zinc-950"
+                        >
+                          Free
+                        </span>
+                        <template v-else>
+                          <span
+                            class="text-3xl font-semibold tabular-nums tracking-tight text-zinc-950"
+                          >
+                            {{ formatGhsWhole(plan.monthlyGhs) }}
+                          </span>
+                          <span class="text-sm font-medium text-zinc-500"
+                            >/ month</span
+                          >
+                        </template>
+                      </p>
+                      <div class="min-h-0 flex-1 border-t border-zinc-100 pt-4">
+                        <p
+                          class="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500"
+                        >
+                          What's included
+                        </p>
+                        <div
+                          class="max-h-[14rem] touch-pan-y divide-y divide-zinc-100 overflow-y-auto overscroll-y-contain rounded-xl border border-zinc-100 bg-zinc-50/80 sm:max-h-[17rem]"
+                        >
+                          <div
+                            v-for="group in plan.groups"
+                            :key="`${plan.id}-${group.title}`"
+                            class="px-3 py-2 sm:px-3.5 sm:py-2.5"
+                          >
+                            <template v-if="group.lines.length === 1">
+                              <div
+                                class="flex flex-col gap-0.5 sm:flex-row sm:items-start sm:justify-between sm:gap-3"
+                              >
+                                <h4
+                                  class="shrink-0 text-[10px] font-bold uppercase tracking-wide text-zinc-800"
+                                >
+                                  {{ group.title }}
+                                </h4>
+                                <p
+                                  class="min-w-0 text-xs font-medium leading-relaxed text-zinc-700 sm:text-right"
+                                >
+                                  {{ group.lines[0] }}
+                                </p>
+                              </div>
+                            </template>
+                            <template v-else>
+                              <h4
+                                class="text-[10px] font-bold uppercase tracking-wide text-zinc-800"
+                              >
+                                {{ group.title }}
+                              </h4>
+                              <ul
+                                class="mt-1.5 space-y-1 text-xs leading-relaxed text-zinc-700"
+                              >
+                                <li
+                                  v-for="(line, idx) in group.lines"
+                                  :key="idx"
+                                  class="flex gap-2"
+                                >
+                                  <span
+                                    class="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-emerald-600"
+                                    aria-hidden="true"
+                                  />
+                                  <span class="min-w-0">{{ line }}</span>
+                                </li>
+                              </ul>
+                            </template>
+                          </div>
+                        </div>
+                      </div>
+                      <footer
+                        v-if="plan.monthlyGhs > 0"
+                        class="rounded-xl border border-zinc-200/80 bg-zinc-50 p-3.5 sm:p-4"
+                      >
+                        <p
+                          class="text-[10px] font-bold uppercase tracking-wide text-zinc-600"
+                        >
+                          Billed annually
+                        </p>
+                        <p
+                          class="mt-0.5 text-base font-semibold tabular-nums text-zinc-950"
+                        >
+                          {{ formatGhsWhole(plan.annualGhs) }}
+                          <span class="text-xs font-medium text-zinc-500"
+                            >/ yr</span
+                          >
+                        </p>
+                        <p class="text-xs font-medium text-emerald-700">
+                          Save {{ formatGhsWhole(plan.annualSaveGhs) }}
+                        </p>
+                      </footer>
+                      <footer
+                        v-else
+                        class="rounded-xl border border-zinc-200/80 bg-zinc-100/70 p-3.5 sm:p-4"
+                      >
+                        <p
+                          class="text-[10px] font-bold uppercase tracking-wide text-zinc-600"
+                        >
+                          Billing
+                        </p>
+                        <p class="mt-0.5 text-xs leading-relaxed text-zinc-700">
+                          Always free — upgrade when you need more capacity.
+                        </p>
+                      </footer>
+                      <button
+                        type="button"
+                        class="mt-auto w-full rounded-full py-3 text-center text-sm font-semibold transition active:scale-[0.99]"
+                        :class="
+                          plan.highlighted
+                            ? 'bg-zinc-900 text-white hover:bg-zinc-800'
+                            : 'border border-zinc-200 bg-white text-zinc-900 hover:bg-zinc-50'
+                        "
+                        @click="choosePlanAndDismiss(plan.id)"
+                      >
+                        Choose {{ plan.name }}
+                      </button>
+                    </div>
+                  </article>
+                </div>
+              </div>
+            </div>
+
+            <p
+              class="shrink-0 border-t border-zinc-200/80 bg-white px-4 py-4 text-center text-xs leading-relaxed text-zinc-500 sm:px-6 sm:py-4"
+            >
+              <RouterLink
+                :to="upgradePricingLink"
+                class="font-semibold text-indigo-700 underline-offset-2 hover:underline"
+                @click="closePlanPicker"
+              >
+                Full pricing on the marketing site
+              </RouterLink>
+            </p>
+          </div>
+        </div>
+      </div>
+    </Transition>
+  </Teleport>
 </template>
+
+<style scoped>
+.dash-plan-picker-enter-active,
+.dash-plan-picker-leave-active {
+  transition: opacity 0.2s ease;
+}
+.dash-plan-picker-enter-active > div.relative,
+.dash-plan-picker-leave-active > div.relative {
+  transition:
+    transform 0.2s ease,
+    opacity 0.2s ease;
+}
+.dash-plan-picker-enter-from,
+.dash-plan-picker-leave-to {
+  opacity: 0;
+}
+.dash-plan-picker-enter-from > div.relative,
+.dash-plan-picker-leave-to > div.relative {
+  transform: scale(0.98);
+  opacity: 0;
+}
+
+.plan-slide-track {
+  transition: transform 0.45s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .plan-slide-track {
+    transition-duration: 0.01ms !important;
+  }
+}
+</style>

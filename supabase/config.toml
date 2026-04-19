@@ -1,0 +1,19 @@
+# Edge Function config (see https://supabase.com/docs/guides/functions/function-configuration)
+#
+# Projects using ES256 JWT signing hit gateway error:
+#   UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM / "Unsupported JWT algorithm ES256"
+# until gateway verification supports it. We disable ingress JWT verification and
+# rely on each function's own checks (e.g. getUser() with the Bearer token).
+# paystack-verify-store-subscription upserts public.seller_subscriptions after store checkout.
+
+[functions.paystack-init]
+verify_jwt = false
+
+[functions.paystack-verify-plan]
+verify_jwt = false
+
+[functions.notify-order]
+verify_jwt = false
+
+[functions.paystack-verify-store-subscription]
+verify_jwt = false

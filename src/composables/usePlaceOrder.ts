@@ -1,4 +1,5 @@
 import { getSupabaseBrowser, isSupabaseConfigured } from '../lib/supabase'
+import { formatFunctionsInvokeError } from '../lib/formatFunctionsInvokeError'
 import type { CartLine } from '../stores/cart'
 
 export type CheckoutGuest = {
@@ -72,7 +73,7 @@ export async function placeOrder(input: PlaceOrderInput): Promise<{
   )
 
   if (fnErr) {
-    notifyError = fnErr.message
+    notifyError = formatFunctionsInvokeError(fnErr, 'notify-order')
   } else if (fnData && typeof fnData === 'object' && 'error' in fnData) {
     notifyError = String((fnData as { error: string }).error)
   } else {

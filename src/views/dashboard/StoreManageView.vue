@@ -7,21 +7,29 @@ import {
   ref,
   watch,
 } from "vue";
-import { RouterLink, useRoute } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 import { storeToRefs } from "pinia";
 import { getSupabaseBrowser, isSupabaseConfigured } from "../../lib/supabase";
 import { formatGhs } from "../../lib/formatMoney";
 import { useAuthStore } from "../../stores/auth";
 import { useToastStore } from "../../stores/toast";
-import { normalizeSignupPlanId } from "../../constants/planEntitlements";
+import {
+  normalizeSignupPlanId,
+  type PlanId,
+} from "../../constants/planEntitlements";
+import { PRICING_PLANS, formatGhsWhole } from "../../constants/pricingPlans";
+import { planLabelFromSignupId } from "../../lib/planLabel";
 import {
   PLAN_FEATURE_LIMITS,
   resolvePricingPlanId,
 } from "../../lib/planFeatureLimits";
 import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefresh";
+import { formatFunctionsInvokeError } from "../../lib/formatFunctionsInvokeError";
+import { refreshSessionForEdgeFunctions } from "../../lib/refreshSessionForEdgeFunctions";
 import SkeletonStoreManage from "../../components/skeleton/SkeletonStoreManage.vue";
 
 const route = useRoute();
+const router = useRouter();
 const auth = useAuthStore();
 const { sessionUserId, isPlatformStaff, user, isSuperAdmin } =
   storeToRefs(auth);
@@ -72,6 +80,15 @@ const productBusy = ref(false);
 const addProductModalOpen = ref(false);
 const deleteProductTargetId = ref<string | null>(null);
 const deleteProductBusy = ref(false);
+
+type PaidStoreFeePlanId = Extract<PlanId, "starter" | "growth" | "pro">;
+
+const storeFeePlanModalOpen = ref(false);
+const selectedStoreFeePlan = ref<PaidStoreFeePlanId>("starter");
+
+const storeFeePlanChoices = computed(() =>
+  PRICING_PLANS.filter((p) => p.monthlyGhs > 0),
+);
 
 const deleteProductTarget = computed(() => {
   const id = deleteProductTargetId.value;
@@ -248,6 +265,11 @@ function onStoreManageDocKeydown(e: KeyboardEvent) {
     closeDeleteProductDialog();
     return;
   }
+  if (storeFeePlanModalOpen.value && !payBusy.value) {
+    e.preventDefault();
+    closeStoreFeePlanModal();
+    return;
+  }
   if (addProductModalOpen.value) {
     e.preventDefault();
     closeAddProductModal();
@@ -279,14 +301,17 @@ async function confirmDeleteProduct() {
   await loadAll();
 }
 
-watch([addProductModalOpen, deleteProductTargetId], ([open, delId]) => {
-  document.body.style.overflow = open || delId ? "hidden" : "";
-  if (open) {
-    void nextTick(() => {
-      document.getElementById("modal-add-product-title")?.focus();
-    });
-  }
-});
+watch(
+  [addProductModalOpen, deleteProductTargetId, storeFeePlanModalOpen],
+  ([open, delId, feeOpen]) => {
+    document.body.style.overflow = open || delId || feeOpen ? "hidden" : "";
+    if (open) {
+      void nextTick(() => {
+        document.getElementById("modal-add-product-title")?.focus();
+      });
+    }
+  },
+);
 
 watch(store, (s) => {
   if (!s) {
@@ -295,6 +320,7 @@ watch(store, (s) => {
       resetAddProductForm();
     }
     if (deleteProductTargetId.value) deleteProductTargetId.value = null;
+    storeFeePlanModalOpen.value = false;
     document.body.style.overflow = "";
   }
 });
@@ -309,6 +335,115 @@ onBeforeUnmount(() => {
 });
 
 const payBusy = ref(false);
+const paystackStoreVerifyBusy = ref(false);
+
+const sellerSubscription = ref<{
+  status: string;
+  current_period_end: string | null;
+  pricing_plan_id: string | null;
+} | null>(null);
+
+function paystackReturnReference(): string {
+  const raw = route.query.reference ?? route.query.trxref;
+  const one = Array.isArray(raw) ? raw[0] : raw;
+  return typeof one === "string" ? one.trim() : "";
+}
+
+/** After Paystack redirects back to this store page, verify payment and upsert `seller_subscriptions`. */
+async function consumePaystackStoreReturn() {
+  const reference = paystackReturnReference();
+  if (!reference.startsWith("sub_")) return;
+  if (!isSupabaseConfigured() || !sessionUserId.value || !storeId.value) return;
+  if (paystackStoreVerifyBusy.value) return;
+
+  const lockKey = `paystack_store_verify_${reference}`;
+  if (sessionStorage.getItem(lockKey) === "1") {
+    await router.replace({
+      name: "dashboard-store",
+      params: { storeId: storeId.value },
+      query: {},
+    });
+    return;
+  }
+
+  paystackStoreVerifyBusy.value = true;
+  try {
+    const sb = getSupabaseBrowser();
+    const prep = await refreshSessionForEdgeFunctions(sb);
+    if (!prep.ok) {
+      toast.error(prep.message);
+      await router.replace({
+        name: "dashboard-store",
+        params: { storeId: storeId.value },
+        query: {},
+      });
+      return;
+    }
+    auth.syncSession(prep.session);
+    const { data, error } = await sb.functions.invoke(
+      "paystack-verify-store-subscription",
+      {
+        body: { reference, store_id: storeId.value },
+        headers: prep.headers,
+      },
+    );
+    if (error) {
+      const bodyErr =
+        data && typeof data === "object" && "error" in data
+          ? String((data as { error?: unknown }).error ?? "")
+          : "";
+      toast.error(
+        bodyErr ||
+          formatFunctionsInvokeError(error, "paystack-verify-store-subscription") ||
+          "Could not verify payment.",
+      );
+      await router.replace({
+        name: "dashboard-store",
+        params: { storeId: storeId.value },
+        query: {},
+      });
+      return;
+    }
+    sessionStorage.setItem(lockKey, "1");
+    toast.success("Store subscription recorded.");
+    await router.replace({
+      name: "dashboard-store",
+      params: { storeId: storeId.value },
+      query: {},
+    });
+    const sb2 = getSupabaseBrowser();
+    const { data: refData, error: refErr } = await sb2.auth.refreshSession();
+    if (!refErr && refData.session) auth.syncSession(refData.session);
+    else await auth.refreshSessionFromSupabase();
+    await loadAll({ silent: true });
+  } finally {
+    paystackStoreVerifyBusy.value = false;
+  }
+}
+
+watch(
+  () =>
+    [
+      route.query.reference,
+      route.query.trxref,
+      storeId.value,
+      sessionUserId.value,
+    ] as const,
+  () => {
+    void consumePaystackStoreReturn();
+  },
+  { immediate: true },
+);
+
+function formatSubscriptionPeriodEnd(iso: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(d);
+}
 const logoBusy = ref(false);
 const logoUploadInputRef = ref<HTMLInputElement | null>(null);
 
@@ -459,6 +594,7 @@ async function loadAll(opts?: { silent?: boolean }) {
   if (!silent) {
     loading.value = true;
     store.value = null;
+    sellerSubscription.value = null;
   }
   if (!isSupabaseConfigured() || !sessionUserId.value || !storeId.value) {
     if (!silent) loading.value = false;
@@ -489,6 +625,26 @@ async function loadAll(opts?: { silent?: boolean }) {
       owner_id: s.owner_id,
       logo_path: s.logo_path?.trim() || null,
     };
+
+    const { data: subRow } = await supabase
+      .from("seller_subscriptions")
+      .select("status, current_period_end, pricing_plan_id")
+      .eq("store_id", s.id)
+      .maybeSingle();
+    sellerSubscription.value = subRow
+      ? {
+          status: String(subRow.status ?? "inactive"),
+          current_period_end:
+            typeof subRow.current_period_end === "string"
+              ? subRow.current_period_end
+              : null,
+          pricing_plan_id:
+            typeof subRow.pricing_plan_id === "string" &&
+            subRow.pricing_plan_id.trim()
+              ? subRow.pricing_plan_id.trim()
+              : null,
+        }
+      : null;
 
     const { data: p } = await supabase
       .from("products")
@@ -551,6 +707,7 @@ useRealtimeTableRefresh({
       { table: "products", filter: `store_id=eq.${id}` },
       { table: "orders", filter: `store_id=eq.${id}` },
       { table: "support_tickets", filter: `store_id=eq.${id}` },
+      { table: "seller_subscriptions", filter: `store_id=eq.${id}` },
     ];
   },
   onEvent: () => loadAll({ silent: true }),
@@ -679,16 +836,50 @@ async function submitSupportTicket() {
   }
 }
 
-async function startPaystack() {
+function openStoreFeePlanModal() {
+  if (!store.value || payBusy.value) return;
+  const normalized = normalizeSignupPlanId(
+    user.value?.user_metadata?.signup_plan,
+  );
+  selectedStoreFeePlan.value =
+    normalized === "starter" ||
+    normalized === "growth" ||
+    normalized === "pro"
+      ? normalized
+      : "starter";
+  storeFeePlanModalOpen.value = true;
+}
+
+function closeStoreFeePlanModal() {
+  if (payBusy.value) return;
+  storeFeePlanModalOpen.value = false;
+}
+
+async function confirmStoreFeePlanAndPay() {
+  if (!store.value || payBusy.value) return;
+  const planId = selectedStoreFeePlan.value;
+  storeFeePlanModalOpen.value = false;
+  await startPaystackWithPlan(planId);
+}
+
+async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
   if (!store.value) return;
   payBusy.value = true;
   const supabase = getSupabaseBrowser();
+  const prep = await refreshSessionForEdgeFunctions(supabase);
+  if (!prep.ok) {
+    payBusy.value = false;
+    toast.error(prep.message);
+    return;
+  }
+  auth.syncSession(prep.session);
   const { data, error } = await supabase.functions.invoke("paystack-init", {
-    body: { store_id: store.value.id },
+    body: { store_id: store.value.id, plan_id: planId },
+    headers: prep.headers,
   });
   payBusy.value = false;
   if (error) {
-    toast.error(error.message);
+    toast.error(formatFunctionsInvokeError(error, "paystack-init"));
     return;
   }
   const url =
@@ -786,14 +977,42 @@ async function startPaystack() {
               </p>
             </div>
           </div>
-          <button
-            type="button"
-            class="rounded-full border border-amber-200/80 bg-gradient-to-r from-amber-50 to-orange-50 px-5 py-2.5 text-sm font-semibold text-amber-950 shadow-sm ring-1 ring-amber-200/50 transition hover:from-amber-100 hover:to-orange-100 disabled:opacity-50"
-            :disabled="payBusy"
-            @click="startPaystack"
-          >
-            Pay subscription (Paystack test)
-          </button>
+          <div class="flex shrink-0 flex-col items-end gap-2">
+            <button
+              type="button"
+              class="rounded-full border border-amber-200/80 bg-gradient-to-r from-amber-50 to-orange-50 px-5 py-2.5 text-sm font-semibold text-amber-950 shadow-sm ring-1 ring-amber-200/50 transition hover:from-amber-100 hover:to-orange-100 disabled:opacity-50"
+              :disabled="payBusy"
+              @click="openStoreFeePlanModal"
+            >
+              Pay store platform fee (test)
+            </button>
+            <p
+              v-if="isStoreOwner"
+              class="max-w-[15rem] text-right text-[10px] leading-snug text-zinc-500"
+            >
+              Choose Starter, Growth, or Pro, then pay the matching monthly
+              platform fee for this store. Your account plan is updated to the
+              same tier after a successful payment.
+            </p>
+            <p
+              v-if="
+                sellerSubscription?.status === 'active' &&
+                sellerSubscription.current_period_end
+              "
+              class="max-w-[14rem] text-right text-xs font-medium leading-snug text-emerald-800"
+            >
+              <span v-if="sellerSubscription.pricing_plan_id">
+                {{ planLabelFromSignupId(sellerSubscription.pricing_plan_id) }}
+                —
+              </span>
+              Platform fee active until
+              {{
+                formatSubscriptionPeriodEnd(
+                  sellerSubscription.current_period_end,
+                )
+              }}
+            </p>
+          </div>
         </div>
       </header>
 
@@ -1565,11 +1784,118 @@ async function startPaystack() {
           </div>
         </Transition>
       </Teleport>
+
+      <Teleport to="body">
+        <Transition name="store-fee-plan-modal">
+          <div
+            v-if="storeFeePlanModalOpen && store"
+            class="fixed inset-0 z-[275] flex items-center justify-center p-4"
+            role="presentation"
+          >
+            <div
+              class="absolute inset-0 bg-zinc-900/50 backdrop-blur-[2px]"
+              aria-hidden="true"
+            />
+            <div
+              class="store-fee-plan-dialog relative z-10 w-full max-w-lg rounded-2xl border border-zinc-200/90 bg-white p-6 shadow-[0_24px_64px_-24px_rgba(15,23,42,0.35)]"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="store-fee-plan-modal-title"
+              @click.stop
+            >
+              <p
+                class="text-[10px] font-bold uppercase tracking-[0.18em] text-amber-800/90"
+              >
+                Store platform fee
+              </p>
+              <h2
+                id="store-fee-plan-modal-title"
+                class="mt-1 text-lg font-bold tracking-tight text-zinc-900"
+              >
+                Choose a plan
+              </h2>
+              <p class="mt-2 text-sm leading-relaxed text-zinc-600">
+                Paystack will charge the monthly amount for the tier you select.
+                Your account plan is set to the same tier after payment
+                succeeds.
+              </p>
+              <ul class="mt-5 space-y-2">
+                <li v-for="p in storeFeePlanChoices" :key="p.id">
+                  <label
+                    class="flex cursor-pointer items-start gap-3 rounded-xl border px-4 py-3 transition"
+                    :class="
+                      selectedStoreFeePlan === p.id
+                        ? 'border-amber-400 bg-amber-50/80 ring-1 ring-amber-200/80'
+                        : 'border-zinc-200 bg-white hover:border-zinc-300'
+                    "
+                  >
+                    <input
+                      v-model="selectedStoreFeePlan"
+                      type="radio"
+                      class="mt-1 h-4 w-4 shrink-0 border-zinc-300 text-amber-700 focus:ring-amber-500"
+                      :value="p.id"
+                    />
+                    <span class="min-w-0 flex-1">
+                      <span class="block text-sm font-bold text-zinc-900">{{
+                        p.name
+                      }}</span>
+                      <span class="mt-0.5 block text-xs text-zinc-600">
+                        {{ formatGhsWhole(p.monthlyGhs) }} / month (test checkout)
+                      </span>
+                    </span>
+                  </label>
+                </li>
+              </ul>
+              <div
+                class="mt-6 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end sm:gap-3"
+              >
+                <button
+                  type="button"
+                  class="inline-flex min-h-[2.75rem] w-full items-center justify-center rounded-xl border border-zinc-200 bg-white px-5 text-sm font-semibold text-zinc-800 shadow-sm transition hover:bg-zinc-50 disabled:pointer-events-none disabled:opacity-50 sm:w-auto"
+                  :disabled="payBusy"
+                  @click="closeStoreFeePlanModal"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="inline-flex min-h-[2.75rem] w-full items-center justify-center rounded-xl border border-amber-700/20 bg-gradient-to-r from-amber-500 to-orange-500 px-5 text-sm font-semibold text-white shadow-md transition hover:from-amber-600 hover:to-orange-600 disabled:pointer-events-none disabled:opacity-50 sm:w-auto sm:min-w-[11rem]"
+                  :disabled="payBusy"
+                  @click="confirmStoreFeePlanAndPay"
+                >
+                  <span v-if="payBusy">Starting…</span>
+                  <span v-else>Continue to Paystack</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </Transition>
+      </Teleport>
     </template>
   </div>
 </template>
 
 <style scoped>
+.store-fee-plan-modal-enter-active,
+.store-fee-plan-modal-leave-active {
+  transition: opacity 0.2s ease;
+}
+.store-fee-plan-modal-enter-from,
+.store-fee-plan-modal-leave-to {
+  opacity: 0;
+}
+.store-fee-plan-modal-enter-active .store-fee-plan-dialog,
+.store-fee-plan-modal-leave-active .store-fee-plan-dialog {
+  transition:
+    transform 0.2s ease,
+    opacity 0.2s ease;
+}
+.store-fee-plan-modal-enter-from .store-fee-plan-dialog,
+.store-fee-plan-modal-leave-to .store-fee-plan-dialog {
+  opacity: 0;
+  transform: translateY(0.5rem) scale(0.98);
+}
+
 .del-product-modal-enter-active,
 .del-product-modal-leave-active {
   transition: opacity 0.2s ease;
