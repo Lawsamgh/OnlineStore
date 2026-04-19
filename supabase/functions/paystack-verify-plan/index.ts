@@ -1,4 +1,9 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1'
+import { sendSellerPlanSubscribedEmail } from '../_shared/sendSellerPlanEmail.ts'
+import {
+  extractPaystackPaymentFields,
+  intPesewasFromUnknown,
+} from '../_shared/paystackPaymentDetails.ts'
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -71,6 +76,8 @@ Deno.serve(async (req) => {
       data?: {
         status?: string
         amount?: number
+        channel?: string
+        fees?: number | string
         metadata?: Record<string, unknown>
         customer?: unknown
       }
@@ -105,8 +112,8 @@ Deno.serve(async (req) => {
     }
 
     const expected = PLAN_MONTHLY_PESEWAS[planId]
-    const paid = typeof d.amount === 'number' ? d.amount : NaN
-    if (paid !== expected) {
+    const paid = intPesewasFromUnknown(d.amount)
+    if (paid == null || paid !== expected) {
       return Response.json({ error: 'Amount mismatch' }, { status: 400, headers: cors })
     }
 
@@ -149,6 +156,8 @@ Deno.serve(async (req) => {
     const periodEnd = new Date()
     periodEnd.setUTCDate(periodEnd.getUTCDate() + 30)
 
+    const payFields = extractPaystackPaymentFields(d as unknown as Record<string, unknown>)
+
     const storeRows = ownedStores ?? []
     if (storeRows.length > 0) {
       const nowIso = new Date().toISOString()
@@ -161,6 +170,9 @@ Deno.serve(async (req) => {
         current_period_end: periodEnd.toISOString(),
         pricing_plan_id: planId,
         updated_at: nowIso,
+        paid_amount_pesewas: payFields.paid_amount_pesewas,
+        payment_channel: payFields.payment_channel,
+        paystack_fee_pesewas: payFields.paystack_fee_pesewas,
       }))
       const { error: subErr } = await admin.from('seller_subscriptions').upsert(subRows, {
         onConflict: 'store_id',
@@ -170,8 +182,22 @@ Deno.serve(async (req) => {
       }
     }
 
+    await sendSellerPlanSubscribedEmail({
+      resendApiKey: Deno.env.get('RESEND_API_KEY') ?? undefined,
+      resendFromEmail: Deno.env.get('RESEND_FROM_EMAIL') ?? 'onboarding@resend.dev',
+      to: existing.user.email ?? user.email ?? undefined,
+      planId,
+      source: 'account',
+      periodEndsAtIso: periodEnd.toISOString(),
+    })
+
     return Response.json(
-      { ok: true, plan_id: planId, stores_synced: storeRows.length },
+      {
+        ok: true,
+        plan_id: planId,
+        stores_synced: storeRows.length,
+        payment_snapshot: payFields,
+      },
       { headers: cors },
     )
   } catch (e) {

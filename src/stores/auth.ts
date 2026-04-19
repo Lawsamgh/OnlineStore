@@ -33,6 +33,11 @@ export const useAuthStore = defineStore("auth", () => {
   /** Row in `admin_roles` for this user, if any (one row per user). */
   const platformAdminRole = ref<PlatformAdminRole>("none");
   /**
+   * False from first attach of a new session until `refreshSuperAdminRole`
+   * settles, so UI does not briefly assume `platformAdminRole === "none"`.
+   */
+  const platformStaffRoleResolved = ref(false);
+  /**
    * After a new session, the first successful role read must not fire the
    * "console access granted" seller bell (user may already have been staff).
    */
@@ -140,6 +145,7 @@ export const useAuthStore = defineStore("auth", () => {
     if (!next) {
       adminRoleRefreshGen.value++;
       platformAdminRole.value = "none";
+      platformStaffRoleResolved.value = true;
       profileAvatarPublicUrl.value = null;
       suppressNextConsoleAccessBell.value = false;
       const uid = prevSession?.user?.id ?? null;
@@ -161,13 +167,20 @@ export const useAuthStore = defineStore("auth", () => {
       }
       return;
     }
+    const sameUser =
+      prevSession?.user?.id != null && prevSession.user.id === next.user.id;
+    if (!sameUser) {
+      platformStaffRoleResolved.value = false;
+    }
     suppressNextConsoleAccessBell.value = true;
     try {
       useUiStore().clearSellerConsoleAccessReadyBell();
     } catch {
       /* Pinia may not be ready in edge tests */
     }
-    void refreshSuperAdminRole();
+    void refreshSuperAdminRole().finally(() => {
+      platformStaffRoleResolved.value = true;
+    });
     void refreshProfileAvatar();
   }
 
@@ -317,6 +330,7 @@ export const useAuthStore = defineStore("auth", () => {
     sessionUserId,
     isSignedIn,
     platformAdminRole,
+    platformStaffRoleResolved,
     isSuperAdmin,
     isPlatformStaff,
     platformAdminRoleLabel,

@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { RouterLink, useRoute } from 'vue-router'
+import { useRoute } from 'vue-router'
 import { getSupabaseBrowser, isSupabaseConfigured } from '../../lib/supabase'
-import { waMeLink } from '../../lib/whatsapp'
 import { formatGhs } from '../../lib/formatMoney'
 import { useCartStore } from '../../stores/cart'
 import { useUiStore } from '../../stores/ui'
@@ -31,6 +30,7 @@ const products = ref<
     id: string
     title: string
     description: string | null
+    category: string | null
     price_cents: number
     image_paths: string[]
   }[]
@@ -44,17 +44,6 @@ function productImageUrl(path: string | undefined): string | null {
   const { data } = supabase.storage
     .from('product-images')
     .getPublicUrl(`${store.value.id}/${path}`)
-  return data.publicUrl
-}
-
-function logoUrl(): string | null {
-  if (!store.value?.id) return null
-  if (!isSupabaseConfigured()) return null
-  const supabase = getSupabaseBrowser()
-  const p = store.value.logo_path?.trim()
-  const key =
-    p && p.length > 0 ? p : `${store.value.id}/logo`
-  const { data } = supabase.storage.from('store-logos').getPublicUrl(key)
   return data.publicUrl
 }
 
@@ -87,29 +76,45 @@ async function load() {
 
   const { data: p, error: pe } = await supabase
     .from('products')
-    .select('id, title, description, price_cents, image_paths')
+    .select(
+      'id, title, description, price_cents, image_paths, product_categories ( name )',
+    )
     .eq('store_id', s.id)
     .eq('is_published', true)
     .order('created_at', { ascending: false })
   if (pe) {
     toast.error(pe.message)
   } else {
-    products.value = (p ?? []) as typeof products.value
+    products.value = (p ?? []).map((row) => {
+      const r = row as Record<string, unknown>
+      const rel = r.product_categories as { name?: string } | null | undefined
+      const category =
+        rel &&
+        typeof rel === 'object' &&
+        typeof rel.name === 'string' &&
+        rel.name.trim()
+          ? rel.name.trim()
+          : null
+      return {
+        id: String(r.id),
+        title: String(r.title),
+        description:
+          typeof r.description === 'string' && r.description.trim()
+            ? r.description.trim()
+            : null,
+        category,
+        price_cents: Number(r.price_cents) || 0,
+        image_paths: Array.isArray(r.image_paths)
+          ? (r.image_paths as string[])
+          : [],
+      }
+    })
   }
   loading.value = false
 }
 
 onMounted(load)
 watch(slug, load)
-
-const whatsappHref = computed(() => {
-  const w = store.value?.whatsapp_phone_e164
-  if (!w) return null
-  const text = encodeURIComponent(
-    `Hi ${store.value?.name ?? 'there'}, I have a question about your shop.`,
-  )
-  return waMeLink(w, text)
-})
 
 function addToCart(p: (typeof products.value)[0]) {
   cart.addLine({
@@ -129,50 +134,19 @@ function addToCart(p: (typeof products.value)[0]) {
       This shop could not be found or is not available.
     </p>
     <template v-else-if="store">
-      <div class="flex flex-col gap-6 sm:flex-row sm:items-start">
-        <div
-          class="flex h-24 w-24 shrink-0 items-center justify-center overflow-hidden rounded-xl border border-slate-200 bg-slate-100"
-        >
-          <img
-            v-if="logoUrl()"
-            :src="logoUrl()!"
-            alt=""
-            class="h-full w-full object-cover"
-            @error="($event.target as HTMLImageElement).style.display = 'none'"
-          />
-          <span v-else class="text-2xl font-bold text-slate-400">{{
-            store.name.slice(0, 1).toUpperCase()
-          }}</span>
-        </div>
-        <div class="min-w-0 flex-1">
-          <h1 class="text-2xl font-bold tracking-tight text-slate-900">
-            {{ store.name }}
-          </h1>
-          <p v-if="store.description" class="mt-2 text-slate-600">
-            {{ store.description }}
-          </p>
-          <div class="mt-4 flex flex-wrap gap-3">
-            <a
-              v-if="whatsappHref"
-              :href="whatsappHref"
-              target="_blank"
-              rel="noopener noreferrer"
-              class="inline-flex items-center rounded-lg bg-emerald-600 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-700"
-            >
-              Chat on WhatsApp
-            </a>
-            <RouterLink
-              v-if="cart.lines.length && cart.storeSlug === store.slug"
-              :to="`/${store.slug}/checkout`"
-              class="inline-flex items-center rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50"
-            >
-              Go to checkout
-            </RouterLink>
-          </div>
-        </div>
-      </div>
+      <p
+        v-if="store.description"
+        class="max-w-3xl text-sm leading-relaxed text-slate-600 sm:text-[15px]"
+      >
+        {{ store.description }}
+      </p>
 
-      <h2 class="mt-12 text-lg font-semibold text-slate-900">Products</h2>
+      <h2
+        class="text-lg font-semibold tracking-tight text-slate-900"
+        :class="store.description ? 'mt-8' : 'mt-0'"
+      >
+        Products
+      </h2>
       <p v-if="!products.length" class="mt-2 text-slate-500">
         No published products yet.
       </p>
@@ -196,7 +170,14 @@ function addToCart(p: (typeof products.value)[0]) {
             />
           </div>
           <div class="p-4">
-            <h3 class="font-semibold text-slate-900">{{ p.title }}</h3>
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <h3 class="min-w-0 font-semibold text-slate-900">{{ p.title }}</h3>
+              <span
+                v-if="p.category"
+                class="shrink-0 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-slate-600"
+                >{{ p.category }}</span
+              >
+            </div>
             <p v-if="p.description" class="mt-1 line-clamp-2 text-sm text-slate-600">
               {{ p.description }}
             </p>

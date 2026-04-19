@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { RouterLink, useRouter } from "vue-router";
-import { PRICING_PLANS, formatGhsWhole } from "../constants/pricingPlans";
+import { PRICING_PLANS } from "../constants/pricingPlans";
+import PricingPlanCard from "../components/marketing/PricingPlanCard.vue";
 import { useAuthStore } from "../stores/auth";
 import happySellerPhone from "../assets/marketing/happy-seller-phone.webp";
 
@@ -9,6 +10,122 @@ const auth = useAuthStore();
 const router = useRouter();
 const homeRoot = ref<HTMLElement | null>(null);
 let revealObserver: IntersectionObserver | null = null;
+
+const pricingCarouselRef = ref<HTMLElement | null>(null);
+const pricingCarouselIndex = ref(0);
+const pricingCarouselAtStart = ref(true);
+const pricingCarouselAtEnd = ref(false);
+
+let pricingCarouselScrollRaf = 0;
+let pricingCarouselResizeObs: ResizeObserver | null = null;
+
+function pricingCarouselPrefersReducedMotion(): boolean {
+  if (typeof window === "undefined") return false;
+  return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+}
+
+function currentPricingSlideIndex(): number {
+  const el = pricingCarouselRef.value;
+  if (!el) return 0;
+  const slides = [
+    ...el.querySelectorAll("[data-pricing-slide]"),
+  ] as HTMLElement[];
+  if (slides.length === 0) return 0;
+  const elRect = el.getBoundingClientRect();
+  const cx = elRect.left + elRect.width / 2;
+  let best = 0;
+  let bestD = Infinity;
+  slides.forEach((s, i) => {
+    const r = s.getBoundingClientRect();
+    const sx = r.left + r.width / 2;
+    const d = Math.abs(sx - cx);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  });
+  return best;
+}
+
+function syncPricingCarousel(): void {
+  const el = pricingCarouselRef.value;
+  if (!el) return;
+  const eps = 4;
+  pricingCarouselAtStart.value = el.scrollLeft <= eps;
+  pricingCarouselAtEnd.value =
+    el.scrollLeft + el.clientWidth >= el.scrollWidth - eps;
+  pricingCarouselIndex.value = currentPricingSlideIndex();
+}
+
+function onPricingCarouselScroll(): void {
+  if (pricingCarouselScrollRaf) {
+    cancelAnimationFrame(pricingCarouselScrollRaf);
+  }
+  pricingCarouselScrollRaf = requestAnimationFrame(() => {
+    pricingCarouselScrollRaf = 0;
+    syncPricingCarousel();
+  });
+}
+
+function gotoPricingSlide(i: number): void {
+  const el = pricingCarouselRef.value;
+  const slides = el?.querySelectorAll("[data-pricing-slide]");
+  const slide = slides?.[i] as HTMLElement | undefined;
+  if (!slide) return;
+  slide.scrollIntoView({
+    block: "nearest",
+    inline: "center",
+    behavior: pricingCarouselPrefersReducedMotion() ? "auto" : "smooth",
+  });
+}
+
+function scrollPricingCarousel(delta: 1 | -1): void {
+  const next = Math.min(
+    PRICING_PLANS.length - 1,
+    Math.max(0, currentPricingSlideIndex() + delta),
+  );
+  gotoPricingSlide(next);
+}
+
+function onPricingCarouselKeydown(ev: KeyboardEvent): void {
+  if (ev.key === "ArrowLeft") {
+    ev.preventDefault();
+    scrollPricingCarousel(-1);
+  } else if (ev.key === "ArrowRight") {
+    ev.preventDefault();
+    scrollPricingCarousel(1);
+  } else if (ev.key === "Home") {
+    ev.preventDefault();
+    gotoPricingSlide(0);
+  } else if (ev.key === "End") {
+    ev.preventDefault();
+    gotoPricingSlide(PRICING_PLANS.length - 1);
+  }
+}
+
+function bindPricingCarousel(): void {
+  const el = pricingCarouselRef.value;
+  if (!el) return;
+  el.addEventListener("scroll", onPricingCarouselScroll, { passive: true });
+  pricingCarouselResizeObs = new ResizeObserver(() => {
+    syncPricingCarousel();
+  });
+  pricingCarouselResizeObs.observe(el);
+  syncPricingCarousel();
+}
+
+function unbindPricingCarousel(): void {
+  pricingCarouselRef.value?.removeEventListener(
+    "scroll",
+    onPricingCarouselScroll,
+  );
+  pricingCarouselResizeObs?.disconnect();
+  pricingCarouselResizeObs = null;
+  if (pricingCarouselScrollRaf) {
+    cancelAnimationFrame(pricingCarouselScrollRaf);
+    pricingCarouselScrollRaf = 0;
+  }
+}
 
 const hubQrDataUrl = ref("");
 const storefrontQrDataUrl = ref("");
@@ -63,11 +180,15 @@ onMounted(async () => {
   } catch {
     /* QR is optional; cards still work via buttons */
   }
+
+  await nextTick();
+  bindPricingCarousel();
 });
 
 onBeforeUnmount(() => {
   revealObserver?.disconnect();
   revealObserver = null;
+  unbindPricingCarousel();
 });
 
 const featureItems = [
@@ -181,11 +302,31 @@ const howItWorks = [
               class="ui-anim-fade-up ui-delay-5 mt-9 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center"
             >
               <RouterLink
-                v-if="auth.isSignedIn"
+                v-if="auth.isSignedIn && !auth.isSuperAdmin"
                 to="/dashboard"
                 class="inline-flex min-h-[48px] items-center justify-center gap-2 rounded-full bg-zinc-900 px-8 py-3 text-sm font-semibold text-white shadow-lg shadow-zinc-900/20 transition-all duration-200 ease-out hover:-translate-y-0.5 hover:bg-zinc-800 hover:shadow-xl active:scale-[0.98] motion-reduce:hover:translate-y-0"
               >
                 Go to dashboard
+                <svg
+                  class="h-4 w-4 shrink-0"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  stroke-width="2"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3"
+                  />
+                </svg>
+              </RouterLink>
+              <RouterLink
+                v-else-if="auth.isSignedIn && auth.isSuperAdmin"
+                to="/admin"
+                class="inline-flex min-h-[48px] items-center justify-center gap-2 rounded-full bg-zinc-900 px-8 py-3 text-sm font-semibold text-white shadow-lg shadow-zinc-900/20 transition-all duration-200 ease-out hover:-translate-y-0.5 hover:bg-zinc-800 hover:shadow-xl active:scale-[0.98] motion-reduce:hover:translate-y-0"
+              >
+                Platform admin
                 <svg
                   class="h-4 w-4 shrink-0"
                   fill="none"
@@ -221,7 +362,7 @@ const howItWorks = [
                 </svg>
               </RouterLink>
               <RouterLink
-                v-if="auth.isSignedIn && auth.isPlatformStaff"
+                v-if="auth.isSignedIn && auth.isPlatformStaff && !auth.isSuperAdmin"
                 to="/admin"
                 class="inline-flex min-h-[48px] items-center justify-center rounded-full border border-zinc-300/90 bg-white/80 px-8 py-3 text-sm font-semibold text-zinc-800 shadow-sm backdrop-blur-sm transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-zinc-400 hover:bg-white hover:shadow-md active:scale-[0.98] motion-reduce:hover:translate-y-0"
               >
@@ -1026,28 +1167,28 @@ const howItWorks = [
     <!-- Pricing -->
     <section
       id="pricing"
-      class="relative isolate overflow-hidden scroll-mt-28 bg-gradient-to-b from-zinc-900 via-zinc-950 to-neutral-950 py-20 sm:scroll-mt-32 sm:py-24 lg:py-28"
+      class="relative isolate overflow-hidden scroll-mt-28 bg-gradient-to-b from-zinc-50 via-white to-zinc-100 py-20 sm:scroll-mt-32 sm:py-24 lg:py-28"
       aria-labelledby="pricing-heading"
     >
       <div class="pointer-events-none absolute inset-0" aria-hidden="true">
         <div
-          class="absolute -top-48 left-1/2 h-[min(42rem,120%)] w-[min(90rem,200%)] -translate-x-1/2 rounded-full bg-lime-400/[0.11] blur-3xl"
+          class="absolute -top-48 left-1/2 h-[min(42rem,120%)] w-[min(90rem,200%)] -translate-x-1/2 rounded-full bg-lime-400/[0.18] blur-3xl"
         />
         <div
-          class="absolute -bottom-32 -right-24 h-80 w-80 rounded-full bg-emerald-500/[0.12] blur-3xl sm:h-96 sm:w-96"
+          class="absolute -bottom-32 -right-24 h-80 w-80 rounded-full bg-emerald-400/[0.14] blur-3xl sm:h-96 sm:w-96"
         />
         <div
-          class="absolute left-0 top-1/4 h-72 w-72 -translate-x-1/3 rounded-full bg-violet-500/[0.06] blur-3xl"
+          class="absolute left-0 top-1/4 h-72 w-72 -translate-x-1/3 rounded-full bg-violet-400/[0.08] blur-3xl"
         />
         <div
-          class="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.028)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.028)_1px,transparent_1px)] bg-[size:56px_56px] [mask-image:radial-gradient(ellipse_75%_55%_at_50%_35%,#000_20%,transparent_70%)]"
+          class="absolute inset-0 bg-[linear-gradient(rgba(24,24,27,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(24,24,27,0.04)_1px,transparent_1px)] bg-[size:56px_56px] [mask-image:radial-gradient(ellipse_75%_55%_at_50%_35%,#000_20%,transparent_70%)]"
         />
         <div
-          class="absolute inset-0 bg-gradient-to-b from-white/[0.04] via-transparent to-black/20"
+          class="absolute inset-0 bg-gradient-to-b from-white via-transparent to-zinc-200/40"
         />
       </div>
       <div
-        class="pointer-events-none absolute inset-x-0 top-0 z-[1] h-px bg-gradient-to-r from-transparent via-white/15 to-transparent"
+        class="pointer-events-none absolute inset-x-0 top-0 z-[1] h-px bg-gradient-to-r from-transparent via-zinc-300/80 to-transparent"
         aria-hidden="true"
       />
       <div
@@ -1055,185 +1196,154 @@ const howItWorks = [
       >
         <div class="ui-reveal mx-auto max-w-2xl text-center">
           <p
-            class="text-xs font-semibold uppercase tracking-wider text-lime-400/90"
+            class="text-xs font-semibold uppercase tracking-wider text-lime-700"
           >
             Plans &amp; pricing
           </p>
           <h2
             id="pricing-heading"
-            class="mt-4 text-balance text-3xl font-semibold tracking-tight text-white sm:text-4xl md:text-5xl"
+            class="mt-4 text-balance text-3xl font-semibold tracking-tight text-zinc-900 sm:text-4xl md:text-5xl"
           >
             Pick the plan that matches your ambition
           </h2>
-          <p class="mt-5 text-pretty text-lg leading-relaxed text-zinc-300/95">
+          <p class="mt-5 text-pretty text-lg leading-relaxed text-zinc-600">
             Subscriptions cover your seller tools and storefront. Your customers
             still pay you directly for products — cash or MoMo on delivery, your
-            rules.
+            rules. Use the track, dots, or arrow keys — about three tiers fit on
+            large screens; the rest snap into place.
           </p>
         </div>
 
         <div
-          class="mt-14 grid gap-6 sm:grid-cols-2 sm:gap-7 lg:mt-16 lg:grid-cols-2 lg:gap-8 xl:grid-cols-4 xl:gap-6 2xl:gap-8"
+          class="relative mt-14 rounded-2xl outline-none ring-offset-2 ring-offset-white focus-visible:ring-2 focus-visible:ring-lime-500/70 lg:mt-16"
+          role="region"
+          aria-roledescription="carousel"
+          aria-label="Pricing plans"
+          tabindex="0"
+          @keydown="onPricingCarouselKeydown"
         >
-          <article
-            v-for="plan in PRICING_PLANS"
-            :key="plan.id"
-            class="ui-reveal relative flex flex-col overflow-hidden rounded-3xl border bg-white p-7 transition-all duration-300 ease-out hover:-translate-y-1 motion-reduce:hover:translate-y-0 sm:p-8"
-            :class="
-              plan.highlighted
-                ? 'border-zinc-200/90 border-l-4 border-l-lime-400 shadow-xl shadow-lime-500/15 ring-1 ring-lime-400/20 hover:shadow-2xl hover:shadow-lime-500/20'
-                : 'border-zinc-200/90 shadow-lg shadow-zinc-900/5 hover:border-zinc-300 hover:shadow-xl'
-            "
+          <div
+            class="mb-6 flex flex-col items-center justify-center gap-4 rounded-2xl border border-zinc-200/90 bg-white/95 px-4 py-4 shadow-md shadow-zinc-900/5 sm:flex-row sm:gap-10 sm:px-6 sm:py-4"
           >
             <div
-              v-if="plan.highlighted"
-              class="absolute right-5 top-5 rounded-full bg-lime-400 px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-zinc-900"
+              class="flex flex-wrap items-center justify-center gap-3"
+              role="radiogroup"
+              aria-label="Choose a pricing plan"
             >
-              Popular
-            </div>
-            <h3 class="text-sm font-bold uppercase tracking-wide text-zinc-800">
-              {{ plan.name }}
-            </h3>
-            <p
-              v-if="plan.audience"
-              class="mt-2 text-sm leading-relaxed text-zinc-600"
-            >
-              {{ plan.audience }}
-            </p>
-            <p class="mt-5 flex flex-wrap items-baseline gap-1">
-              <span
-                v-if="plan.monthlyGhs === 0"
-                class="text-4xl font-semibold tracking-tight text-zinc-950"
+              <button
+                v-for="(plan, i) in PRICING_PLANS"
+                :key="plan.id"
+                type="button"
+                role="radio"
+                class="flex items-center justify-center rounded-full transition-all duration-300 ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-lime-600/90"
+                :class="
+                  i === pricingCarouselIndex
+                    ? 'h-11 min-w-[4.75rem] bg-lime-500 px-3 shadow-[0_0_22px_rgba(132,204,22,0.55)] ring-2 ring-lime-400/70 ring-offset-2 ring-offset-white'
+                    : 'h-11 w-11 hover:bg-zinc-100/90'
+                "
+                :aria-checked="i === pricingCarouselIndex"
+                :aria-label="`Show ${plan.name} plan`"
+                @click="gotoPricingSlide(i)"
               >
-                Free
-              </span>
-              <template v-else>
                 <span
-                  class="text-4xl font-semibold tabular-nums tracking-tight text-zinc-950"
-                >
-                  {{ formatGhsWhole(plan.monthlyGhs) }}
-                </span>
-                <span class="text-sm font-medium text-zinc-500">/ month</span>
-              </template>
-            </p>
-            <div class="mt-8 flex-1 border-t border-zinc-200/80 pt-8">
-              <p
-                class="mb-3 text-xs font-semibold uppercase tracking-wide text-zinc-500"
-              >
-                What's included
-              </p>
-              <div
-                class="divide-y divide-zinc-200/90 overflow-hidden rounded-2xl border border-zinc-200/90 bg-zinc-50/70"
-              >
-                <div
-                  v-for="group in plan.groups"
-                  :key="`${plan.id}-${group.title}`"
-                  class="px-4 py-3.5 sm:px-5 sm:py-4"
-                >
-                  <template v-if="group.lines.length === 1">
-                    <div
-                      class="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between sm:gap-6"
-                    >
-                      <h4
-                        class="shrink-0 text-xs font-bold uppercase tracking-wide text-zinc-900"
-                      >
-                        {{ group.title }}
-                      </h4>
-                      <p
-                        class="min-w-0 text-sm font-medium leading-relaxed text-zinc-800 sm:max-w-[min(100%,20rem)] sm:text-right"
-                      >
-                        {{ group.lines[0] }}
-                      </p>
-                    </div>
-                  </template>
-                  <template v-else>
-                    <h4
-                      class="text-xs font-bold uppercase tracking-wide text-zinc-900"
-                    >
-                      {{ group.title }}
-                    </h4>
-                    <ul
-                      class="mt-2.5 space-y-1.5 text-sm leading-relaxed text-zinc-800"
-                    >
-                      <li
-                        v-for="(line, idx) in group.lines"
-                        :key="idx"
-                        class="flex gap-2.5"
-                      >
-                        <span
-                          class="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-600"
-                          aria-hidden="true"
-                        />
-                        <span class="min-w-0">{{ line }}</span>
-                      </li>
-                    </ul>
-                  </template>
-                </div>
-              </div>
+                  class="block rounded-full transition-all duration-300"
+                  :class="
+                    i === pricingCarouselIndex
+                      ? 'h-3.5 w-10 bg-white/95'
+                      : 'h-3.5 w-3.5 bg-zinc-500 shadow-inner shadow-black/15'
+                  "
+                  aria-hidden="true"
+                />
+              </button>
             </div>
-            <footer
-              v-if="plan.monthlyGhs > 0"
-              class="mt-8 rounded-2xl border border-zinc-200 bg-zinc-50 p-5 sm:p-6"
+            <p
+              class="text-center text-sm font-semibold tabular-nums tracking-tight text-zinc-600 sm:text-base"
             >
-              <p
-                class="text-xs font-bold uppercase tracking-wide text-zinc-700"
+              <span class="text-zinc-900">{{
+                PRICING_PLANS[pricingCarouselIndex]?.name ?? ""
+              }}</span>
+              <span class="mx-2 text-zinc-400 font-normal" aria-hidden="true"
+                >·</span
               >
-                Billed annually
-              </p>
-              <p class="mt-1 text-xl font-semibold tabular-nums text-zinc-950">
-                {{ formatGhsWhole(plan.annualGhs) }}
-                <span class="text-sm font-medium text-zinc-500">/ yr</span>
-              </p>
-              <p class="mt-1 text-sm font-medium text-emerald-700">
-                Save {{ formatGhsWhole(plan.annualSaveGhs) }}
-              </p>
-            </footer>
-            <footer
-              v-else
-              class="mt-8 rounded-2xl border border-zinc-200/90 bg-zinc-100/80 p-5 sm:p-6"
-            >
-              <p
-                class="text-xs font-bold uppercase tracking-wide text-zinc-600"
+              <span class="font-bold text-zinc-800"
+                >{{ pricingCarouselIndex + 1 }} /
+                {{ PRICING_PLANS.length }}</span
               >
-                Billing
-              </p>
-              <p class="mt-1 text-sm font-medium leading-relaxed text-zinc-700">
-                Always free — no card required. Upgrade to Starter when you need
-                more products, orders, and analytics.
-              </p>
-            </footer>
-            <RouterLink
-              v-if="!auth.isSignedIn"
-              :to="{ name: 'login', query: { plan: plan.id, mode: 'sign-up' } }"
-              class="mt-6 block w-full rounded-full py-3.5 text-center text-sm font-semibold transition-all duration-200 ease-out active:scale-[0.99]"
-              :class="
-                plan.highlighted
-                  ? 'bg-zinc-900 text-white hover:bg-zinc-800'
-                  : 'border border-zinc-200 bg-white text-zinc-900 hover:bg-zinc-50'
-              "
+            </p>
+          </div>
+
+          <div
+            ref="pricingCarouselRef"
+            class="flex snap-x snap-mandatory gap-5 overflow-x-auto scroll-smooth scroll-px-4 pb-4 pt-1 [-ms-overflow-style:none] [scrollbar-color:rgba(24,24,27,0.22)_transparent] [scrollbar-width:thin] sm:scroll-px-6 sm:gap-6 [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-zinc-300/90 [&::-webkit-scrollbar-track]:bg-transparent"
+          >
+            <div
+              v-for="(plan, slideIndex) in PRICING_PLANS"
+              :id="`pricing-slide-${plan.id}`"
+              :key="plan.id"
+              data-pricing-slide
+              class="ui-reveal shrink-0 snap-center overflow-visible [flex:0_0_min(20rem,calc(100vw-2.75rem))] sm:[flex:0_0_calc(50%-0.75rem)] lg:[flex:0_0_calc((100%-3rem)/3)]"
+              role="group"
+              :aria-roledescription="`Slide ${slideIndex + 1} of ${PRICING_PLANS.length}`"
+              :aria-label="`${plan.name} plan`"
             >
-              {{
-                plan.monthlyGhs === 0 ? "Start free" : `Get ${plan.name}`
-              }}
-            </RouterLink>
-            <RouterLink
-              v-else
-              :to="{ name: 'dashboard', query: { plan: plan.id } }"
-              class="mt-6 block w-full rounded-full py-3.5 text-center text-sm font-semibold transition-all duration-200 ease-out active:scale-[0.99]"
-              :class="
-                plan.highlighted
-                  ? 'bg-zinc-900 text-white hover:bg-zinc-800'
-                  : 'border border-zinc-200 bg-white text-zinc-900 hover:bg-zinc-50'
-              "
+              <PricingPlanCard
+                :plan="plan"
+                :tone="plan.highlighted ? 'hero' : 'side'"
+              />
+            </div>
+          </div>
+
+          <div
+            class="pointer-events-none absolute inset-y-6 left-0 right-0 z-[3] flex items-center justify-between sm:inset-y-10"
+          >
+            <button
+              type="button"
+              class="pointer-events-auto ml-0 inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-zinc-200/90 bg-white/95 text-zinc-800 shadow-md shadow-zinc-900/10 backdrop-blur-sm transition enabled:hover:border-zinc-300 enabled:hover:bg-zinc-50 enabled:active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-35 sm:ml-1"
+              :disabled="pricingCarouselAtStart"
+              aria-label="Previous pricing plan"
+              @click="scrollPricingCarousel(-1)"
             >
-              {{
-                plan.monthlyGhs === 0 ? "Open dashboard" : `Choose ${plan.name}`
-              }}
-            </RouterLink>
-          </article>
+              <svg
+                class="h-5 w-5"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="2"
+                aria-hidden="true"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M15.75 19.5 8.25 12l7.5-7.5"
+                />
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="pointer-events-auto mr-0 inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-zinc-200/90 bg-white/95 text-zinc-800 shadow-md shadow-zinc-900/10 backdrop-blur-sm transition enabled:hover:border-zinc-300 enabled:hover:bg-zinc-50 enabled:active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-35 sm:mr-1"
+              :disabled="pricingCarouselAtEnd"
+              aria-label="Next pricing plan"
+              @click="scrollPricingCarousel(1)"
+            >
+              <svg
+                class="h-5 w-5"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="2"
+                aria-hidden="true"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="m8.25 4.5 7.5 7.5-7.5 7.5"
+                />
+              </svg>
+            </button>
+          </div>
         </div>
         <p
-          class="ui-reveal mx-auto mt-12 max-w-2xl text-center text-sm leading-relaxed text-zinc-400/95"
+          class="ui-reveal mx-auto mt-12 max-w-2xl text-center text-sm leading-relaxed text-zinc-600"
         >
           Card or MoMo fees from your payment provider may apply at checkout.
           Features can vary by rollout — confirm with sales before you

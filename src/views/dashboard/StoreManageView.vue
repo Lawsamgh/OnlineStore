@@ -27,6 +27,7 @@ import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefre
 import { formatFunctionsInvokeError } from "../../lib/formatFunctionsInvokeError";
 import { refreshSessionForEdgeFunctions } from "../../lib/refreshSessionForEdgeFunctions";
 import SkeletonStoreManage from "../../components/skeleton/SkeletonStoreManage.vue";
+import ProductCategoryDropdown from "../../components/store/ProductCategoryDropdown.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -54,11 +55,16 @@ const products = ref<
     id: string;
     title: string;
     description: string | null;
+    category_id: string | null;
+    category_name: string | null;
     price_cents: number;
     is_published: boolean;
     image_paths: string[];
+    created_at: string;
   }[]
 >([]);
+
+const productCategories = ref<{ id: string; name: string }[]>([]);
 
 const orders = ref<
   {
@@ -74,9 +80,16 @@ const orders = ref<
 
 const newTitle = ref("");
 const newDesc = ref("");
+/** Selected `product_categories.id` when adding a product (empty = none). */
+const newCategoryId = ref("");
 const newPrice = ref("");
 const newPublished = ref(true);
 const productBusy = ref(false);
+/** While saving inline category for a product row. */
+const categoryBusyId = ref<string | null>(null);
+const newCategoryName = ref("");
+const categoryAddBusy = ref(false);
+const deleteCategoryBusyId = ref<string | null>(null);
 const addProductModalOpen = ref(false);
 const deleteProductTargetId = ref<string | null>(null);
 const deleteProductBusy = ref(false);
@@ -95,6 +108,23 @@ const deleteProductTarget = computed(() => {
   if (!id) return null;
   return products.value.find((p) => p.id === id) ?? null;
 });
+
+/** Products with no category (for sidebar nudge). */
+const uncategorizedProductCount = computed(
+  () => products.value.filter((p) => !p.category_id).length,
+);
+
+const productsPriceTotalCents = computed(() =>
+  products.value.reduce((sum, p) => sum + (Number(p.price_cents) || 0), 0),
+);
+
+const productsPublishedCount = computed(
+  () => products.value.filter((p) => p.is_published).length,
+);
+
+const productsDraftCount = computed(
+  () => products.value.filter((p) => !p.is_published).length,
+);
 
 /** Picked cover file + object name under `product-images` (DB stores `objectName` only). */
 const pendingCoverImage = ref<{ file: File; objectName: string } | null>(null);
@@ -243,6 +273,7 @@ const canSubmitAddProduct = computed(() => {
 function resetAddProductForm() {
   newTitle.value = "";
   newDesc.value = "";
+  newCategoryId.value = "";
   newPrice.value = "";
   pendingCoverImage.value = null;
   newPublished.value = true;
@@ -298,7 +329,7 @@ async function confirmDeleteProduct() {
   }
   deleteProductTargetId.value = null;
   toast.success("Product removed.");
-  await loadAll();
+  void loadAll({ silent: true });
 }
 
 watch(
@@ -394,7 +425,10 @@ async function consumePaystackStoreReturn() {
           : "";
       toast.error(
         bodyErr ||
-          formatFunctionsInvokeError(error, "paystack-verify-store-subscription") ||
+          formatFunctionsInvokeError(
+            error,
+            "paystack-verify-store-subscription",
+          ) ||
           "Could not verify payment.",
       );
       await router.replace({
@@ -462,6 +496,55 @@ const isStoreOwner = computed(
     !!sessionUserId.value &&
     store.value.owner_id === sessionUserId.value,
 );
+
+/** Show store Paystack CTA when free tier, no/lapsed sub, past_due, or renewal window. */
+const STORE_PLATFORM_PAY_WARNING_DAYS = 7;
+
+const signupPlanIdResolved = computed(() =>
+  normalizeSignupPlanId(
+    typeof user.value?.user_metadata?.signup_plan === "string"
+      ? user.value.user_metadata.signup_plan
+      : undefined,
+  ),
+);
+
+const isAccountOnFreePlan = computed(
+  () => signupPlanIdResolved.value === "free",
+);
+
+function subscriptionPeriodEndsWithinDays(
+  iso: string | null,
+  days: number,
+): boolean {
+  if (!iso) return false;
+  const end = new Date(iso).getTime();
+  if (Number.isNaN(end)) return false;
+  const cutoff = Date.now() + days * 86_400_000;
+  return end <= cutoff;
+}
+
+const showStorePlatformPayCta = computed(() => {
+  if (!isStoreOwner.value) return false;
+  if (isAccountOnFreePlan.value) return true;
+
+  const sub = sellerSubscription.value;
+  if (!sub) return true;
+
+  const st = sub.status;
+  if (st === "past_due" || st === "inactive" || st === "canceled") {
+    return true;
+  }
+
+  if (st === "active" || st === "trialing") {
+    if (!sub.current_period_end) return true;
+    return subscriptionPeriodEndsWithinDays(
+      sub.current_period_end,
+      STORE_PLATFORM_PAY_WARNING_DAYS,
+    );
+  }
+
+  return true;
+});
 
 /** Owners need a chosen plan (or super admin) before changing the shop logo. */
 const canUploadStoreLogo = computed(
@@ -555,6 +638,41 @@ const tickets = ref<
 const ticketSubject = ref("");
 const ticketMessage = ref("");
 const ticketBusy = ref(false);
+const supportTicketModalOpen = ref(false);
+
+function openSupportTicketModal() {
+  supportTicketModalOpen.value = true;
+}
+
+function closeSupportTicketModal() {
+  if (ticketBusy.value) return;
+  supportTicketModalOpen.value = false;
+}
+
+const ticketsOpenCount = computed(
+  () =>
+    tickets.value.filter((t) => (t.status || "").toLowerCase() === "open")
+      .length,
+);
+
+const ticketsClosedCount = computed(
+  () =>
+    tickets.value.filter((t) => (t.status || "").toLowerCase() === "closed")
+      .length,
+);
+
+function ticketStatusBadgeClass(status: string): string {
+  const s = (status || "").toLowerCase();
+  const base =
+    "inline-flex shrink-0 items-center justify-center rounded-full px-2.5 py-0.5 text-[11px] font-semibold capitalize tabular-nums ring-1";
+  if (s === "open") {
+    return `${base} bg-amber-50 text-amber-950 ring-amber-200/85`;
+  }
+  if (s === "closed") {
+    return `${base} bg-zinc-100 text-zinc-700 ring-zinc-200/80`;
+  }
+  return `${base} bg-violet-50 text-violet-900 ring-violet-200/80`;
+}
 
 const deliveryForms = ref<
   Record<
@@ -579,6 +697,58 @@ function ensureDeliveryForm(orderId: string) {
   }
 }
 
+function formatOrderListDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(d);
+}
+
+function orderShortId(id: string): string {
+  const t = id.replace(/-/g, "");
+  return t.length >= 10 ? `${t.slice(0, 6)}…${t.slice(-4)}` : id;
+}
+
+/** DD/MM/YYYY for product table "Listed" column. */
+function formatProductTableDate(iso: string): string {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const yyyy = d.getFullYear();
+  return `${dd}/${mm}/${yyyy}`;
+}
+
+function orderStatusPillClass(status: string): string {
+  switch (status) {
+    case "delivered":
+      return "bg-emerald-50 text-emerald-900 ring-emerald-200/70";
+    case "canceled":
+      return "bg-zinc-100 text-zinc-700 ring-zinc-200/80";
+    case "out_for_delivery":
+      return "bg-sky-50 text-sky-900 ring-sky-200/70";
+    case "preparing":
+    case "confirmed":
+      return "bg-amber-50 text-amber-950 ring-amber-200/70";
+    default:
+      return "bg-violet-50 text-violet-900 ring-violet-200/70";
+  }
+}
+
+function orderCustomerTitle(ord: (typeof orders.value)[0]): string {
+  if (ord.customer_id) return "Registered buyer";
+  return ord.guest_name?.trim() || "Guest checkout";
+}
+
+function orderCustomerSubtitle(ord: (typeof orders.value)[0]): string {
+  if (ord.customer_id) return "Signed-in account";
+  const email = ord.guest_email?.trim();
+  return email || "No email on file";
+}
+
 /** Public URL for first product image in `product-images` (same key shape as storefront). */
 function productCoverPublicUrl(path: string | undefined): string | null {
   if (!path?.trim() || !store.value?.id || !isSupabaseConfigured()) return null;
@@ -595,6 +765,7 @@ async function loadAll(opts?: { silent?: boolean }) {
     loading.value = true;
     store.value = null;
     sellerSubscription.value = null;
+    productCategories.value = [];
   }
   if (!isSupabaseConfigured() || !sessionUserId.value || !storeId.value) {
     if (!silent) loading.value = false;
@@ -610,11 +781,13 @@ async function loadAll(opts?: { silent?: boolean }) {
     if (se || !s) {
       toast.error(se?.message ?? "Store not found.");
       if (!silent) store.value = null;
+      productCategories.value = [];
       return;
     }
     if (s.owner_id !== sessionUserId.value && !isPlatformStaff.value) {
       toast.error("You do not manage this store.");
       store.value = null;
+      productCategories.value = [];
       return;
     }
     store.value = {
@@ -646,24 +819,66 @@ async function loadAll(opts?: { silent?: boolean }) {
         }
       : null;
 
-    const { data: p } = await supabase
-      .from("products")
-      .select("id, title, description, price_cents, is_published, image_paths")
-      .eq("store_id", s.id)
-      .order("created_at", { ascending: false });
-    products.value = (p ?? []).map((row) => ({
-      id: row.id,
-      title: row.title,
-      description:
-        typeof row.description === "string" && row.description.trim()
-          ? row.description.trim()
-          : null,
-      price_cents: row.price_cents,
-      is_published: row.is_published,
-      image_paths: Array.isArray(row.image_paths)
-        ? (row.image_paths as string[])
-        : [],
-    })) as typeof products.value;
+    const [{ data: catRows, error: catErr }, { data: p, error: pErr }] =
+      await Promise.all([
+        supabase
+          .from("product_categories")
+          .select("id, name")
+          .eq("store_id", s.id)
+          .order("name", { ascending: true }),
+        supabase
+          .from("products")
+          .select(
+            "id, title, description, price_cents, is_published, image_paths, category_id, created_at, product_categories ( name )",
+          )
+          .eq("store_id", s.id)
+          .order("created_at", { ascending: false }),
+      ]);
+    if (catErr) toast.error(catErr.message);
+    productCategories.value = (catRows ?? [])
+      .map((row) => {
+        const r = row as { id?: unknown; name?: unknown };
+        const name = typeof r.name === "string" ? r.name.trim() : "";
+        if (!name) return null;
+        return { id: String(r.id), name };
+      })
+      .filter((x): x is { id: string; name: string } => x !== null);
+    if (pErr) toast.error(pErr.message);
+    products.value = (p ?? []).map((row) => {
+      const r = row as Record<string, unknown>;
+      const rel = r.product_categories as { name?: string } | null | undefined;
+      const categoryName =
+        rel &&
+        typeof rel === "object" &&
+        typeof rel.name === "string" &&
+        rel.name.trim()
+          ? rel.name.trim()
+          : null;
+      const categoryId =
+        typeof r.category_id === "string" && r.category_id.trim()
+          ? r.category_id.trim()
+          : null;
+      const createdAt =
+        typeof r.created_at === "string" && r.created_at.trim()
+          ? r.created_at.trim()
+          : "";
+      return {
+        id: String(r.id),
+        title: String(r.title),
+        description:
+          typeof r.description === "string" && r.description.trim()
+            ? r.description.trim()
+            : null,
+        category_id: categoryId,
+        category_name: categoryName,
+        price_cents: Number(r.price_cents) || 0,
+        is_published: Boolean(r.is_published),
+        image_paths: Array.isArray(r.image_paths)
+          ? (r.image_paths as string[])
+          : [],
+        created_at: createdAt,
+      };
+    });
 
     const { data: o } = await supabase
       .from("orders")
@@ -705,6 +920,7 @@ useRealtimeTableRefresh({
     return [
       { table: "stores", filter: `id=eq.${id}` },
       { table: "products", filter: `store_id=eq.${id}` },
+      { table: "product_categories", filter: `store_id=eq.${id}` },
       { table: "orders", filter: `store_id=eq.${id}` },
       { table: "support_tickets", filter: `store_id=eq.${id}` },
       { table: "seller_subscriptions", filter: `store_id=eq.${id}` },
@@ -746,10 +962,15 @@ async function addProduct() {
       }
       paths = [objectName];
     }
+    const cid =
+      typeof newCategoryId.value === "string" && newCategoryId.value.trim()
+        ? newCategoryId.value.trim()
+        : null;
     const { error } = await supabase.from("products").insert({
       store_id: store.value.id,
       title: newTitle.value.trim(),
       description: newDesc.value.trim() || null,
+      category_id: cid,
       price_cents: cents,
       image_paths: paths,
       is_published: newPublished.value,
@@ -760,7 +981,7 @@ async function addProduct() {
     }
     closeAddProductModal();
     toast.success("Product added.");
-    await loadAll();
+    void loadAll({ silent: true });
   } finally {
     productBusy.value = false;
   }
@@ -768,17 +989,93 @@ async function addProduct() {
 
 async function togglePublish(p: (typeof products.value)[0]) {
   const supabase = getSupabaseBrowser();
+  const nextPublished = !p.is_published;
   const { error } = await supabase
     .from("products")
-    .update({ is_published: !p.is_published })
+    .update({ is_published: nextPublished })
     .eq("id", p.id);
   if (error) toast.error(error.message);
   else {
+    p.is_published = nextPublished;
     toast.success(
-      p.is_published ? "Product unpublished." : "Product published.",
+      nextPublished ? "Product published." : "Product unpublished.",
     );
-    await loadAll();
+    // Silent reload: no full-page skeleton (unlike `loadAll()`). Realtime also
+    // triggers the same once `products` is in `supabase_realtime` (migration).
+    void loadAll({ silent: true });
   }
+}
+
+async function saveProductCategoryId(
+  p: (typeof products.value)[0],
+  categoryId: string | null,
+) {
+  const next =
+    typeof categoryId === "string" && categoryId.trim()
+      ? categoryId.trim()
+      : null;
+  if (next === p.category_id) return;
+  categoryBusyId.value = p.id;
+  const supabase = getSupabaseBrowser();
+  const { error } = await supabase
+    .from("products")
+    .update({ category_id: next })
+    .eq("id", p.id);
+  categoryBusyId.value = null;
+  if (error) {
+    toast.error(error.message);
+    await loadAll({ silent: true });
+    return;
+  }
+  p.category_id = next;
+  p.category_name =
+    productCategories.value.find((c) => c.id === next)?.name ?? null;
+}
+
+async function addStoreCategory() {
+  if (!store.value) return;
+  const name = newCategoryName.value.trim();
+  if (!name) {
+    toast.info("Enter a category name.");
+    return;
+  }
+  categoryAddBusy.value = true;
+  const supabase = getSupabaseBrowser();
+  const { error } = await supabase.from("product_categories").insert({
+    store_id: store.value.id,
+    name,
+  });
+  categoryAddBusy.value = false;
+  if (error) {
+    toast.error(error.message);
+    return;
+  }
+  newCategoryName.value = "";
+  toast.success("Category added.");
+  await loadAll({ silent: true });
+}
+
+async function deleteStoreCategory(categoryId: string) {
+  if (deleteCategoryBusyId.value) return;
+  const cat = productCategories.value.find((c) => c.id === categoryId);
+  const label = cat?.name?.trim() || "this category";
+  const ok = window.confirm(
+    `Remove “${label}”? Any products using it will have no category selected.`,
+  );
+  if (!ok) return;
+  deleteCategoryBusyId.value = categoryId;
+  const supabase = getSupabaseBrowser();
+  const { error } = await supabase
+    .from("product_categories")
+    .delete()
+    .eq("id", categoryId);
+  deleteCategoryBusyId.value = null;
+  if (error) {
+    toast.error(error.message);
+    return;
+  }
+  toast.success("Category removed.");
+  await loadAll({ silent: true });
 }
 
 async function setOrderStatus(orderId: string, status: string) {
@@ -790,7 +1087,7 @@ async function setOrderStatus(orderId: string, status: string) {
   if (error) toast.error(error.message);
   else {
     toast.success("Order status updated.");
-    await loadAll();
+    void loadAll({ silent: true });
   }
 }
 
@@ -816,7 +1113,10 @@ async function saveDelivery(orderId: string) {
 
 async function submitSupportTicket() {
   if (!store.value || !sessionUserId.value) return;
-  if (!ticketSubject.value.trim() || !ticketMessage.value.trim()) return;
+  if (!ticketSubject.value.trim() || !ticketMessage.value.trim()) {
+    toast.info("Add a subject and a short description.");
+    return;
+  }
   ticketBusy.value = true;
   const supabase = getSupabaseBrowser();
   const { error } = await supabase.from("support_tickets").insert({
@@ -831,8 +1131,9 @@ async function submitSupportTicket() {
   else {
     ticketSubject.value = "";
     ticketMessage.value = "";
+    supportTicketModalOpen.value = false;
     toast.success("Support ticket sent.");
-    await loadAll();
+    void loadAll({ silent: true });
   }
 }
 
@@ -842,9 +1143,7 @@ function openStoreFeePlanModal() {
     user.value?.user_metadata?.signup_plan,
   );
   selectedStoreFeePlan.value =
-    normalized === "starter" ||
-    normalized === "growth" ||
-    normalized === "pro"
+    normalized === "starter" || normalized === "growth" || normalized === "pro"
       ? normalized
       : "starter";
   storeFeePlanModalOpen.value = true;
@@ -978,22 +1277,23 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
             </div>
           </div>
           <div class="flex shrink-0 flex-col items-end gap-2">
-            <button
-              type="button"
-              class="rounded-full border border-amber-200/80 bg-gradient-to-r from-amber-50 to-orange-50 px-5 py-2.5 text-sm font-semibold text-amber-950 shadow-sm ring-1 ring-amber-200/50 transition hover:from-amber-100 hover:to-orange-100 disabled:opacity-50"
-              :disabled="payBusy"
-              @click="openStoreFeePlanModal"
-            >
-              Pay store platform fee (test)
-            </button>
-            <p
-              v-if="isStoreOwner"
-              class="max-w-[15rem] text-right text-[10px] leading-snug text-zinc-500"
-            >
-              Choose Starter, Growth, or Pro, then pay the matching monthly
-              platform fee for this store. Your account plan is updated to the
-              same tier after a successful payment.
-            </p>
+            <template v-if="showStorePlatformPayCta">
+              <button
+                type="button"
+                class="rounded-full border border-amber-200/80 bg-gradient-to-r from-amber-50 to-orange-50 px-5 py-2.5 text-sm font-semibold text-amber-950 shadow-sm ring-1 ring-amber-200/50 transition hover:from-amber-100 hover:to-orange-100 disabled:opacity-50"
+                :disabled="payBusy"
+                @click="openStoreFeePlanModal"
+              >
+                Pay store platform fee
+              </button>
+              <p
+                class="max-w-[15rem] text-right text-[10px] leading-snug text-zinc-500"
+              >
+                Choose Starter, Growth, or Pro, then pay the matching monthly
+                platform fee for this store. Your account plan is updated to the
+                same tier after a successful payment.
+              </p>
+            </template>
             <p
               v-if="
                 sellerSubscription?.status === 'active' &&
@@ -1082,80 +1382,134 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
         </div>
 
         <div
-          class="flex max-h-[55dvh] min-h-0 flex-col overflow-hidden rounded-3xl border border-zinc-200/70 bg-white/90 shadow-[0_16px_48px_-28px_rgba(15,23,42,0.14)] ring-1 ring-zinc-100/80 backdrop-blur-md"
+          class="flex min-h-0 flex-col gap-6 xl:grid xl:grid-cols-2 xl:items-start xl:gap-6"
         >
           <div
-            class="hidden shrink-0 grid-cols-[5.5rem_minmax(0,1fr)_7.5rem_5.5rem_11rem] gap-3 border-b border-zinc-200 bg-zinc-50/95 px-4 py-3 text-[11px] font-bold uppercase tracking-wider text-zinc-500 lg:grid"
+            class="flex max-h-[55dvh] min-h-0 min-w-0 w-full flex-col overflow-hidden rounded-t-3xl rounded-b-none border border-zinc-200/70 bg-white/95 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.16)] ring-1 ring-zinc-100/80 backdrop-blur-md"
           >
-            <span>Photo</span>
-            <span class="text-left">
-              <span class="block">Product</span>
-              <span
-                class="mt-0.5 block text-[10px] font-semibold normal-case tracking-normal text-zinc-400"
-                >Description</span
-              >
-            </span>
-            <span class="text-right">Price</span>
-            <span>Status</span>
-            <span class="text-right">Actions</span>
-          </div>
-          <ul
-            v-if="products.length"
-            class="min-h-0 flex-1 overflow-y-auto overscroll-y-contain"
-          >
-            <li
-              v-for="p in products"
-              :key="p.id"
-              class="border-b border-zinc-200 transition last:border-b-0 hover:bg-zinc-50/60"
+            <div
+              class="flex shrink-0 flex-col gap-2 border-b border-zinc-100 bg-gradient-to-r from-zinc-50/95 to-white px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5"
             >
-              <div
-                class="flex flex-col gap-4 p-4 lg:grid lg:grid-cols-[5.5rem_minmax(0,1fr)_7.5rem_5.5rem_11rem] lg:items-start lg:gap-4"
-              >
-                <div
-                  class="mx-auto flex h-24 w-24 shrink-0 overflow-hidden rounded-2xl border border-zinc-200/80 bg-zinc-100 shadow-inner lg:mx-0 lg:h-20 lg:w-20"
+              <div class="min-w-0">
+                <h3 class="text-sm font-bold tracking-tight text-zinc-900">
+                  Product list
+                </h3>
+                <p
+                  class="mt-0.5 text-[11px] font-medium leading-snug text-zinc-500"
                 >
-                  <img
-                    v-if="productCoverPublicUrl(p.image_paths?.[0])"
-                    :src="productCoverPublicUrl(p.image_paths[0])!"
-                    alt=""
-                    class="h-full w-full object-cover"
-                    loading="lazy"
-                    @error="
-                      ($event.target as HTMLImageElement).style.display = 'none'
-                    "
-                  />
-                  <div
-                    v-else
-                    class="flex h-full w-full items-center justify-center text-zinc-300"
-                    aria-hidden="true"
-                  >
-                    <svg
-                      class="h-9 w-9 opacity-60"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="1.5"
+                  Listed date, category, price, and status — labels stay on the
+                  right panel.
+                </p>
+              </div>
+              <span
+                class="inline-flex shrink-0 items-center gap-1.5 self-start rounded-full bg-zinc-900/[0.06] px-2.5 py-1 text-[11px] font-bold tabular-nums text-zinc-700 ring-1 ring-zinc-200/80 sm:self-auto"
+              >
+                <span class="text-zinc-500">Items</span>
+                {{ products.length }}
+              </span>
+            </div>
+            <div
+              class="hidden shrink-0 grid-cols-[minmax(0,1.2fr)_10.25rem_4.75rem_5rem_3.75rem_5.75rem] gap-x-2 gap-y-1 border-b border-zinc-200 bg-zinc-100/90 px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500 lg:grid"
+            >
+              <span class="text-left">Name</span>
+              <span class="text-left">Category</span>
+              <span class="text-left">Listed</span>
+              <span class="text-right">Price</span>
+              <span class="text-center">Status</span>
+              <span class="text-right">Action</span>
+            </div>
+            <template v-if="products.length">
+            <ul
+              class="min-h-0 flex-1 overflow-x-auto overflow-y-auto overscroll-y-contain"
+            >
+              <li
+                v-for="p in products"
+                :key="p.id"
+                class="border-b border-zinc-100 transition-colors last:border-b-0 hover:bg-zinc-50/80 motion-safe:duration-150"
+              >
+                <!-- Mobile: card-style row -->
+                <div class="space-y-3 p-4 lg:hidden">
+                  <div class="flex gap-3">
+                    <div
+                      class="flex h-[3.25rem] w-[3.25rem] shrink-0 overflow-hidden rounded-xl border border-zinc-200/80 bg-zinc-100 shadow-inner"
                     >
-                      <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-                      <circle cx="8.5" cy="8.5" r="1.5" />
-                      <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
-                    </svg>
+                      <img
+                        v-if="productCoverPublicUrl(p.image_paths?.[0])"
+                        :src="productCoverPublicUrl(p.image_paths[0])!"
+                        alt=""
+                        class="h-full w-full object-cover"
+                        loading="lazy"
+                        @error="
+                          ($event.target as HTMLImageElement).style.display =
+                            'none'
+                        "
+                      />
+                      <div
+                        v-else
+                        class="flex h-full w-full items-center justify-center text-zinc-300"
+                        aria-hidden="true"
+                      >
+                        <svg
+                          class="h-6 w-6 opacity-60"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.5"
+                        >
+                          <rect
+                            x="3"
+                            y="3"
+                            width="18"
+                            height="18"
+                            rx="2"
+                            ry="2"
+                          />
+                          <circle cx="8.5" cy="8.5" r="1.5" />
+                          <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+                        </svg>
+                      </div>
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <p
+                        class="text-[0.9375rem] font-semibold leading-snug tracking-tight text-zinc-900"
+                      >
+                        {{ p.title }}
+                      </p>
+                      <p
+                        v-if="p.description"
+                        class="mt-0.5 line-clamp-2 text-xs leading-relaxed text-zinc-600"
+                      >
+                        {{ p.description }}
+                      </p>
+                      <p
+                        class="mt-1.5 text-[11px] font-medium tabular-nums text-zinc-500"
+                      >
+                        Listed {{ formatProductTableDate(p.created_at) }}
+                      </p>
+                    </div>
                   </div>
-                </div>
-                <div class="min-w-0 text-center lg:text-left">
-                  <p class="font-semibold text-zinc-900">{{ p.title }}</p>
-                  <p
-                    v-if="p.description"
-                    class="mt-1 whitespace-pre-wrap text-left text-sm leading-snug text-zinc-600 line-clamp-3"
-                  >
-                    {{ p.description }}
-                  </p>
-                  <p class="mt-1 text-sm text-zinc-600 lg:hidden">
-                    {{ formatGhs(p.price_cents) }}
-                  </p>
-                  <p class="mt-1 lg:hidden">
+                  <div class="min-w-0">
                     <span
-                      class="inline-flex rounded-full px-2.5 py-0.5 text-xs font-semibold"
+                      class="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
+                    >
+                      Category
+                    </span>
+                    <ProductCategoryDropdown
+                      :category-id="p.category_id"
+                      :categories="productCategories"
+                      :pending="categoryBusyId === p.id"
+                      size="md"
+                      @pick="(v) => saveProductCategoryId(p, v)"
+                    />
+                  </div>
+                  <div
+                    class="flex flex-wrap items-center justify-between gap-3 border-t border-zinc-100/90 pt-3"
+                  >
+                    <p class="text-sm font-bold tabular-nums text-zinc-900">
+                      {{ formatGhs(p.price_cents) }}
+                    </p>
+                    <span
+                      class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold"
                       :class="
                         p.is_published
                           ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
@@ -1164,213 +1518,1085 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                     >
                       {{ p.is_published ? "Live" : "Draft" }}
                     </span>
-                  </p>
+                    <div class="ml-auto flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        class="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-teal-300 hover:bg-teal-50/90 hover:text-teal-800 focus-visible:ring-2 focus-visible:ring-teal-500/30"
+                        :aria-label="
+                          p.is_published
+                            ? 'Unpublish product'
+                            : 'Publish product'
+                        "
+                        @click="togglePublish(p)"
+                      >
+                        <svg
+                          v-if="p.is_published"
+                          class="h-[1.125rem] w-[1.125rem]"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.75"
+                          aria-hidden="true"
+                        >
+                          <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            d="M5.25 7.5A2.25 2.25 0 017.5 5.25h9a2.25 2.25 0 012.25 2.25v9a2.25 2.25 0 01-2.25 2.25h-9a2.25 2.25 0 01-2.25-2.25v-9z"
+                          />
+                          <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            d="M10.5 9.75v4.5m3-2.25h-4.5"
+                          />
+                        </svg>
+                        <svg
+                          v-else
+                          class="h-[1.125rem] w-[1.125rem]"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.75"
+                          aria-hidden="true"
+                        >
+                          <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z"
+                          />
+                        </svg>
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-rose-600 shadow-sm outline-none transition hover:border-rose-300 hover:bg-rose-50 focus-visible:ring-2 focus-visible:ring-rose-500/25"
+                        aria-label="Delete product"
+                        @click="openDeleteProductDialog(p.id)"
+                      >
+                        <svg
+                          class="h-[1.125rem] w-[1.125rem]"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.75"
+                          aria-hidden="true"
+                        >
+                          <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"
+                          />
+                        </svg>
+                      </button>
+                    </div>
+                  </div>
                 </div>
-                <p
-                  class="hidden self-center text-right text-sm font-semibold tabular-nums text-zinc-800 lg:block"
+
+                <!-- Desktop: wide table row -->
+                <div
+                  class="hidden min-w-[42rem] grid-cols-[minmax(0,1.2fr)_10.25rem_4.75rem_5rem_3.75rem_5.75rem] gap-x-2 gap-y-1 px-4 py-4 lg:grid lg:items-center"
                 >
-                  {{ formatGhs(p.price_cents) }}
-                </p>
-                <div class="hidden self-center lg:block">
-                  <span
-                    class="inline-flex rounded-full px-2.5 py-0.5 text-xs font-semibold"
-                    :class="
-                      p.is_published
-                        ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
-                        : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
-                    "
+                  <div class="flex min-w-0 items-center gap-3">
+                    <div
+                      class="flex h-11 w-11 shrink-0 overflow-hidden rounded-lg border border-zinc-200/80 bg-zinc-100 shadow-inner"
+                    >
+                      <img
+                        v-if="productCoverPublicUrl(p.image_paths?.[0])"
+                        :src="productCoverPublicUrl(p.image_paths[0])!"
+                        alt=""
+                        class="h-full w-full object-cover"
+                        loading="lazy"
+                        @error="
+                          ($event.target as HTMLImageElement).style.display =
+                            'none'
+                        "
+                      />
+                      <div
+                        v-else
+                        class="flex h-full w-full items-center justify-center text-zinc-300"
+                        aria-hidden="true"
+                      >
+                        <svg
+                          class="h-5 w-5 opacity-60"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.5"
+                        >
+                          <rect
+                            x="3"
+                            y="3"
+                            width="18"
+                            height="18"
+                            rx="2"
+                            ry="2"
+                          />
+                          <circle cx="8.5" cy="8.5" r="1.5" />
+                          <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+                        </svg>
+                      </div>
+                    </div>
+                    <div class="min-w-0">
+                      <p
+                        class="truncate text-sm font-semibold tracking-tight text-zinc-900"
+                      >
+                        {{ p.title }}
+                      </p>
+                      <p
+                        v-if="p.description"
+                        class="mt-0.5 line-clamp-1 text-xs leading-snug text-zinc-500"
+                      >
+                        {{ p.description }}
+                      </p>
+                    </div>
+                  </div>
+                  <div class="min-w-0 max-w-[10.25rem] justify-self-stretch">
+                    <span class="sr-only">Category</span>
+                    <ProductCategoryDropdown
+                      :category-id="p.category_id"
+                      :categories="productCategories"
+                      :pending="categoryBusyId === p.id"
+                      size="sm"
+                      @pick="(v) => saveProductCategoryId(p, v)"
+                    />
+                  </div>
+                  <p class="text-xs tabular-nums text-zinc-600">
+                    {{ formatProductTableDate(p.created_at) }}
+                  </p>
+                  <p
+                    class="text-right text-sm font-semibold tabular-nums text-zinc-900"
                   >
-                    {{ p.is_published ? "Live" : "Draft" }}
+                    {{ formatGhs(p.price_cents) }}
+                  </p>
+                  <div class="flex justify-center">
+                    <span
+                      class="inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                      :class="
+                        p.is_published
+                          ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
+                          : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
+                      "
+                    >
+                      {{ p.is_published ? "Live" : "Draft" }}
+                    </span>
+                  </div>
+                  <div class="flex justify-end gap-1">
+                    <button
+                      type="button"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-teal-300 hover:bg-teal-50/90 hover:text-teal-800 focus-visible:ring-2 focus-visible:ring-teal-500/30"
+                      :aria-label="
+                        p.is_published ? 'Unpublish product' : 'Publish product'
+                      "
+                      @click="togglePublish(p)"
+                    >
+                      <svg
+                        v-if="p.is_published"
+                        class="h-[1.125rem] w-[1.125rem]"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.75"
+                        aria-hidden="true"
+                      >
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          d="M5.25 7.5A2.25 2.25 0 017.5 5.25h9a2.25 2.25 0 012.25 2.25v9a2.25 2.25 0 01-2.25 2.25h-9a2.25 2.25 0 01-2.25-2.25v-9z"
+                        />
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          d="M10.5 9.75v4.5m3-2.25h-4.5"
+                        />
+                      </svg>
+                      <svg
+                        v-else
+                        class="h-[1.125rem] w-[1.125rem]"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.75"
+                        aria-hidden="true"
+                      >
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z"
+                        />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-rose-600 shadow-sm outline-none transition hover:border-rose-300 hover:bg-rose-50 focus-visible:ring-2 focus-visible:ring-rose-500/25"
+                      aria-label="Delete product"
+                      @click="openDeleteProductDialog(p.id)"
+                    >
+                      <svg
+                        class="h-[1.125rem] w-[1.125rem]"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="1.75"
+                        aria-hidden="true"
+                      >
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </li>
+            </ul>
+            <footer
+              class="shrink-0 border-t border-zinc-200/90 bg-gradient-to-r from-zinc-50/95 to-zinc-100/80 px-4 py-3.5 sm:px-5"
+              aria-label="Product list summary"
+            >
+              <div
+                class="flex flex-col gap-3 text-xs text-zinc-600 lg:hidden"
+              >
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <span class="font-semibold text-zinc-800">Summary</span>
+                  <span class="tabular-nums text-zinc-500"
+                    >{{ products.length }} products</span
+                  >
+                </div>
+                <div class="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+                  <span
+                    >Live
+                    <span class="font-semibold text-emerald-800">{{
+                      productsPublishedCount
+                    }}</span></span
+                  >
+                  <span
+                    >Draft
+                    <span class="font-semibold text-zinc-800">{{
+                      productsDraftCount
+                    }}</span></span
+                  >
+                  <span class="ml-auto font-semibold tabular-nums text-zinc-900">
+                    List total {{ formatGhs(productsPriceTotalCents) }}
                   </span>
                 </div>
-                <div
-                  class="flex flex-wrap justify-center gap-2 self-center lg:justify-end"
+              </div>
+              <div
+                class="hidden min-w-[42rem] grid-cols-[minmax(0,1.2fr)_10.25rem_4.75rem_5rem_3.75rem_5.75rem] gap-x-2 text-[11px] lg:grid lg:items-center"
+              >
+                <span class="font-bold uppercase tracking-wider text-zinc-500"
+                  >Summary</span
                 >
+                <span class="text-zinc-400" aria-hidden="true">—</span>
+                <span class="text-zinc-400" aria-hidden="true">—</span>
+                <p
+                  class="text-right text-sm font-bold tabular-nums tracking-tight text-zinc-900"
+                >
+                  {{ formatGhs(productsPriceTotalCents) }}
+                </p>
+                <div class="flex justify-center">
+                  <span
+                    class="inline-flex max-w-full flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5 text-center text-[11px] font-medium text-zinc-600"
+                  >
+                    <span class="text-emerald-800"
+                      >{{ productsPublishedCount }} live</span
+                    >
+                    <span class="text-zinc-300" aria-hidden="true">·</span>
+                    <span>{{ productsDraftCount }} draft</span>
+                  </span>
+                </div>
+                <span
+                  class="text-right text-[10px] font-semibold uppercase tracking-wide text-zinc-400"
+                >
+                  {{ products.length }} rows
+                </span>
+              </div>
+            </footer>
+            </template>
+            <p
+              v-else
+              class="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-16 text-center"
+            >
+              <span
+                class="flex h-14 w-14 items-center justify-center rounded-2xl bg-zinc-100 text-zinc-400 ring-1 ring-zinc-200/80"
+                aria-hidden="true"
+              >
+                <svg
+                  class="h-7 w-7"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"
+                  />
+                </svg>
+              </span>
+              <span class="text-sm font-semibold text-zinc-700">
+                No products in this store yet
+              </span>
+              <span class="max-w-xs text-xs leading-relaxed text-zinc-500">
+                Add your first item with
+                <span class="font-semibold text-zinc-600">Add product</span>
+                — you can attach categories anytime.
+              </span>
+            </p>
+          </div>
+
+          <aside
+            class="w-full min-w-0 shrink-0 overflow-hidden rounded-3xl border border-violet-200/50 bg-gradient-to-b from-violet-50/80 via-white to-teal-50/30 p-1 shadow-[0_16px_40px_-24px_rgba(91,33,182,0.2)] ring-1 ring-violet-100/60 xl:sticky xl:top-4 xl:self-start"
+          >
+            <div
+              class="rounded-[1.35rem] border border-white/80 bg-white/85 p-4 shadow-inner backdrop-blur-sm sm:p-5"
+            >
+              <div class="flex items-start justify-between gap-3">
+                <div class="flex min-w-0 gap-3">
+                  <span
+                    class="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-violet-500 to-teal-500 text-white shadow-md shadow-violet-500/25"
+                    aria-hidden="true"
+                  >
+                    <svg
+                      class="h-5 w-5"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                    >
+                      <path
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"
+                      />
+                    </svg>
+                  </span>
+                  <div class="min-w-0">
+                    <h3
+                      class="text-base font-bold tracking-tight text-zinc-900"
+                    >
+                      Categories
+                    </h3>
+                    <p class="mt-0.5 text-xs leading-relaxed text-zinc-600">
+                      Group products for your shop — each product can show its
+                      category as a label for buyers.
+                    </p>
+                  </div>
+                </div>
+                <span
+                  v-if="productCategories.length"
+                  class="inline-flex shrink-0 rounded-full bg-violet-100 px-2 py-0.5 text-[11px] font-bold tabular-nums text-violet-900 ring-1 ring-violet-200/80"
+                >
+                  {{ productCategories.length }}
+                </span>
+              </div>
+
+              <div
+                v-if="uncategorizedProductCount > 0 && products.length"
+                class="mt-4 flex items-start gap-2.5 rounded-2xl border border-amber-200/80 bg-amber-50/90 px-3 py-2.5 text-xs leading-snug text-amber-950 ring-1 ring-amber-100/80"
+                role="status"
+              >
+                <span
+                  class="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-amber-100 text-amber-700"
+                  aria-hidden="true"
+                >
+                  <svg
+                    class="h-3.5 w-3.5"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M12 18v-5M9 9a3 3 0 116 0c0 2-3 2-3 4"
+                    />
+                  </svg>
+                </span>
+                <span>
+                  <span class="font-semibold">{{
+                    uncategorizedProductCount
+                  }}</span>
+                  {{
+                    uncategorizedProductCount === 1
+                      ? "product has"
+                      : "products have"
+                  }}
+                  no category — pick one in the list when you are ready.
+                </span>
+              </div>
+
+              <div class="mt-4">
+                <label for="store-new-category-name" class="sr-only"
+                  >New category name</label
+                >
+                <div
+                  class="flex flex-col gap-2 rounded-2xl border border-zinc-200/70 bg-zinc-50/50 p-1.5 sm:flex-row sm:items-stretch"
+                >
+                  <input
+                    id="store-new-category-name"
+                    v-model="newCategoryName"
+                    type="text"
+                    autocomplete="off"
+                    placeholder="e.g. Snacks, Drinks, Deals"
+                    class="min-w-0 flex-1 rounded-xl border border-transparent bg-white px-3 py-2.5 text-sm text-zinc-900 shadow-sm outline-none ring-zinc-200/80 transition placeholder:text-zinc-400 focus:border-teal-300 focus:ring-2 focus:ring-teal-500/20"
+                    @keydown.enter.prevent="addStoreCategory"
+                  />
                   <button
                     type="button"
-                    class="rounded-full border border-teal-200/80 bg-teal-50/90 px-3 py-1.5 text-sm font-semibold text-teal-900 transition hover:bg-teal-100"
-                    @click="togglePublish(p)"
+                    class="inline-flex items-center justify-center gap-2 rounded-xl bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-white shadow-md shadow-zinc-900/10 transition hover:bg-zinc-800 disabled:pointer-events-none disabled:opacity-45 sm:shrink-0"
+                    :disabled="categoryAddBusy || !newCategoryName.trim()"
+                    @click="addStoreCategory"
                   >
-                    {{ p.is_published ? "Unpublish" : "Publish" }}
+                    <span
+                      v-if="categoryAddBusy"
+                      class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white"
+                      aria-hidden="true"
+                    />
+                    <span v-else class="text-lg leading-none" aria-hidden="true"
+                      >+</span
+                    >
+                    <span>{{ categoryAddBusy ? "Adding…" : "Add" }}</span>
                   </button>
+                </div>
+                <p class="mt-2 text-[11px] font-medium text-zinc-500">
+                  Press
+                  <kbd
+                    class="rounded border border-zinc-200 bg-white px-1 py-0.5 font-mono text-[10px] text-zinc-600"
+                    >Enter</kbd
+                  >
+                  to add quickly.
+                </p>
+              </div>
+
+              <ul
+                v-if="productCategories.length"
+                class="mt-4 max-h-[min(20rem,calc(100dvh-14rem))] space-y-2 overflow-y-auto overscroll-y-contain pr-0.5"
+              >
+                <li
+                  v-for="c in productCategories"
+                  :key="c.id"
+                  class="group flex items-center gap-2 rounded-2xl border border-violet-100 bg-gradient-to-r from-white to-violet-50/40 px-3 py-2.5 text-sm font-semibold text-violet-950 shadow-sm ring-1 ring-violet-100/60 transition hover:border-violet-200 hover:shadow-md"
+                >
+                  <span
+                    class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-100 text-violet-700"
+                    aria-hidden="true"
+                  >
+                    <svg
+                      class="h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                    >
+                      <path
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z"
+                      />
+                    </svg>
+                  </span>
+                  <span class="min-w-0 flex-1 truncate">{{ c.name }}</span>
                   <button
                     type="button"
-                    class="rounded-full border border-rose-200/80 bg-rose-50/90 px-3 py-1.5 text-sm font-semibold text-rose-800 transition hover:bg-rose-100"
-                    @click="openDeleteProductDialog(p.id)"
+                    class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-rose-200/70 bg-white text-rose-600 opacity-90 transition hover:bg-rose-50 hover:opacity-100 disabled:pointer-events-none disabled:opacity-40"
+                    :disabled="deleteCategoryBusyId === c.id"
+                    :aria-label="`Remove category ${c.name}`"
+                    title="Remove category"
+                    @click="deleteStoreCategory(c.id)"
                   >
-                    Delete
+                    <span
+                      v-if="deleteCategoryBusyId === c.id"
+                      class="h-4 w-4 animate-spin rounded-full border-2 border-rose-200 border-t-rose-600"
+                      aria-hidden="true"
+                    />
+                    <svg
+                      v-else
+                      class="h-4 w-4"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2"
+                      aria-hidden="true"
+                    >
+                      <path
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"
+                      />
+                    </svg>
                   </button>
+                </li>
+              </ul>
+              <div
+                v-else
+                class="mt-4 flex flex-col items-center rounded-2xl border border-dashed border-violet-200/80 bg-violet-50/30 px-4 py-8 text-center"
+              >
+                <p class="text-sm font-semibold text-violet-950">
+                  No categories yet
+                </p>
+                <p
+                  class="mt-1 max-w-[16rem] text-xs leading-relaxed text-violet-800/80"
+                >
+                  Add a name above to create your first label, then assign it to
+                  products in the table.
+                </p>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section v-show="tab === 'orders'" class="space-y-4">
+        <div
+          class="flex max-h-[min(70dvh,42rem)] min-h-0 flex-col overflow-hidden rounded-3xl border border-zinc-200/70 bg-white/95 shadow-[0_16px_48px_-28px_rgba(15,23,42,0.14)] ring-1 ring-zinc-100/80 backdrop-blur-md"
+        >
+          <div
+            class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-zinc-100 bg-gradient-to-r from-zinc-50/95 to-white px-4 py-3.5 sm:px-5"
+          >
+            <div>
+              <h2 class="text-sm font-bold tracking-tight text-zinc-900">
+                Orders &amp; delivery
+              </h2>
+              <p class="mt-0.5 text-[11px] font-medium text-zinc-500">
+                Update fulfilment status and buyer-facing delivery updates.
+              </p>
+            </div>
+            <span
+              class="inline-flex items-center rounded-full bg-zinc-900/90 px-2.5 py-1 text-[11px] font-bold tabular-nums text-white shadow-sm"
+            >
+              {{ orders.length }} total
+            </span>
+          </div>
+
+          <ul
+            v-if="orders.length"
+            class="min-h-0 flex-1 divide-y divide-zinc-100 overflow-y-auto overscroll-y-contain"
+          >
+            <li
+              v-for="ord in orders"
+              :key="ord.id"
+              class="group/ord transition-colors hover:bg-zinc-50/70"
+            >
+              <div
+                class="flex flex-col gap-4 p-4 sm:flex-row sm:items-start sm:justify-between sm:gap-5 sm:p-5"
+              >
+                <div class="flex min-w-0 flex-1 gap-3.5">
+                  <div
+                    class="relative mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-zinc-200/80 bg-gradient-to-br from-teal-100 to-sky-100 text-sm font-bold text-teal-900 shadow-inner ring-1 ring-white/80"
+                    aria-hidden="true"
+                  >
+                    <span class="select-none">{{
+                      orderCustomerTitle(ord).charAt(0).toUpperCase()
+                    }}</span>
+                  </div>
+                  <div class="min-w-0 flex-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <p
+                        class="truncate text-[0.9375rem] font-semibold tracking-tight text-zinc-900"
+                      >
+                        {{ orderCustomerTitle(ord) }}
+                      </p>
+                      <span
+                        class="inline-flex shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1"
+                        :class="orderStatusPillClass(ord.status)"
+                      >
+                        {{ ord.status.replace(/_/g, " ") }}
+                      </span>
+                    </div>
+                    <p class="mt-0.5 truncate text-xs text-zinc-500">
+                      {{ orderCustomerSubtitle(ord) }}
+                    </p>
+                    <p
+                      class="mt-1 font-mono text-[10px] font-medium text-zinc-400"
+                    >
+                      {{ orderShortId(ord.id) }}
+                      <span class="text-zinc-300">·</span>
+                      {{ formatOrderListDate(ord.created_at) }}
+                    </p>
+                    <p
+                      v-if="ord.delivery_address"
+                      class="mt-2 line-clamp-2 text-xs leading-relaxed text-zinc-600"
+                    >
+                      <span class="font-semibold text-zinc-500">Drop-off</span>
+                      {{ ord.delivery_address }}
+                    </p>
+                  </div>
+                </div>
+                <div class="shrink-0 sm:pt-0.5">
+                  <label class="sr-only" :for="`order-status-${ord.id}`"
+                    >Order status</label
+                  >
+                  <select
+                    :id="`order-status-${ord.id}`"
+                    class="w-full min-w-[11.5rem] cursor-pointer appearance-none rounded-xl border border-zinc-200/90 bg-white py-2.5 pl-3 pr-9 text-sm font-semibold text-zinc-900 shadow-sm outline-none transition hover:border-zinc-300 focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20 sm:w-auto"
+                    :value="ord.status"
+                    @change="
+                      setOrderStatus(
+                        ord.id,
+                        ($event.target as HTMLSelectElement).value,
+                      )
+                    "
+                  >
+                    <option value="pending">Pending</option>
+                    <option value="confirmed">Confirmed</option>
+                    <option value="preparing">Preparing</option>
+                    <option value="out_for_delivery">Out for delivery</option>
+                    <option value="delivered">Delivered</option>
+                    <option value="canceled">Canceled</option>
+                  </select>
+                </div>
+              </div>
+
+              <div
+                v-if="deliveryForms[ord.id]"
+                class="border-t border-zinc-100/90 bg-gradient-to-b from-zinc-50/40 to-white/60 px-4 pb-4 pt-3 sm:px-5 sm:pb-5"
+              >
+                <div
+                  class="flex flex-wrap items-center justify-between gap-2 border-l-2 border-teal-400/80 pl-3"
+                >
+                  <h3
+                    class="text-[11px] font-bold uppercase tracking-wider text-teal-900/80"
+                  >
+                    Delivery tracking
+                  </h3>
+                  <button
+                    type="button"
+                    class="inline-flex items-center justify-center rounded-full bg-zinc-900 px-4 py-1.5 text-[11px] font-bold uppercase tracking-wide text-white shadow-md transition hover:bg-zinc-800 active:scale-[0.98]"
+                    @click="saveDelivery(ord.id)"
+                  >
+                    Save tracking
+                  </button>
+                </div>
+                <div
+                  class="mt-3 grid gap-3 border-l-2 border-transparent pl-3 sm:grid-cols-2 lg:grid-cols-12"
+                >
+                  <div class="sm:col-span-2 lg:col-span-4">
+                    <label
+                      class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
+                      :for="`del-stage-${ord.id}`"
+                      >Stage</label
+                    >
+                    <select
+                      :id="`del-stage-${ord.id}`"
+                      v-model="deliveryForms[ord.id].stage"
+                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow-sm outline-none transition focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20"
+                    >
+                      <option value="pending">Pending</option>
+                      <option value="picked_up">Picked up</option>
+                      <option value="in_transit">In transit</option>
+                      <option value="delivered">Delivered</option>
+                    </select>
+                  </div>
+                  <div class="sm:col-span-2 lg:col-span-8">
+                    <label
+                      class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
+                      :for="`del-msg-${ord.id}`"
+                      >Message to customer</label
+                    >
+                    <input
+                      :id="`del-msg-${ord.id}`"
+                      v-model="deliveryForms[ord.id].last_message"
+                      type="text"
+                      placeholder="e.g. Rider is 10 minutes away"
+                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20"
+                    />
+                  </div>
+                  <div class="sm:col-span-1 lg:col-span-3">
+                    <label
+                      class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
+                      :for="`del-lat-${ord.id}`"
+                      >Latitude</label
+                    >
+                    <input
+                      :id="`del-lat-${ord.id}`"
+                      v-model="deliveryForms[ord.id].last_latitude"
+                      type="text"
+                      inputmode="decimal"
+                      placeholder="5.6037"
+                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-white px-3 py-2 font-mono text-sm text-zinc-900 shadow-sm outline-none transition focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20"
+                    />
+                  </div>
+                  <div class="sm:col-span-1 lg:col-span-3">
+                    <label
+                      class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
+                      :for="`del-lng-${ord.id}`"
+                      >Longitude</label
+                    >
+                    <input
+                      :id="`del-lng-${ord.id}`"
+                      v-model="deliveryForms[ord.id].last_longitude"
+                      type="text"
+                      inputmode="decimal"
+                      placeholder="-0.1870"
+                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-white px-3 py-2 font-mono text-sm text-zinc-900 shadow-sm outline-none transition focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20"
+                    />
+                  </div>
                 </div>
               </div>
             </li>
           </ul>
-          <p
-            v-else
-            class="flex flex-1 flex-col items-center justify-center gap-2 px-4 py-12 text-center text-sm text-zinc-500"
-          >
-            No products yet. Add one with the button above.
-          </p>
-        </div>
-      </section>
 
-      <section v-show="tab === 'orders'" class="space-y-6">
-        <div
-          v-for="ord in orders"
-          :key="ord.id"
-          class="rounded-3xl border border-white/60 bg-white/70 p-6 shadow-[0_24px_60px_-32px_rgba(15,23,42,0.14)] backdrop-blur-xl"
-        >
-          <div class="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p class="font-mono text-xs text-zinc-500">{{ ord.id }}</p>
-              <p class="text-sm text-zinc-700">
-                <template v-if="ord.customer_id"
-                  >Registered buyer (account)</template
-                >
-                <template v-else>
-                  {{ ord.guest_name ?? "Guest" }} · {{ ord.guest_email ?? "—" }}
-                </template>
-              </p>
-              <p v-if="ord.delivery_address" class="mt-1 text-sm text-zinc-600">
-                {{ ord.delivery_address }}
-              </p>
-            </div>
-            <div>
-              <label
-                class="text-xs font-semibold uppercase tracking-wide text-zinc-500"
-                >Order status</label
-              >
-              <select
-                class="mt-1.5 block w-full min-w-[10rem] rounded-2xl border border-zinc-200/80 bg-white/90 px-3 py-2 text-sm text-zinc-900 outline-none focus:border-teal-300 focus:ring-4 focus:ring-teal-500/15"
-                :value="ord.status"
-                @change="
-                  setOrderStatus(
-                    ord.id,
-                    ($event.target as HTMLSelectElement).value,
-                  )
-                "
-              >
-                <option value="pending">pending</option>
-                <option value="confirmed">confirmed</option>
-                <option value="preparing">preparing</option>
-                <option value="out_for_delivery">out_for_delivery</option>
-                <option value="delivered">delivered</option>
-                <option value="canceled">canceled</option>
-              </select>
-            </div>
-          </div>
           <div
-            v-if="deliveryForms[ord.id]"
-            class="mt-5 border-t border-zinc-100/80 pt-5"
+            v-else
+            class="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center"
           >
-            <h3 class="text-sm font-bold text-zinc-900">Delivery tracking</h3>
-            <div class="mt-3 grid gap-3 sm:grid-cols-2">
-              <div>
-                <label class="text-xs font-medium text-zinc-500">Stage</label>
-                <select
-                  v-model="deliveryForms[ord.id].stage"
-                  class="mt-1 w-full rounded-2xl border border-zinc-200/80 bg-white/90 px-3 py-2 text-sm outline-none focus:border-teal-300 focus:ring-4 focus:ring-teal-500/15"
-                >
-                  <option value="pending">pending</option>
-                  <option value="picked_up">picked_up</option>
-                  <option value="in_transit">in_transit</option>
-                  <option value="delivered">delivered</option>
-                </select>
-              </div>
-              <div class="sm:col-span-2">
-                <label class="text-xs font-medium text-zinc-500"
-                  >Message to customer</label
-                >
-                <input
-                  v-model="deliveryForms[ord.id].last_message"
-                  type="text"
-                  class="mt-1 w-full rounded-2xl border border-zinc-200/80 bg-white/90 px-3 py-2 text-sm outline-none focus:border-teal-300 focus:ring-4 focus:ring-teal-500/15"
-                />
-              </div>
-              <div>
-                <label class="text-xs font-medium text-zinc-500"
-                  >Latitude</label
-                >
-                <input
-                  v-model="deliveryForms[ord.id].last_latitude"
-                  type="text"
-                  class="mt-1 w-full rounded-2xl border border-zinc-200/80 bg-white/90 px-3 py-2 text-sm outline-none focus:border-teal-300 focus:ring-4 focus:ring-teal-500/15"
-                />
-              </div>
-              <div>
-                <label class="text-xs font-medium text-zinc-500"
-                  >Longitude</label
-                >
-                <input
-                  v-model="deliveryForms[ord.id].last_longitude"
-                  type="text"
-                  class="mt-1 w-full rounded-2xl border border-zinc-200/80 bg-white/90 px-3 py-2 text-sm outline-none focus:border-teal-300 focus:ring-4 focus:ring-teal-500/15"
-                />
-              </div>
-            </div>
-            <button
-              type="button"
-              class="mt-4 rounded-full bg-zinc-900 px-5 py-2 text-sm font-semibold text-white shadow-md transition hover:bg-zinc-800"
-              @click="saveDelivery(ord.id)"
+            <div
+              class="flex h-12 w-12 items-center justify-center rounded-2xl border border-zinc-200/80 bg-zinc-50 text-zinc-400"
+              aria-hidden="true"
             >
-              Save tracking
-            </button>
+              <svg
+                class="h-6 w-6"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="1.5"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z"
+                />
+              </svg>
+            </div>
+            <p class="text-sm font-semibold text-zinc-800">No orders yet</p>
+            <p class="max-w-xs text-xs leading-relaxed text-zinc-500">
+              When buyers check out, each order appears here with delivery tools
+              underneath.
+            </p>
           </div>
         </div>
-        <p v-if="!orders.length" class="text-sm text-zinc-500">
-          No orders yet.
-        </p>
       </section>
 
       <section v-show="tab === 'support'" class="space-y-6">
         <div
-          class="rounded-3xl border border-white/60 bg-white/70 p-6 shadow-[0_24px_60px_-32px_rgba(15,23,42,0.14)] backdrop-blur-xl"
+          class="flex flex-col gap-4 rounded-3xl border border-white/60 bg-white/70 px-5 py-4 shadow-[0_24px_60px_-32px_rgba(15,23,42,0.14)] backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-5"
         >
-          <h2 class="text-lg font-bold text-zinc-900">Contact platform</h2>
-          <p class="mt-2 text-xs leading-relaxed text-zinc-600">
-            Opens a support ticket visible to the super admin.
-          </p>
-          <div class="mt-4 space-y-3">
-            <input
-              v-model="ticketSubject"
-              type="text"
-              placeholder="Subject"
-              class="w-full rounded-2xl border border-zinc-200/80 bg-white/90 px-4 py-2.5 text-sm outline-none focus:border-violet-300 focus:ring-4 focus:ring-violet-500/15"
-            />
-            <textarea
-              v-model="ticketMessage"
-              rows="4"
-              placeholder="Describe the issue"
-              class="w-full rounded-2xl border border-zinc-200/80 bg-white/90 px-4 py-2.5 text-sm outline-none focus:border-violet-300 focus:ring-4 focus:ring-violet-500/15"
-            />
-            <button
-              type="button"
-              class="rounded-full bg-zinc-900 px-6 py-2.5 text-sm font-semibold text-white shadow-lg transition hover:bg-zinc-800 disabled:opacity-50"
-              :disabled="ticketBusy"
-              @click="submitSupportTicket"
+          <div class="min-w-0">
+            <h2 class="text-lg font-bold tracking-tight text-zinc-900">
+              Support tickets
+            </h2>
+            <p class="mt-1 text-sm leading-relaxed text-zinc-600">
+              Message the platform team — each ticket is visible to super admins
+              so they can help with account, billing, or technical issues.
+            </p>
+          </div>
+          <button
+            type="button"
+            class="inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl bg-zinc-900 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-zinc-900/20 transition hover:bg-zinc-800 disabled:pointer-events-none disabled:opacity-40"
+            :disabled="!store"
+            @click="openSupportTicketModal"
+          >
+            <span class="text-lg font-light leading-none" aria-hidden="true"
+              >+</span
             >
-              Submit ticket
-            </button>
+            New ticket
+          </button>
+        </div>
+        <div
+          class="flex max-h-[min(55dvh,36rem)] min-h-[12rem] min-w-0 w-full flex-col overflow-hidden rounded-t-3xl rounded-b-none border border-zinc-200/70 bg-white/95 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.16)] ring-1 ring-zinc-100/80 backdrop-blur-md xl:max-h-[min(55dvh,42rem)]"
+          role="region"
+          aria-label="Support ticket history"
+        >
+          <div
+            class="flex shrink-0 flex-col gap-2 border-b border-zinc-100 bg-gradient-to-r from-violet-50/90 to-white px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5"
+          >
+            <div class="min-w-0">
+              <h3 class="text-sm font-bold tracking-tight text-zinc-900">
+                Ticket history
+              </h3>
+              <p
+                class="mt-0.5 text-[11px] font-medium leading-snug text-zinc-500"
+              >
+                Subject, status, and when each ticket was opened — newest at
+                the top.
+              </p>
+            </div>
+            <span
+              class="inline-flex shrink-0 items-center gap-1.5 self-start rounded-full bg-zinc-900/[0.06] px-2.5 py-1 text-[11px] font-bold tabular-nums text-zinc-700 ring-1 ring-zinc-200/80 sm:self-auto"
+            >
+              <span class="text-zinc-500">Tickets</span>
+              {{ tickets.length }}
+            </span>
+          </div>
+          <div
+            class="hidden shrink-0 grid-cols-[minmax(0,1.05fr)_7rem_10.25rem_minmax(0,1.15fr)] gap-x-3 border-b border-zinc-200 bg-zinc-100/90 px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500 lg:grid"
+          >
+            <span class="text-left">Subject</span>
+            <span class="text-left">Status</span>
+            <span class="text-left">Opened</span>
+            <span class="text-left">Message</span>
+          </div>
+          <template v-if="tickets.length">
+            <ul
+              class="min-h-0 flex-1 divide-y divide-zinc-100 overflow-x-auto overflow-y-auto overscroll-y-contain"
+            >
+              <li
+                v-for="t in tickets"
+                :key="t.id"
+                class="transition-colors hover:bg-zinc-50/90 motion-safe:duration-150"
+              >
+                <div class="space-y-3 p-4 lg:hidden">
+                  <div class="flex flex-wrap items-start justify-between gap-2">
+                    <p
+                      class="min-w-0 flex-1 text-[0.9375rem] font-semibold leading-snug tracking-tight text-zinc-900"
+                    >
+                      {{ t.subject }}
+                    </p>
+                    <span :class="ticketStatusBadgeClass(t.status)">{{
+                      t.status
+                    }}</span>
+                  </div>
+                  <p class="text-[11px] font-medium tabular-nums text-zinc-500">
+                    Opened {{ formatOrderListDate(t.created_at) }}
+                  </p>
+                  <p
+                    class="line-clamp-4 text-xs leading-relaxed text-zinc-600 whitespace-pre-wrap"
+                  >
+                    {{ t.message }}
+                  </p>
+                </div>
+                <div
+                  class="hidden min-w-[44rem] grid-cols-[minmax(0,1.05fr)_7rem_10.25rem_minmax(0,1.15fr)] gap-x-3 px-4 py-3.5 lg:grid lg:items-start"
+                >
+                  <div class="min-w-0">
+                    <p
+                      class="truncate text-sm font-semibold tracking-tight text-zinc-900"
+                    >
+                      {{ t.subject }}
+                    </p>
+                    <p
+                      class="mt-1 font-mono text-[10px] text-zinc-400"
+                      :title="t.id"
+                    >
+                      {{ orderShortId(t.id) }}
+                    </p>
+                  </div>
+                  <div class="pt-0.5">
+                    <span :class="ticketStatusBadgeClass(t.status)">{{
+                      t.status
+                    }}</span>
+                  </div>
+                  <p
+                    class="pt-0.5 text-xs tabular-nums leading-snug text-zinc-600"
+                  >
+                    {{ formatOrderListDate(t.created_at) }}
+                  </p>
+                  <p
+                    class="line-clamp-3 min-w-0 text-xs leading-relaxed text-zinc-600 whitespace-pre-wrap"
+                  >
+                    {{ t.message }}
+                  </p>
+                </div>
+              </li>
+            </ul>
+            <footer
+              class="shrink-0 border-t border-zinc-200/90 bg-gradient-to-r from-zinc-50/95 to-zinc-100/80 px-4 py-3 sm:px-5"
+            >
+              <div
+                class="flex flex-col gap-2 text-xs text-zinc-600 lg:hidden"
+              >
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <span class="font-semibold text-zinc-800">Summary</span>
+                  <span class="tabular-nums text-zinc-500"
+                    >{{ tickets.length }} total</span
+                  >
+                </div>
+                <div class="flex flex-wrap gap-x-4 gap-y-1">
+                  <span
+                    >Open
+                    <span class="font-semibold text-amber-800">{{
+                      ticketsOpenCount
+                    }}</span></span
+                  >
+                  <span
+                    >Closed
+                    <span class="font-semibold text-zinc-800">{{
+                      ticketsClosedCount
+                    }}</span></span
+                  >
+                </div>
+              </div>
+              <div
+                class="hidden min-w-[44rem] grid-cols-[minmax(0,1.05fr)_7rem_10.25rem_minmax(0,1.15fr)] gap-x-3 text-[11px] lg:grid lg:items-center"
+              >
+                <span
+                  class="font-bold uppercase tracking-wider text-zinc-500"
+                  >Summary</span
+                >
+                <span class="text-zinc-500" aria-hidden="true">—</span>
+                <span class="text-zinc-500" aria-hidden="true">—</span>
+                <div
+                  class="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-right font-medium text-zinc-600"
+                >
+                  <span
+                    ><span class="tabular-nums font-bold text-zinc-900">{{
+                      tickets.length
+                    }}</span>
+                    total</span
+                  >
+                  <span class="text-zinc-300" aria-hidden="true">·</span>
+                  <span class="text-amber-800"
+                    ><span class="font-bold tabular-nums">{{
+                      ticketsOpenCount
+                    }}</span>
+                    open</span
+                  >
+                  <span class="text-zinc-300" aria-hidden="true">·</span>
+                  <span
+                    ><span class="font-bold tabular-nums text-zinc-800">{{
+                      ticketsClosedCount
+                    }}</span>
+                    closed</span
+                  >
+                </div>
+              </div>
+            </footer>
+          </template>
+          <div
+            v-else
+            class="flex flex-1 flex-col items-center justify-center gap-3 px-6 py-14 text-center"
+          >
+            <span
+              class="flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-50 text-violet-400 ring-1 ring-violet-100/90"
+              aria-hidden="true"
+            >
+              <svg
+                class="h-7 w-7"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="1.5"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 5.25a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0-10.5a.375.375 0 11-.75 0 .375.375 0 01.75 0zM12 18.75a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 5.25a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 6.75a.375.375 0 11-.75 0 .375.375 0 01.75 0zm13.5 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0-5.25a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0-5.25a.375.375 0 11-.75 0 .375.375 0 01.75 0zM12 3.75a.375.375 0 11-.75 0 .375.375 0 01.75 0zm7.5 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0-5.25a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0-5.25a.375.375 0 11-.75 0 .375.375 0 01.75 0zM12 8.25a.375.375 0 11-.75 0 .375.375 0 01.75 0z"
+                />
+              </svg>
+            </span>
+            <p class="text-sm font-semibold text-zinc-800">No tickets yet</p>
+            <p class="max-w-sm text-xs leading-relaxed text-zinc-500">
+              When you need help from the platform team, use
+              <span class="font-semibold text-zinc-600">New ticket</span>
+              — your conversation history will show here.
+            </p>
           </div>
         </div>
-        <ul class="space-y-3">
-          <li
-            v-for="t in tickets"
-            :key="t.id"
-            class="rounded-3xl border border-violet-100/80 bg-gradient-to-br from-violet-50/80 to-white/70 px-4 py-3 text-sm shadow-sm backdrop-blur-sm"
-          >
-            <p class="font-semibold text-zinc-900">{{ t.subject }}</p>
-            <p class="text-xs text-zinc-500">
-              {{ t.status }} · {{ new Date(t.created_at).toLocaleString() }}
-            </p>
-            <p class="mt-2 text-zinc-600 whitespace-pre-wrap">
-              {{ t.message }}
-            </p>
-          </li>
-        </ul>
-        <p v-if="!tickets.length" class="text-sm text-zinc-500">
-          No tickets yet for this store.
-        </p>
       </section>
+
+      <Teleport to="body">
+        <Transition name="aproduct-modal">
+          <div
+            v-if="supportTicketModalOpen && store"
+            class="aproduct-root fixed inset-0 z-[262] flex items-end justify-center p-0 sm:items-center sm:p-4"
+            role="presentation"
+          >
+            <div
+              class="absolute inset-0 bg-zinc-900/45 backdrop-blur-[2px]"
+              aria-hidden="true"
+            />
+            <div
+              class="aproduct-dialog relative z-10 flex max-h-[min(92svh,40rem)] w-full max-w-[min(96vw,40rem)] flex-col overflow-hidden rounded-t-[1.75rem] border border-zinc-200/80 bg-white shadow-[0_-24px_80px_-20px_rgba(15,23,42,0.35)] sm:max-h-[min(92svh,42rem)] sm:rounded-3xl sm:shadow-[0_32px_80px_-24px_rgba(15,23,42,0.35)]"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="support-ticket-modal-title"
+              @click.stop
+            >
+              <div
+                class="flex shrink-0 items-start justify-between gap-3 border-b border-zinc-100 bg-gradient-to-br from-violet-50/90 via-white to-indigo-50/40 px-5 py-4 sm:rounded-t-3xl sm:px-6 sm:py-5"
+              >
+                <div class="min-w-0 flex-1">
+                  <p
+                    class="text-[10px] font-bold uppercase tracking-[0.18em] text-violet-800/70"
+                  >
+                    Support
+                  </p>
+                  <h2
+                    id="support-ticket-modal-title"
+                    class="mt-1 text-lg font-bold tracking-tight text-zinc-900"
+                  >
+                    New ticket
+                  </h2>
+                  <p class="mt-2 text-xs leading-relaxed text-zinc-600">
+                    Visible to platform super admins — include enough detail to
+                    reproduce or resolve the issue.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  class="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-zinc-200/80 bg-white/90 text-xl leading-none text-zinc-500 shadow-sm transition hover:border-zinc-300 hover:bg-white hover:text-zinc-800 disabled:opacity-40"
+                  aria-label="Close"
+                  :disabled="ticketBusy"
+                  @click="closeSupportTicketModal"
+                >
+                  ×
+                </button>
+              </div>
+              <form
+                class="flex min-h-0 flex-1 flex-col"
+                @submit.prevent="submitSupportTicket"
+              >
+                <div class="space-y-4 overflow-y-auto overscroll-y-contain px-5 py-5 sm:px-6">
+                  <div>
+                    <label
+                      for="support-ticket-subject"
+                      class="text-xs font-semibold text-zinc-700"
+                      >Subject <span class="text-rose-600">*</span></label
+                    >
+                    <input
+                      id="support-ticket-subject"
+                      v-model.trim="ticketSubject"
+                      type="text"
+                      name="subject"
+                      required
+                      autocomplete="off"
+                      placeholder="e.g. Payout not reflecting"
+                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-zinc-50/50 px-4 py-3 text-sm text-zinc-900 outline-none transition placeholder:text-zinc-400 focus:border-violet-400 focus:bg-white focus:ring-2 focus:ring-violet-500/20"
+                    />
+                  </div>
+                  <div>
+                    <label
+                      for="support-ticket-message"
+                      class="text-xs font-semibold text-zinc-700"
+                      >Describe the issue
+                      <span class="text-rose-600">*</span></label
+                    >
+                    <textarea
+                      id="support-ticket-message"
+                      v-model.trim="ticketMessage"
+                      name="message"
+                      rows="5"
+                      required
+                      placeholder="What happened, what you expected, and any links or order IDs that help."
+                      class="mt-1.5 min-h-[7.5rem] w-full resize-y rounded-xl border border-zinc-200/90 bg-zinc-50/50 px-4 py-3 text-sm text-zinc-900 outline-none transition placeholder:text-zinc-400 focus:border-violet-400 focus:bg-white focus:ring-2 focus:ring-violet-500/20"
+                    />
+                  </div>
+                </div>
+                <div
+                  class="flex shrink-0 flex-col-reverse gap-2 border-t border-zinc-100 bg-zinc-50/60 px-5 py-4 sm:flex-row sm:justify-end sm:px-6"
+                >
+                  <button
+                    type="button"
+                    class="inline-flex min-h-[44px] items-center justify-center rounded-xl border border-zinc-200/90 bg-white px-4 py-2.5 text-sm font-semibold text-zinc-800 transition hover:bg-zinc-50 disabled:opacity-40"
+                    :disabled="ticketBusy"
+                    @click="closeSupportTicketModal"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    class="inline-flex min-h-[44px] items-center justify-center rounded-xl bg-zinc-900 px-5 py-2.5 text-sm font-semibold text-white shadow-md transition hover:bg-zinc-800 disabled:opacity-50"
+                    :disabled="ticketBusy"
+                  >
+                    {{ ticketBusy ? "Sending…" : "Submit ticket" }}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </Transition>
+      </Teleport>
 
       <Teleport to="body">
         <Transition name="aproduct-modal">
@@ -1477,6 +2703,34 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                           placeholder="What buyers should know — size, variants, delivery notes…"
                           class="mt-1.5 w-full resize-y rounded-xl border border-zinc-200/90 bg-zinc-50/50 px-4 py-3 text-sm text-zinc-900 outline-none transition placeholder:text-zinc-400 focus:border-teal-400 focus:bg-white focus:ring-2 focus:ring-teal-500/20"
                         />
+                      </div>
+                      <div>
+                        <span
+                          id="modal-add-product-category-label"
+                          class="text-xs font-semibold text-zinc-700"
+                        >
+                          Category
+                        </span>
+                        <div class="mt-1.5">
+                          <ProductCategoryDropdown
+                            :category-id="newCategoryId.trim() || null"
+                            :categories="productCategories"
+                            labelled-by="modal-add-product-category-label"
+                            size="md"
+                            @pick="
+                              (v) => {
+                                newCategoryId = v ?? '';
+                              }
+                            "
+                          />
+                        </div>
+                        <p
+                          id="modal-add-product-category-hint"
+                          class="mt-1.5 text-[11px] leading-snug text-zinc-500"
+                        >
+                          Optional — add labels in the Categories panel first if
+                          you need new ones.
+                        </p>
                       </div>
                     </div>
                   </div>
@@ -1840,7 +3094,8 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                         p.name
                       }}</span>
                       <span class="mt-0.5 block text-xs text-zinc-600">
-                        {{ formatGhsWhole(p.monthlyGhs) }} / month (test checkout)
+                        {{ formatGhsWhole(p.monthlyGhs) }} / month (test
+                        checkout)
                       </span>
                     </span>
                   </label>

@@ -3,6 +3,7 @@ import { getSupabaseBrowser, isSupabaseConfigured } from "../lib/supabase";
 import { useAuthStore } from "../stores/auth";
 import CheckoutView from "../views/store/CheckoutView.vue";
 import OrderSuccessView from "../views/store/OrderSuccessView.vue";
+import StorefrontLayout from "../views/store/StorefrontLayout.vue";
 import StoreView from "../views/store/StoreView.vue";
 import CreateStoreView from "../views/dashboard/CreateStoreView.vue";
 import DashboardHome from "../views/dashboard/DashboardHome.vue";
@@ -92,19 +93,25 @@ const router = createRouter({
       ],
     },
     {
-      path: "/:storeSlug/checkout",
-      name: "store-checkout",
-      component: CheckoutView,
-    },
-    {
-      path: "/:storeSlug/order/:orderId/success",
-      name: "order-success",
-      component: OrderSuccessView,
-    },
-    {
       path: "/:storeSlug",
-      name: "store",
-      component: StoreView,
+      component: StorefrontLayout,
+      children: [
+        {
+          path: "",
+          name: "store",
+          component: StoreView,
+        },
+        {
+          path: "checkout",
+          name: "store-checkout",
+          component: CheckoutView,
+        },
+        {
+          path: "order/:orderId/success",
+          name: "order-success",
+          component: OrderSuccessView,
+        },
+      ],
     },
   ],
 });

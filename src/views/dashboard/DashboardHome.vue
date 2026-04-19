@@ -22,6 +22,7 @@ import {
   PLAN_FEATURE_LIMITS,
   resolvePricingPlanId,
 } from "../../lib/planFeatureLimits";
+import { normalizeSignupPlanId } from "../../constants/planEntitlements";
 import SkeletonDashboardHome from "../../components/skeleton/SkeletonDashboardHome.vue";
 const DashboardKpiTimeChart = defineAsyncComponent(
   () => import("../../components/dashboard/DashboardKpiTimeChart.vue"),
@@ -52,6 +53,13 @@ type SellerStoreRow = {
   logo_path: string | null;
   /** `profiles.signup_plan` (seller subscription tier). */
   signup_plan: string | null;
+  /** `seller_subscriptions` — subscription card for platform staff. */
+  sub_pricing_plan_id: string | null;
+  sub_payment_channel: string | null;
+  sub_paid_amount_pesewas: number | null;
+  sub_status: string | null;
+  sub_current_period_end: string | null;
+  sub_updated_at: string | null;
 };
 
 const stores = ref<SellerStoreRow[]>([]);
@@ -83,6 +91,45 @@ const isSellerPlanUnset = computed(() => {
 const upgradePricingLink = { name: "home" as const, hash: "#pricing" };
 
 const planPickerOpen = ref(false);
+
+/** Earliest `current_period_end` among active/trialing store subs (for upgrade guard). */
+const dashboardPaidPlanRenewalEnd = ref<string | null>(null);
+
+const PAID_ACCOUNT_PLAN_IDS = new Set(["starter", "growth", "pro"]);
+const PLAN_UPGRADE_GUARD_DAYS = 7;
+
+function formatSubscriptionEndLabel(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(d);
+}
+
+function accountPaidPlanNotDueSoon(): boolean {
+  const id = normalizeSignupPlanId(
+    typeof auth.user?.user_metadata?.signup_plan === "string"
+      ? auth.user.user_metadata.signup_plan
+      : undefined,
+  );
+  if (!id || !PAID_ACCOUNT_PLAN_IDS.has(id)) return false;
+  const endIso = dashboardPaidPlanRenewalEnd.value;
+  if (!endIso) return false;
+  const end = new Date(endIso).getTime();
+  if (Number.isNaN(end)) return false;
+  const cutoff = Date.now() + PLAN_UPGRADE_GUARD_DAYS * 86_400_000;
+  return end > cutoff;
+}
+
+function onUpgradePlanClick() {
+  if (accountPaidPlanNotDueSoon()) {
+    const when = formatSubscriptionEndLabel(dashboardPaidPlanRenewalEnd.value!);
+    toast.info(`You already have an active plan, which ends on ${when}.`);
+    return;
+  }
+  openPlanPicker();
+}
 
 function openPlanPicker() {
   planPickerOpen.value = true;
@@ -211,7 +258,9 @@ async function choosePlanAndDismiss(planId: string) {
   }
   const url =
     data && typeof data === "object" && "authorization_url" in data
-      ? String((data as { authorization_url?: unknown }).authorization_url ?? "")
+      ? String(
+          (data as { authorization_url?: unknown }).authorization_url ?? "",
+        )
       : "";
   if (!url) {
     toast.error("Could not start checkout.");
@@ -353,6 +402,148 @@ const filteredStores = computed(() => {
 });
 
 const previewStores = computed(() => filteredStores.value.slice(0, 5));
+
+/**
+ * Stable key for Realtime resubscribe scope only — **not** the full `stores`
+ * array. Watching `stores` directly re-fired after every silent refetch
+ * (same shop IDs), tearing down channels and amplifying flicker.
+ */
+const dashboardRealtimeScopeKey = computed(() => {
+  const uid = sessionUserId.value ?? "";
+  if (!uid) return "";
+  const ids = stores.value
+    .map((s) => s.id)
+    .slice()
+    .sort()
+    .join("\0");
+  return `${uid}\0${ids}`;
+});
+
+/** Avoids Storefronts vs Subscriptions flash before `admin_roles` is read. */
+const sellerSideCardRoleReady = computed(
+  () => !auth.isSignedIn || auth.platformStaffRoleResolved,
+);
+
+function adminStorePlanLabel(s: SellerStoreRow): string {
+  const id = s.sub_pricing_plan_id;
+  if (!id) return "—";
+  const p = PRICING_PLANS.find((x) => x.id === id);
+  return p?.name ?? id;
+}
+
+function adminStorePaymentChannelLabel(s: SellerStoreRow): string {
+  const ch = s.sub_payment_channel;
+  if (!ch?.trim()) return "—";
+  return ch
+    .split(/_+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function adminStoreHasSubscriptionSnapshot(s: SellerStoreRow): boolean {
+  return Boolean(
+    s.sub_pricing_plan_id?.trim() ||
+    s.sub_payment_channel?.trim() ||
+    (s.sub_paid_amount_pesewas != null &&
+      Number.isFinite(s.sub_paid_amount_pesewas)),
+  );
+}
+
+const subscriptionLedgerIconGradients = [
+  "from-zinc-800 to-zinc-600",
+  "from-slate-900 to-zinc-700",
+  "from-neutral-800 to-stone-600",
+  "from-zinc-900 to-neutral-700",
+] as const;
+
+function subscriptionLedgerIconWrapClass(idx: number): string {
+  const g =
+    subscriptionLedgerIconGradients[
+      idx % subscriptionLedgerIconGradients.length
+    ]!;
+  return `bg-gradient-to-br ${g}`;
+}
+
+function formatSubscriptionLedgerDate(iso: string | null | undefined): string {
+  if (!iso || typeof iso !== "string") return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  }).format(d);
+}
+
+type SubscriptionLedgerRow = {
+  id: string;
+  iconLetter: string;
+  iconClass: string;
+  title: string;
+  subtitle: string;
+  amount: string;
+  amountPositive: boolean;
+};
+
+const adminSubscriptionLedgerRows = computed((): SubscriptionLedgerRow[] => {
+  return previewStores.value.map((s, idx) => {
+    const planLabel = adminStorePlanLabel(s);
+    const channelShown = adminStorePaymentChannelLabel(s);
+    const dateStr = formatSubscriptionLedgerDate(
+      s.sub_updated_at || s.sub_current_period_end,
+    );
+    const subtitleParts: string[] = [];
+    if (channelShown !== "—") subtitleParts.push(channelShown);
+    if (dateStr) subtitleParts.push(`Updated ${dateStr}`);
+    let title: string;
+    if (s.sub_pricing_plan_id) {
+      title = planLabel;
+    } else if (adminStoreHasSubscriptionSnapshot(s)) {
+      title =
+        s.sub_status === "active" || s.sub_status === "trialing"
+          ? "Platform subscription"
+          : "Subscription";
+    } else {
+      title = "No Paystack record";
+    }
+    const subtitle =
+      subtitleParts.length > 0
+        ? subtitleParts.join(" · ")
+        : adminStoreHasSubscriptionSnapshot(s)
+          ? "Add plan metadata on next checkout verify"
+          : "Run checkout to create a subscription row";
+
+    const pesewas = s.sub_paid_amount_pesewas;
+    const hasAmount = pesewas != null && Number.isFinite(pesewas);
+    const amountFmt = hasAmount
+      ? new Intl.NumberFormat("en-GH", {
+          style: "currency",
+          currency: "GHS",
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        }).format(pesewas / 100)
+      : "";
+    const amount = hasAmount ? `+${amountFmt}` : "—";
+
+    const initialSource =
+      s.sub_pricing_plan_id && planLabel !== "—" ? planLabel : title;
+    const iconLetter =
+      initialSource.length && initialSource !== "—"
+        ? initialSource.charAt(0).toUpperCase()
+        : "S";
+
+    return {
+      id: s.id,
+      iconLetter,
+      iconClass: subscriptionLedgerIconWrapClass(idx),
+      title,
+      subtitle,
+      amount,
+      amountPositive: hasAmount,
+    };
+  });
+});
 
 /** Totals across the signed-in seller's stores (filled in `loadSellerDashboard`). */
 const planUsage = ref({ products: 0, ordersThisMonth: 0 });
@@ -554,7 +745,9 @@ async function loadSellerDashboard(silent = false) {
           const prof = raw.profiles as { signup_plan?: string | null } | null;
           const logoRaw = (raw as { logo_path?: unknown }).logo_path;
           const logoPath =
-            typeof logoRaw === "string" && logoRaw.trim() ? logoRaw.trim() : null;
+            typeof logoRaw === "string" && logoRaw.trim()
+              ? logoRaw.trim()
+              : null;
           return {
             id: String(raw.id),
             slug: String(raw.slug),
@@ -562,6 +755,12 @@ async function loadSellerDashboard(silent = false) {
             is_active: Boolean(raw.is_active),
             logo_path: logoPath,
             signup_plan: prof?.signup_plan?.trim() || null,
+            sub_pricing_plan_id: null,
+            sub_payment_channel: null,
+            sub_paid_amount_pesewas: null,
+            sub_status: null,
+            sub_current_period_end: null,
+            sub_updated_at: null,
           };
         },
       );
@@ -574,11 +773,12 @@ async function loadSellerDashboard(silent = false) {
     const storeIds = stores.value.map((s) => s.id);
     if (storeIds.length === 0) {
       planUsage.value = { products: 0, ordersThisMonth: 0 };
+      dashboardPaidPlanRenewalEnd.value = null;
     } else {
       const monthStart = new Date();
       monthStart.setDate(1);
       monthStart.setHours(0, 0, 0, 0);
-      const [prRes, orRes] = await Promise.all([
+      const [prRes, orRes, subRes] = await Promise.all([
         supabase
           .from("products")
           .select("id", { count: "exact", head: true })
@@ -588,6 +788,12 @@ async function loadSellerDashboard(silent = false) {
           .select("id", { count: "exact", head: true })
           .in("store_id", storeIds)
           .gte("created_at", monthStart.toISOString()),
+        supabase
+          .from("seller_subscriptions")
+          .select(
+            "store_id, current_period_end, status, pricing_plan_id, payment_channel, paid_amount_pesewas, updated_at",
+          )
+          .in("store_id", storeIds),
       ]);
       if (prRes.error) toast.error(prRes.error.message);
       if (orRes.error) toast.error(orRes.error.message);
@@ -595,6 +801,97 @@ async function loadSellerDashboard(silent = false) {
         products: prRes.count ?? 0,
         ordersThisMonth: orRes.count ?? 0,
       };
+      if (subRes.error) {
+        dashboardPaidPlanRenewalEnd.value = null;
+        stores.value = stores.value.map((s) => ({
+          ...s,
+          sub_pricing_plan_id: null,
+          sub_payment_channel: null,
+          sub_paid_amount_pesewas: null,
+          sub_status: null,
+          sub_current_period_end: null,
+          sub_updated_at: null,
+        }));
+      } else {
+        type SubRow = {
+          store_id?: string;
+          current_period_end?: string | null;
+          status?: string | null;
+          pricing_plan_id?: string | null;
+          payment_channel?: string | null;
+          paid_amount_pesewas?: number | null;
+          updated_at?: string | null;
+        };
+        const rows = (subRes.data ?? []) as SubRow[];
+        let minEnd: string | null = null;
+        const billingByStore = new Map<
+          string,
+          {
+            sub_pricing_plan_id: string | null;
+            sub_payment_channel: string | null;
+            sub_paid_amount_pesewas: number | null;
+            sub_status: string | null;
+            sub_current_period_end: string | null;
+            sub_updated_at: string | null;
+          }
+        >();
+        for (const row of rows) {
+          const st = typeof row.status === "string" ? row.status.trim() : "";
+          if (st === "active" || st === "trialing") {
+            const end =
+              typeof row.current_period_end === "string"
+                ? row.current_period_end
+                : null;
+            if (end && (!minEnd || new Date(end) < new Date(minEnd))) {
+              minEnd = end;
+            }
+          }
+          const sid = typeof row.store_id === "string" ? row.store_id : "";
+          if (!sid) continue;
+          const planRaw = row.pricing_plan_id;
+          const planId =
+            typeof planRaw === "string" && planRaw.trim()
+              ? planRaw.trim().toLowerCase()
+              : null;
+          const chRaw = row.payment_channel;
+          const channel =
+            typeof chRaw === "string" && chRaw.trim()
+              ? chRaw.trim().toLowerCase()
+              : null;
+          const paid =
+            typeof row.paid_amount_pesewas === "number" &&
+            Number.isFinite(row.paid_amount_pesewas)
+              ? row.paid_amount_pesewas
+              : null;
+          const endRaw = row.current_period_end;
+          const periodEnd =
+            typeof endRaw === "string" && endRaw.trim() ? endRaw.trim() : null;
+          const upRaw = row.updated_at;
+          const updatedAt =
+            typeof upRaw === "string" && upRaw.trim() ? upRaw.trim() : null;
+          billingByStore.set(sid, {
+            sub_pricing_plan_id: planId,
+            sub_payment_channel: channel,
+            sub_paid_amount_pesewas: paid,
+            sub_status: st || null,
+            sub_current_period_end: periodEnd,
+            sub_updated_at: updatedAt,
+          });
+        }
+        dashboardPaidPlanRenewalEnd.value = minEnd;
+        stores.value = stores.value.map((s) => {
+          const b = billingByStore.get(s.id);
+          return {
+            ...s,
+            sub_pricing_plan_id: b?.sub_pricing_plan_id ?? null,
+            sub_payment_channel: b?.sub_payment_channel ?? null,
+            sub_paid_amount_pesewas: b?.sub_paid_amount_pesewas ?? null,
+            sub_status: b?.sub_status ?? null,
+            sub_current_period_end: b?.sub_current_period_end ?? null,
+            sub_updated_at: b?.sub_updated_at ?? null,
+          };
+        });
+      }
     }
   } finally {
     if (!silent) loading.value = false;
@@ -627,19 +924,22 @@ onMounted(() => {
 
 useRealtimeTableRefresh({
   channelName: () => `seller-home-${sessionUserId.value ?? ""}`,
-  deps: [sessionUserId, stores],
+  deps: [dashboardRealtimeScopeKey],
+  debounceMs: 900,
   getTables: () => {
     const uid = sessionUserId.value;
     if (!uid) return [];
     const specs: { table: string; filter?: string }[] = [
       { table: "stores", filter: `owner_id=eq.${uid}` },
       { table: "announcements", filter: "is_active=eq.true" },
-      { table: "profiles", filter: `id=eq.${uid}` },
+      // Omit `profiles`: `last_seen_at` heartbeat would refetch the whole
+      // dashboard on an interval unrelated to shops or subscriptions.
     ];
     for (const s of stores.value) {
       specs.push(
         { table: "products", filter: `store_id=eq.${s.id}` },
         { table: "orders", filter: `store_id=eq.${s.id}` },
+        { table: "seller_subscriptions", filter: `store_id=eq.${s.id}` },
       );
     }
     return specs;
@@ -809,7 +1109,7 @@ onUnmounted(() => {
           </div>
 
           <div
-            class="h-[60vh] overflow-hidden rounded-[1.75rem] border border-zinc-200/60 bg-white shadow-[0_28px_70px_-40px_rgba(15,23,42,0.18)]"
+            class="h-[54vh] overflow-hidden rounded-[1.75rem] border border-zinc-200/60 bg-white shadow-[0_28px_70px_-40px_rgba(15,23,42,0.18)]"
           >
             <div
               class="flex items-center justify-between gap-3 border-b border-zinc-100 px-5 py-4 sm:px-6"
@@ -817,10 +1117,23 @@ onUnmounted(() => {
               <h2 class="text-lg font-bold text-zinc-900">Shop pipeline</h2>
               <button
                 type="button"
-                class="flex h-10 w-10 items-center justify-center rounded-xl border border-zinc-200/80 bg-zinc-50 text-lg font-bold leading-none text-zinc-400 transition hover:bg-white hover:text-zinc-600"
-                aria-label="More"
+                class="flex h-10 w-10 items-center justify-center rounded-xl border border-zinc-200/80 bg-zinc-50 text-zinc-600 transition hover:bg-white hover:text-zinc-800"
+                aria-label="Chat"
               >
-                ···
+                <svg
+                  class="h-5 w-5"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  stroke-width="1.75"
+                  aria-hidden="true"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+                  />
+                </svg>
               </button>
             </div>
 
@@ -864,8 +1177,9 @@ onUnmounted(() => {
                               class="relative z-10 h-full w-full object-cover"
                               loading="lazy"
                               @error="
-                                ($event.target as HTMLImageElement).style.display =
-                                  'none'
+                                (
+                                  $event.target as HTMLImageElement
+                                ).style.display = 'none'
                               "
                             />
                           </div>
@@ -981,7 +1295,7 @@ onUnmounted(() => {
             <button
               type="button"
               class="inline-flex items-center rounded-2xl border border-indigo-200/90 bg-white px-3 py-1.5 text-[11px] font-bold uppercase tracking-wide text-indigo-900 shadow-sm ring-1 ring-indigo-100 transition hover:border-indigo-300 hover:bg-indigo-50/60"
-              @click="openPlanPicker"
+              @click="onUpgradePlanClick"
             >
               {{ isSellerPlanUnset ? "Choose plan" : "Upgrade plan" }}
             </button>
@@ -1001,9 +1315,7 @@ onUnmounted(() => {
                     <span class="truncate">{{ row.label }}</span>
                     <span
                       class="max-w-[11rem] shrink-0 text-right text-[11px] font-semibold tabular-nums sm:max-w-none sm:text-xs"
-                      :class="
-                        row.over ? 'text-amber-700' : 'text-zinc-600'
-                      "
+                      :class="row.over ? 'text-amber-700' : 'text-zinc-600'"
                       :title="row.right"
                       >{{ row.right }}</span
                     >
@@ -1013,11 +1325,7 @@ onUnmounted(() => {
                   >
                     <div
                       class="h-full rounded-full transition-all"
-                      :class="
-                        row.over
-                          ? 'bg-amber-500'
-                          : 'bg-zinc-800'
-                      "
+                      :class="row.over ? 'bg-amber-500' : 'bg-zinc-800'"
                       :style="{ width: `${row.pct}%` }"
                     />
                   </div>
@@ -1027,135 +1335,204 @@ onUnmounted(() => {
           </ul>
         </div>
 
-        <div
-          class="flex h-[60vh] flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/50 bg-[#f3f3f7] p-5 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.1)] sm:rounded-3xl sm:p-6"
-        >
-          <div class="shrink-0">
-            <h3 class="text-base font-bold tracking-tight text-zinc-900">
-              Storefronts
-            </h3>
-            <p class="mt-1 text-xs text-zinc-500">
-              Recent shops — open the live link or jump into the workspace.
-            </p>
-          </div>
-
+        <template v-if="sellerSideCardRoleReady">
           <div
-            class="mt-5 min-h-0 flex-1 overflow-y-auto overscroll-y-contain pr-0.5"
+            :class="auth.isPlatformStaff ? 'flex min-h-0 flex-col gap-5' : ''"
           >
-            <ul v-if="previewStores.length" class="space-y-5">
-            <li
-              v-for="(s, idx) in previewStores"
-              :key="s.id"
-              class="flex gap-3"
+            <div
+              :class="
+                auth.isPlatformStaff
+                  ? 'flex max-h-[min(38vh,22rem)] min-h-0 flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/50 bg-[#f3f3f7] p-5 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.1)] sm:rounded-3xl sm:p-6'
+                  : 'flex h-[60vh] flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/50 bg-[#f3f3f7] p-5 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.1)] sm:rounded-3xl sm:p-6'
+              "
             >
+              <div class="shrink-0">
+                <h3 class="text-base font-bold tracking-tight text-zinc-900">
+                  Storefronts
+                </h3>
+                <p class="mt-1 text-xs text-zinc-500">
+                  Recent shops — open the live link or jump into the workspace.
+                </p>
+              </div>
+
               <div
-                class="relative flex h-11 w-11 shrink-0 overflow-hidden rounded-full border border-zinc-200/70 bg-zinc-100 shadow-md ring-2 ring-white"
+                class="mt-5 min-h-0 flex-1 overflow-y-auto overscroll-y-contain pr-0.5"
               >
-                <span
-                  class="absolute inset-0 z-0 flex items-center justify-center bg-gradient-to-br text-sm font-bold text-white"
-                  :class="avatarGradient(idx + s.name.length)"
-                  >{{ storeInitial(s.name) }}</span
-                >
-                <img
-                  v-if="
-                    s.logo_path?.trim() &&
-                    storeLogoPublicUrl(s.id, s.logo_path)
-                  "
-                  :src="storeLogoPublicUrl(s.id, s.logo_path)!"
-                  alt=""
-                  class="relative z-10 h-full w-full object-cover"
-                  loading="lazy"
-                  @error="
-                    ($event.target as HTMLImageElement).style.display = 'none'
-                  "
-                />
-              </div>
-              <div class="min-w-0 flex-1">
-                <div class="flex items-start justify-between gap-2">
-                  <div class="min-w-0">
-                    <p class="truncate font-bold text-zinc-900">
-                      {{ s.name }}
-                    </p>
-                    <p class="mt-0.5 truncate font-mono text-xs text-zinc-500">
-                      /{{ s.slug }}
-                    </p>
-                  </div>
-                  <div class="flex shrink-0 gap-1">
-                    <RouterLink
-                      :to="`/${s.slug}`"
-                      class="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-300/80 bg-white text-zinc-500 transition hover:border-zinc-400 hover:text-zinc-800"
-                      title="Open live shop"
+                <ul v-if="previewStores.length" class="space-y-5">
+                  <li
+                    v-for="(s, idx) in previewStores"
+                    :key="s.id"
+                    class="flex gap-3"
+                  >
+                    <div
+                      class="relative flex h-11 w-11 shrink-0 overflow-hidden rounded-full border border-zinc-200/70 bg-zinc-100 shadow-md ring-2 ring-white"
                     >
-                      <svg
-                        class="h-4 w-4"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                        stroke-width="1.75"
+                      <span
+                        class="absolute inset-0 z-0 flex items-center justify-center bg-gradient-to-br text-sm font-bold text-white"
+                        :class="avatarGradient(idx + s.name.length)"
+                        >{{ storeInitial(s.name) }}</span
                       >
-                        <path
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          d="M2.25 6.75c0 8.284 6.716 15 15 15h2.25a2.25 2.25 0 002.25-2.25v-1.372c0-.516-.351-.966-.852-1.091l-4.423-1.106c-.44-.11-.902.055-1.173.417l-.97 1.293c-.282.376-.769.608-1.29.608H5.25c-.621 0-1.125-.504-1.125-1.125V6.75zM18 9.75a.75.75 0 11-1.5 0 .75.75 0 011.5 0zm-12 0a.75.75 0 11-1.5 0 .75.75 0 011.5 0z"
-                        />
-                      </svg>
-                    </RouterLink>
-                    <RouterLink
-                      :to="`/dashboard/stores/${s.id}`"
-                      class="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-300/80 bg-white text-zinc-500 transition hover:border-zinc-400 hover:text-zinc-800"
-                      title="Manage store"
-                    >
-                      <svg
-                        class="h-4 w-4"
-                        fill="none"
-                        viewBox="0 0 24 24"
-                        stroke="currentColor"
-                        stroke-width="1.75"
+                      <img
+                        v-if="
+                          s.logo_path?.trim() &&
+                          storeLogoPublicUrl(s.id, s.logo_path)
+                        "
+                        :src="storeLogoPublicUrl(s.id, s.logo_path)!"
+                        alt=""
+                        class="relative z-10 h-full w-full object-cover"
+                        loading="lazy"
+                        @error="
+                          ($event.target as HTMLImageElement).style.display =
+                            'none'
+                        "
+                      />
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-start justify-between gap-2">
+                        <div class="min-w-0">
+                          <p class="truncate font-bold text-zinc-900">
+                            {{ s.name }}
+                          </p>
+                          <p
+                            class="mt-0.5 truncate font-mono text-xs text-zinc-500"
+                          >
+                            /{{ s.slug }}
+                          </p>
+                        </div>
+                        <div class="flex shrink-0 gap-1">
+                          <RouterLink
+                            :to="`/${s.slug}`"
+                            class="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-300/80 bg-white text-zinc-500 transition hover:border-zinc-400 hover:text-zinc-800"
+                            title="Open live shop"
+                          >
+                            <svg
+                              class="h-4 w-4"
+                              fill="none"
+                              viewBox="0 0 24 24"
+                              stroke="currentColor"
+                              stroke-width="1.75"
+                            >
+                              <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                d="M2.25 6.75c0 8.284 6.716 15 15 15h2.25a2.25 2.25 0 002.25-2.25v-1.372c0-.516-.351-.966-.852-1.091l-4.423-1.106c-.44-.11-.902.055-1.173.417l-.97 1.293c-.282.376-.769.608-1.29.608H5.25c-.621 0-1.125-.504-1.125-1.125V6.75zM18 9.75a.75.75 0 11-1.5 0 .75.75 0 011.5 0zm-12 0a.75.75 0 11-1.5 0 .75.75 0 011.5 0z"
+                              />
+                            </svg>
+                          </RouterLink>
+                          <RouterLink
+                            :to="`/dashboard/stores/${s.id}`"
+                            class="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-300/80 bg-white text-zinc-500 transition hover:border-zinc-400 hover:text-zinc-800"
+                            title="Manage store"
+                          >
+                            <svg
+                              class="h-4 w-4"
+                              fill="none"
+                              viewBox="0 0 24 24"
+                              stroke="currentColor"
+                              stroke-width="1.75"
+                            >
+                              <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+                              />
+                            </svg>
+                          </RouterLink>
+                        </div>
+                      </div>
+                      <span
+                        class="mt-2 inline-flex rounded-full bg-zinc-800 px-3 py-1 text-[11px] font-semibold text-white"
                       >
-                        <path
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
-                        />
-                      </svg>
-                    </RouterLink>
-                  </div>
-                </div>
-                <span
-                  class="mt-2 inline-flex rounded-full bg-zinc-800 px-3 py-1 text-[11px] font-semibold text-white"
-                >
-                  {{ s.is_active ? "Live" : "Paused" }}
-                </span>
+                        {{ s.is_active ? "Live" : "Paused" }}
+                      </span>
+                    </div>
+                  </li>
+                </ul>
+                <p v-else class="text-sm text-zinc-500">
+                  Create a store to see it listed here.
+                </p>
               </div>
-            </li>
-            </ul>
-            <p v-else class="text-sm text-zinc-500">
-              Create a store to see it listed here.
-            </p>
-          </div>
 
-          <div
-            class="mt-6 shrink-0 rounded-2xl border border-zinc-200/50 bg-white/70 px-4 py-3"
-          >
-            <p class="text-xs font-semibold text-zinc-800">Quick checklist</p>
-            <ul
-              class="mt-2 space-y-2 text-[11px] leading-relaxed text-zinc-600"
+              <div
+                v-if="auth.isPlatformStaff"
+                class="mt-4 shrink-0 rounded-xl border border-zinc-200/60 bg-white/60 px-3 py-2 text-[11px] leading-snug text-zinc-500"
+              >
+                Paystack subscription rows for your shops are in the
+                <span class="font-semibold text-zinc-700">Subscriptions</span>
+                card below.
+              </div>
+            </div>
+
+            <div
+              v-if="auth.isPlatformStaff"
+              class="flex flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/50 bg-[#f3f3f7] p-5 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.1)] sm:rounded-3xl sm:p-6"
             >
-              <li class="flex gap-2">
-                <span class="text-teal-600" aria-hidden="true">✓</span>
-                Short slug, clear store name.
-              </li>
-              <li class="flex gap-2">
-                <span class="text-teal-600" aria-hidden="true">✓</span>
-                Publish products when ready.
-              </li>
-              <li class="flex gap-2">
-                <span class="text-teal-600" aria-hidden="true">✓</span>
-                Share your public shop link.
-              </li>
-            </ul>
+              <div class="shrink-0">
+                <h3 class="text-base font-bold tracking-tight text-zinc-900">
+                  Subscriptions
+                </h3>
+                <p class="mt-1 text-xs text-zinc-500">
+                  <span class="font-medium text-zinc-600"
+                    >seller_subscriptions</span
+                  >
+                  — latest Paystack fields per shop (matches your search, up to
+                  five).
+                </p>
+              </div>
+
+              <div
+                class="mt-5 max-h-[min(70dvh,28rem)] overflow-y-auto overscroll-y-contain pr-0.5"
+              >
+                <ul
+                  v-if="adminSubscriptionLedgerRows.length"
+                  class="divide-y divide-zinc-200/60 overflow-hidden rounded-2xl border border-zinc-200/70 bg-white/90 shadow-[0_1px_0_rgba(255,255,255,0.8)_inset] ring-1 ring-zinc-100/90"
+                >
+                  <li
+                    v-for="row in adminSubscriptionLedgerRows"
+                    :key="row.id"
+                    class="group flex items-center gap-3 px-3 py-3.5 transition-colors hover:bg-sky-50/40 sm:gap-4 sm:px-4"
+                  >
+                    <div
+                      class="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl text-sm font-bold text-white shadow-md ring-1 ring-black/10"
+                      :class="row.iconClass"
+                    >
+                      {{ row.iconLetter }}
+                    </div>
+                    <div class="min-w-0 flex-1">
+                      <p
+                        class="truncate text-[0.9375rem] font-semibold leading-snug tracking-tight text-zinc-900"
+                      >
+                        {{ row.title }}
+                      </p>
+                      <p class="mt-0.5 truncate text-xs text-zinc-500">
+                        {{ row.subtitle }}
+                      </p>
+                    </div>
+                    <div
+                      class="shrink-0 text-right text-[0.9375rem] font-bold tabular-nums tracking-tight"
+                      :class="
+                        row.amountPositive ? 'text-sky-600' : 'text-zinc-400'
+                      "
+                    >
+                      {{ row.amount }}
+                    </div>
+                  </li>
+                </ul>
+                <div
+                  v-else
+                  class="rounded-2xl border border-dashed border-zinc-300/90 bg-zinc-50/90 px-4 py-10 text-center"
+                >
+                  <p class="text-sm font-medium text-zinc-600">
+                    No storefronts yet
+                  </p>
+                  <p class="mt-1 text-xs text-zinc-500">
+                    Subscription rows appear here after you create a shop.
+                  </p>
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
+        </template>
       </div>
     </template>
   </div>
@@ -1328,7 +1705,9 @@ onUnmounted(() => {
                     <div
                       class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto overscroll-y-contain p-5 sm:p-6"
                     >
-                      <div class="flex flex-wrap items-start justify-between gap-2">
+                      <div
+                        class="flex flex-wrap items-start justify-between gap-2"
+                      >
                         <p
                           class="text-[11px] font-bold uppercase tracking-wide text-zinc-500"
                         >

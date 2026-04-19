@@ -1497,24 +1497,24 @@ async function confirmRevokeConsoleAccess() {
                 <button
                   v-if="authStore.isSuperAdmin && u.role === 'admin'"
                   type="button"
-                  class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-rose-200/90 bg-white text-rose-700 shadow-sm ring-1 ring-rose-100/60 transition hover:border-rose-300 hover:bg-rose-50 hover:text-rose-800"
-                  :aria-label="`Revoke console access for ${u.displayName}`"
-                  :title="`Revoke access for ${u.displayName}`"
+                  class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-rose-200/90 bg-rose-50/90 text-rose-800 shadow-sm ring-1 ring-rose-100/70 transition hover:border-rose-400/80 hover:bg-rose-100 hover:text-rose-950"
+                  :aria-label="`Remove ${u.displayName} from admin workspace`"
+                  :title="`Remove ${u.displayName} from the admin workspace`"
                   @click="openRevokeConfirm(u)"
                 >
                   <svg
-                    class="h-4 w-4"
+                    class="h-[18px] w-[18px]"
                     fill="none"
                     viewBox="0 0 24 24"
                     stroke="currentColor"
-                    stroke-width="1.75"
+                    stroke-width="2"
                     stroke-linecap="round"
                     stroke-linejoin="round"
                     aria-hidden="true"
                   >
-                    <path
-                      d="M15 12H9m6 0a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"
-                    />
+                    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                    <circle cx="9" cy="7" r="4" />
+                    <line x1="17" x2="23" y1="11" y2="11" />
                   </svg>
                 </button>
               </div>

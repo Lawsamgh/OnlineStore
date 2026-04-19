@@ -1,4 +1,9 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1'
+import { sendSellerPlanSubscribedEmail } from '../_shared/sendSellerPlanEmail.ts'
+import {
+  extractPaystackPaymentFields,
+  intPesewasFromUnknown,
+} from '../_shared/paystackPaymentDetails.ts'
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -84,6 +89,8 @@ Deno.serve(async (req) => {
       data?: {
         status?: string
         amount?: number
+        channel?: string
+        fees?: number | string
         metadata?: Record<string, unknown>
         customer?: unknown
       }
@@ -134,7 +141,7 @@ Deno.serve(async (req) => {
     }
 
     const metaPlan = strMeta(meta.plan_id).toLowerCase()
-    const paid = typeof d.amount === 'number' ? d.amount : NaN
+    const paid = intPesewasFromUnknown(d.amount) ?? NaN
 
     /** Infer tier from charged pesewas when Paystack omits or flattens `plan_id` in verify metadata. */
     function planIdFromAmount(pesewas: number): string | null {
@@ -174,7 +181,7 @@ Deno.serve(async (req) => {
     const admin = createClient(supabaseUrl, serviceKey)
     const { data: store, error: se } = await admin
       .from('stores')
-      .select('id, owner_id')
+      .select('id, owner_id, name')
       .eq('id', metaStoreId)
       .maybeSingle()
 
@@ -185,6 +192,8 @@ Deno.serve(async (req) => {
     const periodEnd = new Date()
     periodEnd.setUTCDate(periodEnd.getUTCDate() + 30)
 
+    const payFields = extractPaystackPaymentFields(d as unknown as Record<string, unknown>)
+
     const subRow: Record<string, unknown> = {
       store_id: metaStoreId,
       paystack_customer_code: paystackCustomerCode,
@@ -193,6 +202,9 @@ Deno.serve(async (req) => {
       plan_interval: 'monthly',
       current_period_end: periodEnd.toISOString(),
       updated_at: new Date().toISOString(),
+      paid_amount_pesewas: payFields.paid_amount_pesewas,
+      payment_channel: payFields.payment_channel,
+      paystack_fee_pesewas: payFields.paystack_fee_pesewas,
     }
     if (feePlanId) subRow.pricing_plan_id = feePlanId
     else subRow.pricing_plan_id = null
@@ -222,8 +234,26 @@ Deno.serve(async (req) => {
       }
     }
 
+    const storeRec = store as { name?: string | null } | null
+    const storeName = storeRec?.name?.trim() ? storeRec.name.trim() : null
+
+    await sendSellerPlanSubscribedEmail({
+      resendApiKey: Deno.env.get('RESEND_API_KEY') ?? undefined,
+      resendFromEmail: Deno.env.get('RESEND_FROM_EMAIL') ?? 'onboarding@resend.dev',
+      to: user.email ?? undefined,
+      planId: feePlanId,
+      source: 'store',
+      periodEndsAtIso: periodEnd.toISOString(),
+      storeName,
+    })
+
     return Response.json(
-      { ok: true, store_id: metaStoreId, plan_id: feePlanId },
+      {
+        ok: true,
+        store_id: metaStoreId,
+        plan_id: feePlanId,
+        payment_snapshot: payFields,
+      },
       { headers: cors },
     )
   } catch (e) {

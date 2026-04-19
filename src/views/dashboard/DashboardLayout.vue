@@ -28,6 +28,8 @@ import { useToastStore } from "../../stores/toast";
 
 const route = useRoute();
 const router = useRouter();
+/** Footer copyright year (set once per layout load). */
+const dashboardFooterYear = new Date().getFullYear();
 const auth = useAuthStore();
 const { sessionUserId: authSessionUserId } = storeToRefs(auth);
 const cart = useCartStore();
@@ -482,8 +484,6 @@ function onVisibilityRefreshSellerRole() {
   }
 }
 
-const isStoreManage = computed(() => route.name === "dashboard-store");
-
 type ShellNavIcon = "grid" | "plus" | "cog" | "megaphone" | "ticket";
 
 type ShellNavItem = {
@@ -631,6 +631,78 @@ const platformRoleBadgeClass = computed(() =>
   auth.isSuperAdmin
     ? "border-violet-200/90 bg-violet-50 text-violet-900 ring-violet-200/60"
     : "border-slate-200/90 bg-slate-100 text-slate-800 ring-slate-200/70",
+);
+
+/** Earliest `current_period_end` among this user's active/trialing shop subs (matches DashboardHome renewal guard). */
+const headerSellerSubscriptionRenewalEnd = ref<string | null>(null);
+
+function formatHeaderSubscriptionPeriodEnd(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(d);
+}
+
+async function refreshHeaderSellerSubscriptionRenewal() {
+  headerSellerSubscriptionRenewalEnd.value = null;
+  if (!isSupabaseConfigured() || !auth.isSignedIn || isAdminShell.value) return;
+  const uid = authSessionUserId.value;
+  if (!uid) return;
+  const supabase = getSupabaseBrowser();
+  const { data: storeRows, error: storeErr } = await supabase
+    .from("stores")
+    .select("id")
+    .eq("owner_id", uid);
+  if (storeErr) return;
+  const storeIds = (storeRows ?? [])
+    .map((r: { id?: unknown }) =>
+      typeof r.id === "string" ? r.id : String(r.id ?? ""),
+    )
+    .filter(Boolean);
+  if (storeIds.length === 0) return;
+  const { data: subRows, error: subErr } = await supabase
+    .from("seller_subscriptions")
+    .select("current_period_end, status")
+    .in("store_id", storeIds);
+  if (subErr) return;
+  let minEnd: string | null = null;
+  for (const row of subRows ?? []) {
+    const rec = row as {
+      current_period_end?: string | null;
+      status?: string | null;
+    };
+    const st = typeof rec.status === "string" ? rec.status.trim() : "";
+    if (st === "active" || st === "trialing") {
+      const end =
+        typeof rec.current_period_end === "string"
+          ? rec.current_period_end
+          : null;
+      if (end && (!minEnd || new Date(end) < new Date(minEnd))) {
+        minEnd = end;
+      }
+    }
+  }
+  headerSellerSubscriptionRenewalEnd.value = minEnd;
+}
+
+watch(
+  () =>
+    [
+      auth.isSignedIn,
+      authSessionUserId.value,
+      isAdminShell.value,
+      route.fullPath,
+    ] as const,
+  ([signedIn, uid, adminShell]) => {
+    if (!signedIn || !uid || adminShell) {
+      headerSellerSubscriptionRenewalEnd.value = null;
+      return;
+    }
+    void refreshHeaderSellerSubscriptionRenewal();
+  },
+  { immediate: true },
 );
 </script>
 
@@ -955,16 +1027,6 @@ const platformRoleBadgeClass = computed(() =>
         <header
           class="z-40 shrink-0 rounded-[1.75rem] border border-white/70 bg-gradient-to-br from-sky-50/90 via-indigo-50/50 to-violet-50/70 px-5 py-5 shadow-[0_24px_60px_-32px_rgba(15,23,42,0.12)] backdrop-blur-md sm:rounded-[1.875rem] sm:px-8 sm:py-6"
         >
-          <div v-if="isStoreManage" class="mb-4 sm:mb-5">
-            <RouterLink
-              to="/dashboard"
-              class="inline-flex items-center gap-2 rounded-full border border-indigo-200/80 bg-white/80 px-4 py-2 text-sm font-semibold text-indigo-900 shadow-sm transition hover:bg-white"
-            >
-              <span aria-hidden="true" class="text-indigo-600">←</span>
-              All stores
-            </RouterLink>
-          </div>
-
           <!-- Greeting left · compact search + controls grouped right -->
           <div
             class="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between lg:gap-6"
@@ -1055,13 +1117,37 @@ const platformRoleBadgeClass = computed(() =>
                     {{ headerLine }}
                   </p>
                 </template>
-                <p v-if="auth.isPlatformStaff" class="mt-2.5">
+                <p
+                  v-if="
+                    auth.isPlatformStaff || headerSellerSubscriptionRenewalEnd
+                  "
+                  class="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1.5"
+                >
                   <span
+                    v-if="auth.isPlatformStaff"
                     class="inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-semibold tracking-tight ring-1"
                     :class="platformRoleBadgeClass"
                     :aria-label="`Platform console role: ${auth.platformAdminRoleLabel}`"
                   >
                     {{ auth.platformAdminRoleLabel }}
+                  </span>
+                  <span
+                    v-if="headerSellerSubscriptionRenewalEnd"
+                    class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-sky-200/90 bg-sky-50/95 px-3 py-1 text-xs font-semibold text-sky-950 shadow-sm ring-1 ring-sky-100/80"
+                  >
+                    <span class="shrink-0 text-sky-800/90"
+                      >Subscription ends</span
+                    >
+                    <time
+                      class="min-w-0 truncate font-bold tabular-nums tracking-tight text-sky-950"
+                      :datetime="headerSellerSubscriptionRenewalEnd"
+                    >
+                      {{
+                        formatHeaderSubscriptionPeriodEnd(
+                          headerSellerSubscriptionRenewalEnd,
+                        )
+                      }}
+                    </time>
                   </span>
                 </p>
               </div>
@@ -1102,7 +1188,7 @@ const platformRoleBadgeClass = computed(() =>
               <button
                 type="button"
                 class="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-zinc-200/80 bg-zinc-50 text-zinc-500 shadow-sm transition hover:border-zinc-300 hover:bg-white hover:text-zinc-800"
-                aria-label="Filters"
+                aria-label="Chat"
               >
                 <svg
                   class="h-6 w-6"
@@ -1110,18 +1196,13 @@ const platformRoleBadgeClass = computed(() =>
                   viewBox="0 0 24 24"
                   stroke="currentColor"
                   stroke-width="1.75"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
+                  aria-hidden="true"
                 >
-                  <line x1="4" y1="21" x2="4" y2="14" />
-                  <line x1="4" y1="10" x2="4" y2="3" />
-                  <line x1="12" y1="21" x2="12" y2="12" />
-                  <line x1="12" y1="8" x2="12" y2="3" />
-                  <line x1="20" y1="21" x2="20" y2="16" />
-                  <line x1="20" y1="12" x2="20" y2="3" />
-                  <line x1="1" y1="14" x2="7" y2="14" />
-                  <line x1="9" y1="8" x2="15" y2="8" />
-                  <line x1="17" y1="16" x2="23" y2="16" />
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+                  />
                 </svg>
               </button>
 
@@ -1708,11 +1789,56 @@ const platformRoleBadgeClass = computed(() =>
         </header>
 
         <div
-          class="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto overscroll-y-contain"
+          class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
         >
-          <div class="min-w-0 px-0.5 pb-6 md:px-1">
-            <RouterView v-if="!adminAccessBlocked" />
+          <div
+            class="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto overscroll-y-contain"
+          >
+            <div class="min-w-0 flex-1 px-0.5 pb-4 md:px-1">
+              <RouterView v-if="!adminAccessBlocked" />
+            </div>
           </div>
+          <footer
+            v-if="!adminAccessBlocked"
+            class="shrink-0 border-t border-zinc-200/80 bg-white/90 px-4 py-2.5 shadow-[0_-8px_24px_-12px_rgba(15,23,42,0.08)] backdrop-blur-md md:rounded-b-2xl md:px-5"
+            :style="{
+              paddingBottom: 'max(0.625rem, env(safe-area-inset-bottom, 0px))',
+            }"
+          >
+            <nav
+              class="flex flex-col items-center justify-between gap-2 sm:flex-row sm:gap-4"
+              aria-label="Dashboard footer"
+            >
+              <div
+                class="flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-[11px] font-semibold"
+              >
+                <RouterLink
+                  :to="isAdminShell ? { name: 'admin' } : { name: 'dashboard' }"
+                  class="text-zinc-600 transition hover:text-zinc-900"
+                >
+                  {{ isAdminShell ? "Console home" : "Seller hub" }}
+                </RouterLink>
+                <RouterLink
+                  v-if="isAdminShell && auth.isPlatformStaff"
+                  :to="{ name: 'admin-tickets' }"
+                  class="text-zinc-600 transition hover:text-zinc-900"
+                >
+                  Support tickets
+                </RouterLink>
+                <RouterLink
+                  :to="{ name: 'home' }"
+                  class="text-zinc-600 transition hover:text-zinc-900"
+                >
+                  Marketing site
+                </RouterLink>
+              </div>
+              <p
+                class="text-center text-[10px] font-medium tabular-nums text-zinc-400 sm:text-right"
+              >
+                © {{ dashboardFooterYear }} U&amp;I Tech
+              </p>
+            </nav>
+          </footer>
         </div>
       </div>
     </div>
