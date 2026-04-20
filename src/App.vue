@@ -10,7 +10,10 @@ import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
 import AppToastStack from "./components/AppToastStack.vue";
 import CartDrawer from "./components/CartDrawer.vue";
 import { isSupabaseConfigured } from "./lib/supabase";
-import { useAuthStore } from "./stores/auth";
+import {
+  AUTH_OAUTH_REDIRECT_PENDING_KEY,
+  useAuthStore,
+} from "./stores/auth";
 import { useCartStore } from "./stores/cart";
 import { useUiStore } from "./stores/ui";
 
@@ -128,6 +131,18 @@ watch(
   () => route.fullPath,
   () => {
     closeNavProfileMenu();
+  },
+);
+
+watch(
+  () => [auth.isSignedIn, route.name] as const,
+  async ([signedIn, routeName]) => {
+    if (!signedIn || routeName !== "home") return;
+    const pending = sessionStorage.getItem(AUTH_OAUTH_REDIRECT_PENDING_KEY);
+    if (pending !== "1") return;
+    sessionStorage.removeItem(AUTH_OAUTH_REDIRECT_PENDING_KEY);
+    await auth.refreshSuperAdminRole();
+    await router.replace({ name: auth.isSuperAdmin ? "admin" : "dashboard" });
   },
 );
 </script>

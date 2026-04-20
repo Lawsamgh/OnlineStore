@@ -14,6 +14,10 @@ export const AUTH_PENDING_SIGNUP_PLAN_KEY = "uanditech_pending_signup_plan";
 export const AUTH_PENDING_SIGNUP_FULL_NAME_KEY =
   "uanditech_pending_signup_full_name";
 
+/** Set before OAuth so callback can complete post-login routing from any return path. */
+export const AUTH_OAUTH_REDIRECT_PENDING_KEY =
+  "uanditech_oauth_redirect_pending";
+
 /** Set while on `/console-access-pending`; cleared when staff is granted or session ends. */
 export const AUTH_SESSION_CONSOLE_ACCESS_PENDING_KEY =
   "uanditech_session_console_access_pending";

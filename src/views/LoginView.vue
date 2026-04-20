@@ -9,6 +9,7 @@ import {
 } from "../constants/pricingPlans";
 import { isSupabaseConfigured } from "../lib/supabase";
 import {
+  AUTH_OAUTH_REDIRECT_PENDING_KEY,
   AUTH_PENDING_SIGNUP_FULL_NAME_KEY,
   AUTH_PENDING_SIGNUP_PLAN_KEY,
   useAuthStore,
@@ -188,6 +189,7 @@ async function submit() {
       await router.replace(await resolvePostLoginDestination());
     }
   } catch (e: unknown) {
+    sessionStorage.removeItem(AUTH_OAUTH_REDIRECT_PENDING_KEY);
     toast.error(e instanceof Error ? e.message : "Something went wrong");
   } finally {
     busy.value = false;
@@ -201,6 +203,7 @@ async function google() {
   }
   busy.value = true;
   try {
+    sessionStorage.setItem(AUTH_OAUTH_REDIRECT_PENDING_KEY, "1");
     if (mode.value === "sign-up") {
       sessionStorage.setItem(
         AUTH_PENDING_SIGNUP_PLAN_KEY,
