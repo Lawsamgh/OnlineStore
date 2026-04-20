@@ -362,13 +362,6 @@ const howItWorks = [
                 </svg>
               </RouterLink>
               <RouterLink
-                v-if="auth.isSignedIn && auth.isPlatformStaff && !auth.isSuperAdmin"
-                to="/admin"
-                class="inline-flex min-h-[48px] items-center justify-center rounded-full border border-zinc-300/90 bg-white/80 px-8 py-3 text-sm font-semibold text-zinc-800 shadow-sm backdrop-blur-sm transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-zinc-400 hover:bg-white hover:shadow-md active:scale-[0.98] motion-reduce:hover:translate-y-0"
-              >
-                Platform admin
-              </RouterLink>
-              <RouterLink
                 :to="{ name: 'home', hash: '#pricing' }"
                 class="inline-flex min-h-[48px] items-center justify-center rounded-full border border-zinc-300/80 bg-white/60 px-8 py-3 text-sm font-semibold text-zinc-800 backdrop-blur-sm transition-all duration-200 ease-out hover:-translate-y-0.5 hover:border-zinc-400 hover:bg-white hover:shadow-md active:scale-[0.98] motion-reduce:hover:translate-y-0"
               >
