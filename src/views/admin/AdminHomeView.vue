@@ -146,7 +146,7 @@ const subscriptionCashflowMonths = computed((): SubscriptionCashflowMonth[] => {
       "Nov",
       "Dec",
     ];
-    const acc = Array.from({ length: 12 }, (_, i) => ({
+    const acc = Array.from({ length: 12 }, () => ({
       incomeGhs: 0,
       feeGhs: 0,
     }));
