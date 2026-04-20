@@ -15,7 +15,7 @@ import UiSkeletonPanel from "./UiSkeletonPanel.vue";
         <li
           v-for="i in 4"
           :key="i"
-          class="flex min-h-[18.5rem] flex-col rounded-[1.75rem] border border-zinc-200/80 bg-white/70 p-6 pb-8 shadow-sm sm:min-h-[20.5rem] sm:rounded-3xl sm:p-7 sm:pb-9 lg:min-h-[22rem]"
+          class="flex min-h-[12.5rem] flex-col rounded-2xl border border-zinc-200/80 bg-white/70 p-4 pb-4 shadow-sm sm:min-h-[13.5rem] sm:rounded-[1.35rem] sm:p-4 sm:pb-5 lg:min-h-[14rem] lg:p-5"
         >
           <UiSkeleton
             variant="line"
@@ -24,29 +24,29 @@ import UiSkeletonPanel from "./UiSkeletonPanel.vue";
             tone="slate"
             :delay="i % 6"
           />
-          <div class="mt-3 flex items-end justify-between gap-3 sm:mt-4">
+          <div class="mt-2 flex items-end justify-between gap-2.5 sm:mt-3">
             <UiSkeleton
               variant="line"
               class="min-w-0 flex-1"
               width-class="w-2/3"
-              height-class="h-12 sm:h-14 lg:h-16"
+              height-class="h-9 sm:h-10 lg:h-11"
               tone="slate"
               :delay="(i + 1) % 6"
             />
             <div
-              class="h-16 w-16 shrink-0 overflow-hidden rounded-2xl ring-1 ring-zinc-200/70 sm:h-[4.5rem] sm:w-[4.5rem] sm:rounded-[1.35rem] lg:h-20 lg:w-20"
+              class="h-12 w-12 shrink-0 overflow-hidden rounded-xl ring-1 ring-zinc-200/70 sm:h-14 sm:w-14 sm:rounded-[1.1rem]"
             >
               <UiSkeleton
                 variant="rect"
                 width-class="w-full"
-                height-class="h-full min-h-[4rem]"
+                height-class="h-full min-h-[2.75rem]"
                 tone="slate"
                 :delay="(i + 2) % 6"
               />
             </div>
           </div>
           <UiSkeleton
-            class="mt-3 rounded-full"
+            class="mt-2 rounded-full"
             variant="line"
             width-class="w-28"
             height-class="h-6"
@@ -54,14 +54,14 @@ import UiSkeletonPanel from "./UiSkeletonPanel.vue";
             :delay="(i + 2) % 6"
           />
           <UiSkeleton
-            class="mt-2"
+            class="mt-1.5"
             variant="line"
             width-class="w-40"
             height-class="h-3"
             tone="slate"
             :delay="(i + 3) % 6"
           />
-          <div class="mt-auto space-y-2 pt-6 sm:pt-7">
+          <div class="mt-auto space-y-1.5 pt-3 sm:pt-4">
             <UiSkeleton
               variant="line"
               width-class="w-32"

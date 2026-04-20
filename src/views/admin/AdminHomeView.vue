@@ -26,6 +26,7 @@ import {
   saveKpiHistory,
   type KpiSample,
 } from "../../lib/dashboardKpiHistory";
+import AdminSubscriptionCashflowChart from "../../components/admin/AdminSubscriptionCashflowChart.vue";
 
 const DashboardKpiTimeChart = defineAsyncComponent(
   () => import("../../components/dashboard/DashboardKpiTimeChart.vue"),
@@ -46,6 +47,165 @@ const stats = ref({
   ticketsOpen: 0,
   /** Rows in `admin_roles` (super_admin + admin). */
   adminUsers: 0,
+});
+
+/** Sum of `(paid_amount_pesewas − paystack_fee_pesewas)` across stores with a payment snapshot. */
+const subscriptionNetTotalPesewas = ref(0);
+/** Raw rows for monthly paid vs fee aggregation (cashflow chart). */
+type SubscriptionSnapRow = {
+  paid_amount_pesewas: number | null;
+  paystack_fee_pesewas: number | null;
+  updated_at: string;
+};
+const subscriptionSnapRows = ref<SubscriptionSnapRow[]>([]);
+
+/** `year` = Jan–Dec calendar year; `6m` = trailing six months. */
+const subscriptionCashflowPeriod = ref<"year" | "6m">("year");
+
+function applySellerSubscriptionBilling(
+  rows: unknown[] | null,
+  error: { message: string } | null,
+  silent: boolean,
+) {
+  if (error) {
+    if (!silent) toast.error(error.message);
+    subscriptionNetTotalPesewas.value = 0;
+    subscriptionSnapRows.value = [];
+    return;
+  }
+  type Snap = {
+    paid_amount_pesewas?: number | null;
+    paystack_fee_pesewas?: number | null;
+    updated_at?: string;
+  };
+  const list = (rows ?? []) as Snap[];
+  subscriptionSnapRows.value = list
+    .filter(
+      (r) =>
+        typeof r.updated_at === "string" &&
+        !Number.isNaN(new Date(r.updated_at).getTime()),
+    )
+    .map((r) => ({
+      paid_amount_pesewas:
+        typeof r.paid_amount_pesewas === "number" &&
+        Number.isFinite(r.paid_amount_pesewas)
+          ? r.paid_amount_pesewas
+          : null,
+      paystack_fee_pesewas:
+        typeof r.paystack_fee_pesewas === "number" &&
+        Number.isFinite(r.paystack_fee_pesewas)
+          ? r.paystack_fee_pesewas
+          : null,
+      updated_at: r.updated_at as string,
+    }));
+
+  const withPayment = subscriptionSnapRows.value.filter(
+    (r) =>
+      typeof r.paid_amount_pesewas === "number" &&
+      r.paid_amount_pesewas > 0,
+  );
+  let totalPesewas = 0;
+  for (const r of withPayment) {
+    const paid = r.paid_amount_pesewas!;
+    const fee =
+      typeof r.paystack_fee_pesewas === "number" &&
+      Number.isFinite(r.paystack_fee_pesewas)
+        ? r.paystack_fee_pesewas!
+        : 0;
+    totalPesewas += paid - fee;
+  }
+  subscriptionNetTotalPesewas.value = Math.max(0, totalPesewas);
+}
+
+type SubscriptionCashflowMonth = {
+  key: string;
+  label: string;
+  incomeGhs: number;
+  feeGhs: number;
+};
+
+const subscriptionCashflowMonths = computed((): SubscriptionCashflowMonth[] => {
+  const rows = subscriptionSnapRows.value;
+  const period = subscriptionCashflowPeriod.value;
+  const monthLabel = (d: Date) =>
+    d.toLocaleDateString(undefined, { month: "short" });
+
+  if (period === "year") {
+    const y = new Date().getFullYear();
+    const labels = [
+      "Jan",
+      "Feb",
+      "Mar",
+      "Apr",
+      "May",
+      "Jun",
+      "Jul",
+      "Aug",
+      "Sep",
+      "Oct",
+      "Nov",
+      "Dec",
+    ];
+    const acc = Array.from({ length: 12 }, (_, i) => ({
+      incomeGhs: 0,
+      feeGhs: 0,
+    }));
+    for (const r of rows) {
+      const d = new Date(r.updated_at);
+      if (Number.isNaN(d.getTime()) || d.getFullYear() !== y) continue;
+      if (typeof r.paid_amount_pesewas !== "number" || r.paid_amount_pesewas <= 0)
+        continue;
+      const mi = d.getMonth();
+      acc[mi]!.incomeGhs += r.paid_amount_pesewas / 100;
+      const fee =
+        typeof r.paystack_fee_pesewas === "number" &&
+        Number.isFinite(r.paystack_fee_pesewas)
+          ? r.paystack_fee_pesewas
+          : 0;
+      acc[mi]!.feeGhs += fee / 100;
+    }
+    return labels.map((label, i) => ({
+      key: `${y}-${i}`,
+      label,
+      incomeGhs: acc[i]!.incomeGhs,
+      feeGhs: acc[i]!.feeGhs,
+    }));
+  }
+
+  const out: SubscriptionCashflowMonth[] = [];
+  const now = new Date();
+  for (let k = 5; k >= 0; k--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - k, 1);
+    const y = d.getFullYear();
+    const mi = d.getMonth();
+    let incomeGhs = 0;
+    let feeGhs = 0;
+    for (const r of rows) {
+      const dr = new Date(r.updated_at);
+      if (
+        Number.isNaN(dr.getTime()) ||
+        dr.getFullYear() !== y ||
+        dr.getMonth() !== mi
+      )
+        continue;
+      if (typeof r.paid_amount_pesewas !== "number" || r.paid_amount_pesewas <= 0)
+        continue;
+      incomeGhs += r.paid_amount_pesewas / 100;
+      const fee =
+        typeof r.paystack_fee_pesewas === "number" &&
+        Number.isFinite(r.paystack_fee_pesewas)
+          ? r.paystack_fee_pesewas
+          : 0;
+      feeGhs += fee / 100;
+    }
+    out.push({
+      key: `${y}-${mi}`,
+      label: monthLabel(d),
+      incomeGhs,
+      feeGhs,
+    });
+  }
+  return out;
 });
 
 type OwnerStore = {
@@ -671,30 +831,47 @@ async function loadPlatformData(silent = false) {
   if (!silent) loading.value = true;
   try {
     const sb = getSupabaseBrowser();
-    const [s, pr, t, adminRes, adminRolesListRes, storesRes, profilesRecentRes] =
-      await Promise.all([
-        sb.from("stores").select("id", { count: "exact", head: true }),
-        sb.from("products").select("id", { count: "exact", head: true }),
-        sb
-          .from("support_tickets")
-          .select("id", { count: "exact", head: true })
-          .eq("status", "open"),
-        sb.from("admin_roles").select("id", { count: "exact", head: true }),
-        sb.from("admin_roles").select("user_id, role").order("created_at", {
-          ascending: true,
-        }),
-        sb
-          .from("stores")
-          .select(
-            "id, slug, name, is_active, logo_path, owner_id, profiles!stores_owner_id_fkey(display_name, avatar_path, signup_plan)",
-          )
-          .order("created_at", { ascending: false }),
-        sb
-          .from("profiles")
-          .select("id, display_name, avatar_path, created_at")
-          .order("created_at", { ascending: false })
-          .limit(80),
-      ]);
+    const [
+      s,
+      pr,
+      t,
+      adminRes,
+      adminRolesListRes,
+      storesRes,
+      profilesRecentRes,
+      subSnapRes,
+    ] = await Promise.all([
+      sb.from("stores").select("id", { count: "exact", head: true }),
+      sb.from("products").select("id", { count: "exact", head: true }),
+      sb
+        .from("support_tickets")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "open"),
+      sb.from("admin_roles").select("id", { count: "exact", head: true }),
+      sb.from("admin_roles").select("user_id, role").order("created_at", {
+        ascending: true,
+      }),
+      sb
+        .from("stores")
+        .select(
+          "id, slug, name, is_active, logo_path, owner_id, profiles!stores_owner_id_fkey(display_name, avatar_path, signup_plan)",
+        )
+        .order("created_at", { ascending: false }),
+      sb
+        .from("profiles")
+        .select("id, display_name, avatar_path, created_at")
+        .order("created_at", { ascending: false })
+        .limit(80),
+      sb
+        .from("seller_subscriptions")
+        .select("paid_amount_pesewas, paystack_fee_pesewas, updated_at")
+        .order("updated_at", { ascending: true }),
+    ]);
+    applySellerSubscriptionBilling(
+      subSnapRes.data as unknown[] | null,
+      subSnapRes.error,
+      silent,
+    );
     stats.value = {
       stores: s.count ?? 0,
       products: pr.count ?? 0,
@@ -917,6 +1094,7 @@ useRealtimeTableRefresh({
     { table: "admin_roles" },
     { table: "profiles" },
     { table: "products" },
+    { table: "seller_subscriptions" },
   ],
   onEvent: () => loadPlatformData(true),
 });
@@ -1055,7 +1233,7 @@ async function confirmRevokeConsoleAccess() {
           <li
             v-for="card in statCards"
             :key="card.key"
-            class="flex min-h-[18rem] flex-col rounded-[1.75rem] border p-5 pb-7 sm:min-h-[20rem] sm:rounded-3xl sm:p-6 sm:pb-8 md:min-h-[19rem] lg:min-h-[21rem] xl:min-h-[22.5rem]"
+            class="flex flex-col rounded-2xl border p-4 sm:rounded-[1.35rem] sm:p-4 lg:p-5"
             :class="[card.border, card.bg, card.shadow]"
           >
             <p
@@ -1065,20 +1243,20 @@ async function confirmRevokeConsoleAccess() {
               {{ card.label }}
             </p>
             <div
-              class="mt-3 flex min-w-0 items-end justify-between gap-3 sm:mt-4 sm:gap-4"
+              class="mt-2 flex min-w-0 items-end justify-between gap-2.5 sm:mt-3 sm:gap-3"
             >
               <p
-                class="min-w-0 flex-1 text-4xl font-bold tabular-nums leading-[0.92] tracking-tight text-zinc-900 sm:text-5xl sm:leading-[0.9] lg:text-[3rem] lg:leading-[0.9] xl:text-[3.35rem]"
+                class="min-w-0 flex-1 text-3xl font-bold tabular-nums leading-[0.95] tracking-tight text-zinc-900 sm:text-4xl sm:leading-[0.92] lg:text-[2.35rem] lg:leading-[0.92]"
               >
                 {{ card.value }}
               </p>
               <div
-                class="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-white/85 shadow-md shadow-zinc-900/10 ring-1 ring-white/95 sm:h-[4.5rem] sm:w-[4.5rem] sm:rounded-[1.35rem] lg:h-20 lg:w-20"
+                class="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-white/85 shadow-md shadow-zinc-900/10 ring-1 ring-white/95 sm:h-14 sm:w-14 sm:rounded-[1.1rem]"
                 aria-hidden="true"
               >
                 <svg
                   v-if="card.key === 'stores'"
-                  class="h-9 w-9 text-violet-700 sm:h-11 sm:w-11"
+                  class="h-7 w-7 text-violet-700 sm:h-8 sm:w-8"
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
@@ -1092,7 +1270,7 @@ async function confirmRevokeConsoleAccess() {
                 </svg>
                 <svg
                   v-else-if="card.key === 'products'"
-                  class="h-9 w-9 text-sky-700 sm:h-11 sm:w-11"
+                  class="h-7 w-7 text-sky-700 sm:h-8 sm:w-8"
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
@@ -1106,7 +1284,7 @@ async function confirmRevokeConsoleAccess() {
                 </svg>
                 <svg
                   v-else-if="card.key === 'ticketsOpen'"
-                  class="h-9 w-9 text-amber-700 sm:h-11 sm:w-11"
+                  class="h-7 w-7 text-amber-700 sm:h-8 sm:w-8"
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
@@ -1115,15 +1293,12 @@ async function confirmRevokeConsoleAccess() {
                   stroke-linejoin="round"
                 >
                   <path
-                    d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"
+                    d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 01-.825-.242m9.345-8.334a2.126 2.126 0 00-.476-.095 48.64 48.64 0 00-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6M6 18v-3.75m-3 .75h18"
                   />
-                  <path d="M13 5v2" />
-                  <path d="M13 17v2" />
-                  <path d="M13 11v2" />
                 </svg>
                 <svg
                   v-else-if="card.key === 'adminUsers'"
-                  class="h-9 w-9 text-emerald-700 sm:h-11 sm:w-11"
+                  class="h-7 w-7 text-emerald-700 sm:h-8 sm:w-8"
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
@@ -1137,7 +1312,7 @@ async function confirmRevokeConsoleAccess() {
                 </svg>
                 <svg
                   v-else
-                  class="h-9 w-9 text-zinc-500 sm:h-11 sm:w-11"
+                  class="h-7 w-7 text-zinc-500 sm:h-8 sm:w-8"
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
@@ -1152,19 +1327,19 @@ async function confirmRevokeConsoleAccess() {
               </div>
             </div>
             <p
-              class="mt-3 inline-flex w-fit rounded-full px-2.5 py-1 text-[11px] font-semibold sm:mt-4"
+              class="mt-2 inline-flex w-fit rounded-full px-2.5 py-1 text-[11px] font-semibold sm:mt-2.5"
               :class="card.pillClass"
             >
               {{ card.pill }}
             </p>
             <p
-              class="mt-2 text-xs font-medium leading-snug"
+              class="mt-1.5 text-xs font-medium leading-snug"
               :class="card.subtitleClass"
             >
               {{ card.subtitle }}
             </p>
 
-            <div class="mt-auto space-y-2 pt-6 sm:pt-7">
+            <div class="mt-auto space-y-1.5 pt-3 sm:pt-4">
               <div
                 class="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
               >
@@ -1186,7 +1361,7 @@ async function confirmRevokeConsoleAccess() {
                 Live trend (48h, this browser) · hover chart for time &amp; value
               </p>
               <div
-                class="h-36 w-full shrink-0 sm:h-40 lg:h-44"
+                class="h-[6.5rem] w-full shrink-0 sm:h-28 lg:h-[7.25rem]"
                 :aria-label="`${card.label} count over time`"
               >
                 <DashboardKpiTimeChart
@@ -1215,8 +1390,108 @@ async function confirmRevokeConsoleAccess() {
           </li>
         </ul>
 
+        <section
+          class="relative isolate w-full min-w-0 shrink-0 overflow-hidden rounded-2xl border border-white/55 bg-gradient-to-br from-white/50 via-emerald-50/[0.22] to-lime-100/[0.28] p-4 shadow-[0_24px_48px_-18px_rgba(6,95,70,0.14),inset_0_1px_0_rgba(255,255,255,0.72)] ring-1 ring-white/35 backdrop-blur-2xl sm:rounded-3xl sm:p-5"
+          aria-label="Seller subscription cashflow"
+          :title="`Net after fees: ${formatGhs(subscriptionNetTotalPesewas)}`"
+        >
+          <div
+            class="pointer-events-none absolute -right-20 -top-28 h-56 w-56 rounded-full bg-lime-300/[0.22] blur-3xl"
+            aria-hidden="true"
+          />
+          <div
+            class="pointer-events-none absolute -bottom-24 -left-16 h-64 w-64 rounded-full bg-emerald-400/[0.14] blur-3xl"
+            aria-hidden="true"
+          />
+          <div
+            class="pointer-events-none absolute left-1/2 top-1/2 h-40 w-[min(100%,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-full bg-teal-200/[0.08] blur-2xl"
+            aria-hidden="true"
+          />
+
+          <div class="relative z-10">
+            <div
+              class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"
+            >
+              <div class="min-w-0">
+                <h2
+                  class="text-lg font-bold tracking-tight text-zinc-900/95 drop-shadow-sm"
+                >
+                  Subscription cashflow
+                </h2>
+                <p class="mt-1 text-xs font-medium text-zinc-600/85">
+                  Net balance
+                </p>
+                <p
+                  class="mt-1 bg-gradient-to-br from-zinc-900 via-zinc-800 to-emerald-900/90 bg-clip-text text-2xl font-bold tabular-nums tracking-tight text-transparent sm:text-3xl"
+                >
+                  {{ formatGhs(subscriptionNetTotalPesewas) }}
+                </p>
+              </div>
+              <div
+                class="flex shrink-0 flex-col items-stretch gap-3 sm:items-end"
+              >
+                <div class="flex flex-wrap items-center justify-end gap-2">
+                  <label class="sr-only" for="subscription-cashflow-period"
+                    >Period</label
+                  >
+                  <select
+                    id="subscription-cashflow-period"
+                    v-model="subscriptionCashflowPeriod"
+                    class="rounded-full border border-white/60 bg-white/35 px-3 py-2 text-xs font-semibold text-zinc-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.85)] outline-none ring-emerald-400/0 backdrop-blur-md transition hover:bg-white/50 focus:ring-2 focus:ring-emerald-400/35"
+                  >
+                    <option value="year">This year</option>
+                    <option value="6m">Last 6 months</option>
+                  </select>
+                  <span
+                    class="inline-flex items-center gap-1.5 rounded-full border border-emerald-300/45 bg-emerald-500/[0.14] px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-emerald-950 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] backdrop-blur-md"
+                  >
+                    <span class="relative flex h-2 w-2">
+                      <span
+                        class="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-70"
+                        aria-hidden="true"
+                      />
+                      <span
+                        class="relative inline-flex h-2 w-2 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.65)]"
+                        aria-hidden="true"
+                      />
+                    </span>
+                    Live
+                  </span>
+                </div>
+                <div
+                  class="flex flex-wrap items-center justify-end gap-2 sm:gap-3"
+                >
+                  <span
+                    class="inline-flex items-center gap-1.5 rounded-full border border-white/50 bg-white/25 px-2.5 py-1 text-[11px] font-semibold text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.65)] backdrop-blur-sm"
+                  >
+                    <span
+                      class="h-2.5 w-2.5 shrink-0 rounded-sm bg-gradient-to-br from-lime-300 to-lime-500 shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] ring-1 ring-lime-400/40"
+                      aria-hidden="true"
+                    />
+                    Paid
+                  </span>
+                  <span
+                    class="inline-flex items-center gap-1.5 rounded-full border border-white/50 bg-white/25 px-2.5 py-1 text-[11px] font-semibold text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.65)] backdrop-blur-sm"
+                  >
+                    <span
+                      class="h-2.5 w-2.5 shrink-0 rounded-sm bg-gradient-to-br from-emerald-900 to-emerald-950 shadow-[inset_0_-1px_0_rgba(0,0,0,0.35)] ring-1 ring-emerald-950/30"
+                      aria-hidden="true"
+                    />
+                    Fees
+                  </span>
+                </div>
+              </div>
+            </div>
+            <div class="mt-5">
+              <AdminSubscriptionCashflowChart
+                :months="subscriptionCashflowMonths"
+              />
+            </div>
+          </div>
+        </section>
+
         <div
-          class="flex min-h-[18rem] flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/60 bg-white shadow-[0_28px_70px_-40px_rgba(15,23,42,0.18)] sm:min-h-[20rem] sm:rounded-3xl md:min-h-0"
+          class="flex min-h-[16rem] flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/60 bg-white shadow-[0_28px_70px_-40px_rgba(15,23,42,0.18)] sm:min-h-[17rem] sm:rounded-3xl md:min-h-0"
         >
           <div
             class="flex shrink-0 items-center justify-between gap-3 border-b border-zinc-100 px-5 py-4 sm:px-6"
@@ -1321,10 +1596,25 @@ async function confirmRevokeConsoleAccess() {
                     <td class="px-5 py-4 text-right sm:px-6">
                       <button
                         type="button"
-                        class="inline-flex rounded-full bg-zinc-900 px-3 py-1.5 text-xs font-semibold text-white shadow-md transition hover:bg-zinc-800"
+                        class="ml-auto inline-flex h-11 w-11 items-center justify-center rounded-full bg-gradient-to-br from-teal-600 to-emerald-700 text-white shadow-[0_6px_20px_-4px_rgba(13,148,136,0.55)] ring-2 ring-teal-200/90 ring-offset-2 ring-offset-white transition hover:from-teal-500 hover:to-emerald-600 hover:shadow-[0_8px_26px_-4px_rgba(13,148,136,0.65)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-700 active:scale-[0.96] motion-reduce:active:scale-100 sm:h-12 sm:w-12"
+                        :aria-label="`View stores for ${row.ownerName}`"
+                        :title="`View stores · ${row.ownerName}`"
                         @click="openOwnerStoresModal(row)"
                       >
-                        View Stores
+                        <svg
+                          class="h-6 w-6 drop-shadow-sm sm:h-[1.65rem] sm:w-[1.65rem]"
+                          fill="none"
+                          viewBox="0 0 24 24"
+                          stroke="currentColor"
+                          stroke-width="2"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          aria-hidden="true"
+                        >
+                          <path
+                            d="M13.5 21v-7.5a.75.75 0 01.75-.75h3a.75.75 0 01.75.75V21m-4.5 0H2.36m11.14 0H18M2.25 9h1.5m2.25 0h1.5m2.25 0h1.5m2.25 0H15m3 0h1.5M5.25 19.5h13.5a.75.75 0 00.75-.75V6.75a.75.75 0 00-.75-.75H5.25a.75.75 0 00-.75.75v12a.75.75 0 00.75.75z"
+                          />
+                        </svg>
                       </button>
                     </td>
                   </tr>

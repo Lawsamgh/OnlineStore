@@ -116,6 +116,24 @@ const router = createRouter({
   ],
 });
 
+function isOauthReturnOnHome(to: {
+  name?: unknown;
+  query: Record<string, unknown>;
+  hash?: string;
+}) {
+  if (to.name !== "home") return false;
+  const q = to.query;
+  const hasCode = typeof q.code === "string" && q.code.trim().length > 0;
+  const hasOauthError =
+    typeof q.error === "string" ||
+    typeof q.error_description === "string" ||
+    typeof q.error_code === "string";
+  const hasLegacyTokenHash =
+    typeof to.hash === "string" &&
+    /access_token=|refresh_token=|token_type=|expires_in=/.test(to.hash);
+  return hasCode || hasOauthError || hasLegacyTokenHash;
+}
+
 router.beforeEach(async (to) => {
   const auth = useAuthStore();
   // Recover OAuth/PKCE session from URL before requiresAuth checks; otherwise
@@ -142,6 +160,13 @@ router.beforeEach(async (to) => {
 
   if (to.meta.requiresAuth && !auth.isSignedIn) {
     return { name: "login", query: { redirect: to.fullPath } };
+  }
+  // In some hosted setups OAuth may return to `/` (SITE_URL fallback) instead of `/login`.
+  // If the callback already established a session, route users to their app shell.
+  if (auth.isSignedIn && isOauthReturnOnHome(to)) {
+    await auth.refreshSuperAdminRole();
+    if (auth.isSuperAdmin) return { name: "admin" };
+    return { name: "dashboard" };
   }
   if (to.meta.requiresSuperAdmin) {
     if (!auth.isSignedIn) {
