@@ -1,4 +1,4 @@
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1'
+import { createClient } from '@supabase/supabase-js'
 import { sendSellerPlanSubscribedEmail } from '../_shared/sendSellerPlanEmail.ts'
 import {
   extractPaystackPaymentFields,
@@ -16,6 +16,11 @@ const PLAN_MONTHLY_PESEWAS: Record<string, number> = {
   starter: 15000,
   growth: 35000,
   pro: 65000,
+}
+const PLAN_PRICING_KEYS: Record<string, string> = {
+  starter: 'seller_subscription_monthly_pesewas_starter',
+  growth: 'seller_subscription_monthly_pesewas_growth',
+  pro: 'seller_subscription_monthly_pesewas_pro',
 }
 
 const PAID_PLAN_IDS = new Set(Object.keys(PLAN_MONTHLY_PESEWAS))
@@ -75,6 +80,20 @@ Deno.serve(async (req) => {
     }
     if (!storeIdBody) {
       return Response.json({ error: 'store_id required' }, { status: 400, headers: cors })
+    }
+
+    const admin = createClient(supabaseUrl, serviceKey)
+    const dynamicPlanMonthlyPesewas = { ...PLAN_MONTHLY_PESEWAS }
+    const { data: pricingRows } = await admin
+      .from('platform_settings')
+      .select('key, value')
+      .in('key', Object.values(PLAN_PRICING_KEYS))
+    if (Array.isArray(pricingRows)) {
+      for (const [id, key] of Object.entries(PLAN_PRICING_KEYS)) {
+        const row = pricingRows.find((r) => r?.key === key)
+        const n = Number.parseInt(String(row?.value ?? '').trim(), 10)
+        if (Number.isFinite(n) && n > 0) dynamicPlanMonthlyPesewas[id] = n
+      }
     }
 
     const verifyRes = await fetch(
@@ -145,7 +164,7 @@ Deno.serve(async (req) => {
 
     /** Infer tier from charged pesewas when Paystack omits or flattens `plan_id` in verify metadata. */
     function planIdFromAmount(pesewas: number): string | null {
-      for (const [id, v] of Object.entries(PLAN_MONTHLY_PESEWAS)) {
+      for (const [id, v] of Object.entries(dynamicPlanMonthlyPesewas)) {
         if (v === pesewas) return id
       }
       return null
@@ -153,7 +172,7 @@ Deno.serve(async (req) => {
 
     let feePlanId: string | null = null
     if (metaPlan && PAID_PLAN_IDS.has(metaPlan)) {
-      const expected = PLAN_MONTHLY_PESEWAS[metaPlan]!
+      const expected = dynamicPlanMonthlyPesewas[metaPlan]!
       if (paid !== expected) {
         return Response.json({ error: 'Amount mismatch' }, { status: 400, headers: cors })
       }
@@ -178,7 +197,6 @@ Deno.serve(async (req) => {
       paystackCustomerCode = String(cust)
     }
 
-    const admin = createClient(supabaseUrl, serviceKey)
     const { data: store, error: se } = await admin
       .from('stores')
       .select('id, owner_id, name')
@@ -239,7 +257,10 @@ Deno.serve(async (req) => {
 
     await sendSellerPlanSubscribedEmail({
       resendApiKey: Deno.env.get('RESEND_API_KEY') ?? undefined,
-      resendFromEmail: Deno.env.get('RESEND_FROM_EMAIL') ?? 'onboarding@resend.dev',
+      resendFromEmail:
+        Deno.env.get('RESEND_FROM_BILLING_EMAIL') ??
+        Deno.env.get('RESEND_FROM_EMAIL') ??
+        'onboarding@resend.dev',
       to: user.email ?? undefined,
       planId: feePlanId,
       source: 'store',

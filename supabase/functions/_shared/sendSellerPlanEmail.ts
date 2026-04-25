@@ -122,3 +122,62 @@ You can review this store anytime from your seller dashboard.
     console.error('[sendSellerPlanSubscribedEmail]', e)
   }
 }
+
+/** 7-day renewal reminder email for active/trialing seller subscriptions. */
+export async function sendSellerPlanRenewalReminderEmail(opts: {
+  resendApiKey: string | undefined
+  resendFromEmail: string
+  to: string | null | undefined
+  planId: string | null | undefined
+  periodEndsAtIso: string
+  storeName?: string | null
+}): Promise<void> {
+  const key = opts.resendApiKey?.trim()
+  const to = opts.to?.trim()
+  if (!key || !to) return
+
+  const from = opts.resendFromEmail.trim() || 'onboarding@resend.dev'
+  const label = planDisplayName(opts.planId) ?? 'current'
+  const endHuman = formatPeriodEnd(opts.periodEndsAtIso)
+  const shop = opts.storeName?.trim() || 'your store'
+
+  const subject = `Renewal reminder — ${shop} (${label})`
+  const text = `Hello,
+
+Your store subscription for "${shop}" is due to end in 7 days.
+Plan: ${label}
+${endHuman ? `Current period end: ${endHuman}` : ''}
+
+To avoid storefront interruption, please renew before the period ends.
+
+— The team`
+
+  const html = `<p>Hello,</p>
+<p>Your store subscription for <strong>${escapeHtml(shop)}</strong> is due to end in <strong>7 days</strong>.</p>
+<p>Plan: <strong>${escapeHtml(label)}</strong></p>
+${endHuman ? `<p>Current period end: <strong>${escapeHtml(endHuman)}</strong></p>` : ''}
+<p>To avoid storefront interruption, please renew before the period ends.</p>
+<p>— The team</p>`
+
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: `Subscriptions <${from}>`,
+        to: [to],
+        subject,
+        text,
+        html,
+      }),
+    })
+    if (!r.ok) {
+      console.error('[sendSellerPlanRenewalReminderEmail] Resend HTTP', r.status, await r.text())
+    }
+  } catch (e) {
+    console.error('[sendSellerPlanRenewalReminderEmail]', e)
+  }
+}

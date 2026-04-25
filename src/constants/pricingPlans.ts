@@ -18,7 +18,7 @@ export type PricingPlan = {
   groups: PlanFeatureGroup[];
 };
 
-export const PRICING_STORE_URL = "name.yourplatform.com";
+export const PRICING_STORE_URL = "Public link: /your-store-slug";
 
 export const PRICING_PLANS: PricingPlan[] = [
   {
@@ -32,7 +32,7 @@ export const PRICING_PLANS: PricingPlan[] = [
     groups: [
       {
         title: "Storefronts",
-        lines: ["1 shop only"],
+        lines: ["Maximum 1 store", PRICING_STORE_URL],
       },
       {
         title: "Themes",
@@ -55,8 +55,8 @@ export const PRICING_PLANS: PricingPlan[] = [
         lines: ["Email only"],
       },
       {
-        title: "Delivery",
-        lines: ["Status text on orders only", "No live delivery tracker"],
+        title: "Order Status",
+        lines: ["Status text on orders only"],
       },
       {
         title: "Analytics",
@@ -67,8 +67,8 @@ export const PRICING_PLANS: PricingPlan[] = [
         lines: ["1 user"],
       },
       {
-        title: "WhatsApp",
-        lines: ["Click-to-chat only"],
+        title: "SMS",
+        lines: ["Manual SMS updates"],
       },
       {
         title: "Support",
@@ -86,8 +86,8 @@ export const PRICING_PLANS: PricingPlan[] = [
     annualSaveGhs: 300,
     groups: [
       {
-        title: "Store URL",
-        lines: [PRICING_STORE_URL],
+        title: "Storefronts",
+        lines: ["Maximum 1 store", PRICING_STORE_URL],
       },
       {
         title: "Themes",
@@ -110,8 +110,8 @@ export const PRICING_PLANS: PricingPlan[] = [
         lines: ["Email only"],
       },
       {
-        title: "Delivery",
-        lines: ["Basic tracker", "Status only"],
+        title: "Order Status",
+        lines: ["Status updates only"],
       },
       {
         title: "Analytics",
@@ -122,8 +122,8 @@ export const PRICING_PLANS: PricingPlan[] = [
         lines: ["1 user"],
       },
       {
-        title: "WhatsApp",
-        lines: ["Click-to-chat only"],
+        title: "SMS",
+        lines: ["SMS auto notify"],
       },
       {
         title: "Support",
@@ -140,8 +140,8 @@ export const PRICING_PLANS: PricingPlan[] = [
     highlighted: true,
     groups: [
       {
-        title: "Store URL",
-        lines: [PRICING_STORE_URL],
+        title: "Storefronts",
+        lines: ["Maximum 1 store", PRICING_STORE_URL],
       },
       {
         title: "Themes",
@@ -161,11 +161,11 @@ export const PRICING_PLANS: PricingPlan[] = [
       },
       {
         title: "Notifications",
-        lines: ["Email + WhatsApp auto"],
+        lines: ["Email + SMS auto"],
       },
       {
-        title: "Delivery",
-        lines: ["Full tracker", "+ notes & ETA"],
+        title: "Order Status",
+        lines: ["Status updates + notes & ETA"],
       },
       {
         title: "Analytics",
@@ -173,11 +173,11 @@ export const PRICING_PLANS: PricingPlan[] = [
       },
       {
         title: "Admin users",
-        lines: ["3 users"],
+        lines: ["1 user"],
       },
       {
-        title: "WhatsApp",
-        lines: ["Click-to-chat + auto notify"],
+        title: "SMS",
+        lines: ["SMS auto notify"],
       },
       {
         title: "Support",
@@ -193,16 +193,16 @@ export const PRICING_PLANS: PricingPlan[] = [
     annualSaveGhs: 1300,
     groups: [
       {
-        title: "Store URL",
-        lines: [PRICING_STORE_URL],
+        title: "Storefronts",
+        lines: ["Maximum 1 store", PRICING_STORE_URL],
       },
       {
         title: "Themes",
         lines: [
           "All themes",
-          "Full color & font customization",
-          "+ logo & banner",
-          "+ custom CSS",
+          "Full color customization",
+          "Font customization",
+          "Logo upload",
         ],
       },
       {
@@ -219,11 +219,11 @@ export const PRICING_PLANS: PricingPlan[] = [
       },
       {
         title: "Notifications",
-        lines: ["Email + WhatsApp auto + SMS alerts"],
+        lines: ["Email + SMS auto alerts"],
       },
       {
-        title: "Delivery",
-        lines: ["Full tracker + GPS map view"],
+        title: "Order Status",
+        lines: ["Advanced status updates"],
       },
       {
         title: "Analytics",
@@ -231,19 +231,45 @@ export const PRICING_PLANS: PricingPlan[] = [
       },
       {
         title: "Admin users",
-        lines: ["Unlimited"],
+        lines: ["1 user"],
       },
       {
-        title: "WhatsApp",
-        lines: ["Click-to-chat + auto notify + broadcast messages"],
+        title: "SMS",
+        lines: ["SMS auto notify"],
       },
       {
         title: "Support",
-        lines: ["Priority + WhatsApp support", "Same-day response"],
+        lines: ["Priority support", "Same-day response"],
       },
     ],
   },
 ];
+
+export type PaidPlanId = "starter" | "growth" | "pro";
+export type PlanPriceOverrideMap = Partial<Record<PaidPlanId, number>>;
+
+export function pricingPlansWithOverrides(
+  overrides: PlanPriceOverrideMap,
+): PricingPlan[] {
+  const annualMonthsBilled = 10;
+  const annualMonthsSaved = 2;
+  return PRICING_PLANS.map((plan) => {
+    if (plan.id === "free") return plan;
+    const overrideMonthly = overrides[plan.id];
+    if (!Number.isFinite(overrideMonthly) || (overrideMonthly ?? 0) <= 0) {
+      return plan;
+    }
+    const monthly = Math.round(overrideMonthly!);
+    const annual = monthly * annualMonthsBilled;
+    const annualSave = monthly * annualMonthsSaved;
+    return {
+      ...plan,
+      monthlyGhs: monthly,
+      annualGhs: annual,
+      annualSaveGhs: annualSave,
+    };
+  });
+}
 
 export function formatGhsWhole(amount: number): string {
   return new Intl.NumberFormat("en-GH", {

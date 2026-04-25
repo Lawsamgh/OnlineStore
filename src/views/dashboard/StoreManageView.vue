@@ -17,15 +17,22 @@ import {
   normalizeSignupPlanId,
   type PlanId,
 } from "../../constants/planEntitlements";
-import { PRICING_PLANS, formatGhsWhole } from "../../constants/pricingPlans";
+import { formatGhsWhole } from "../../constants/pricingPlans";
+import { usePlanPricingSettings } from "../../composables/usePlanPricingSettings";
 import { planLabelFromSignupId } from "../../lib/planLabel";
 import {
   PLAN_FEATURE_LIMITS,
   resolvePricingPlanId,
 } from "../../lib/planFeatureLimits";
+import {
+  allowedThemeIdsForPlan,
+  resolveThemeFont,
+  resolveThemePreset,
+} from "../../constants/storeThemes";
 import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefresh";
 import { formatFunctionsInvokeError } from "../../lib/formatFunctionsInvokeError";
 import { refreshSessionForEdgeFunctions } from "../../lib/refreshSessionForEdgeFunctions";
+import { clearBodyScrollLock, setBodyScrollLocked } from "../../lib/bodyScrollLock";
 import SkeletonStoreManage from "../../components/skeleton/SkeletonStoreManage.vue";
 import ProductCategoryDropdown from "../../components/store/ProductCategoryDropdown.vue";
 
@@ -35,16 +42,37 @@ const auth = useAuthStore();
 const { sessionUserId, isPlatformStaff, user, isSuperAdmin } =
   storeToRefs(auth);
 const toast = useToastStore();
+const { plans: pricingPlans } = usePlanPricingSettings();
 
 const storeId = computed(() => String(route.params.storeId ?? ""));
 
-const tab = ref<"products" | "orders" | "support">("products");
+type ManageTab = "products" | "orders" | "support";
+const TAB_STORAGE_PREFIX = "uanditech:store-manage:tab:";
+
+function normalizeManageTab(v: unknown): ManageTab {
+  return v === "orders" || v === "support" ? v : "products";
+}
+
+function tabStorageKey(): string {
+  const sid = storeId.value.trim();
+  return `${TAB_STORAGE_PREFIX}${sid || "default"}`;
+}
+
+const tab = ref<ManageTab>("products");
 const loading = ref(true);
 
 const store = ref<{
   id: string;
   slug: string;
   name: string;
+  is_active: boolean;
+  theme_id: string;
+  theme_primary_color: string | null;
+  theme_accent_color: string | null;
+  theme_bg_color: string | null;
+  theme_surface_color: string | null;
+  theme_text_color: string | null;
+  theme_font_family: string | null;
   whatsapp_phone_e164: string | null;
   owner_id: string;
   logo_path: string | null;
@@ -69,14 +97,79 @@ const productCategories = ref<{ id: string; name: string }[]>([]);
 const orders = ref<
   {
     id: string;
+    order_ref: string | null;
     status: string;
     created_at: string;
     customer_id: string | null;
     guest_name: string | null;
     guest_email: string | null;
+    guest_phone: string | null;
     delivery_address: string | null;
+    order_items?: {
+      title_snapshot: string;
+      quantity: number;
+      unit_price_cents: number;
+    }[];
   }[]
 >([]);
+const selectedOrderId = ref<string | null>(null);
+const selectedOrder = computed(
+  () => orders.value.find((o) => o.id === selectedOrderId.value) ?? null,
+);
+const orderSearch = ref("");
+const orderSortMode = ref<"newest" | "status">("newest");
+const ORDER_STATUS_SORT_RANK: Record<string, number> = {
+  pending: 0,
+  confirmed: 1,
+  preparing: 2,
+  out_for_delivery: 3,
+  delivered: 4,
+  canceled: 5,
+};
+const filteredOrders = computed(() => {
+  const q = orderSearch.value.trim().toLowerCase();
+  const searched = !q
+    ? orders.value
+    : orders.value.filter((ord) => {
+    const hay = [
+      ord.id,
+      ord.order_ref ?? "",
+      ord.guest_name ?? "",
+      ord.guest_email ?? "",
+      ord.guest_phone ?? "",
+      ord.delivery_address ?? "",
+      ord.status,
+    ]
+      .join(" ")
+      .toLowerCase();
+    return hay.includes(q);
+  });
+
+  if (orderSortMode.value === "newest") return searched;
+
+  return [...searched].sort((a, b) => {
+    const rankA = ORDER_STATUS_SORT_RANK[a.status] ?? 99;
+    const rankB = ORDER_STATUS_SORT_RANK[b.status] ?? 99;
+    if (rankA !== rankB) return rankA - rankB;
+    return (
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    );
+  });
+});
+const selectedOrderItems = computed(() => {
+  const raw = selectedOrder.value?.order_items;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((it) => ({
+      title:
+        typeof it?.title_snapshot === "string" && it.title_snapshot.trim()
+          ? it.title_snapshot.trim()
+          : "Item",
+      quantity: Number(it?.quantity) || 0,
+      unitPriceCents: Number(it?.unit_price_cents) || 0,
+    }))
+    .filter((it) => it.quantity > 0);
+});
 
 const newTitle = ref("");
 const newDesc = ref("");
@@ -100,7 +193,7 @@ const storeFeePlanModalOpen = ref(false);
 const selectedStoreFeePlan = ref<PaidStoreFeePlanId>("starter");
 
 const storeFeePlanChoices = computed(() =>
-  PRICING_PLANS.filter((p) => p.monthlyGhs > 0),
+  pricingPlans.value.filter((p) => p.monthlyGhs > 0),
 );
 
 const deleteProductTarget = computed(() => {
@@ -131,9 +224,14 @@ const pendingCoverImage = ref<{ file: File; objectName: string } | null>(null);
 const coverImageFileInputRef = ref<HTMLInputElement | null>(null);
 const coverDropActive = ref(false);
 const coverPreviewUrl = ref<string | null>(null);
+const storeOwnerSignupPlan = ref<string | null>(null);
 
 const sellerPlanId = computed(() =>
-  resolvePricingPlanId(user.value?.user_metadata?.signup_plan),
+  resolvePricingPlanId(
+    sellerSubscription.value?.pricing_plan_id ??
+      storeOwnerSignupPlan.value ??
+      user.value?.user_metadata?.signup_plan,
+  ),
 );
 
 const maxProductCoverImageBytes = computed(
@@ -280,6 +378,10 @@ function resetAddProductForm() {
 }
 
 function openAddProductModal() {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
   resetAddProductForm();
   addProductModalOpen.value = true;
 }
@@ -308,6 +410,10 @@ function onStoreManageDocKeydown(e: KeyboardEvent) {
 }
 
 function openDeleteProductDialog(productId: string) {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
   deleteProductTargetId.value = productId;
 }
 
@@ -321,21 +427,46 @@ async function confirmDeleteProduct() {
   if (!id) return;
   deleteProductBusy.value = true;
   const supabase = getSupabaseBrowser();
-  const { error } = await supabase.from("products").delete().eq("id", id);
-  deleteProductBusy.value = false;
-  if (error) {
-    toast.error(error.message);
-    return;
+  const target = deleteProductTarget.value;
+  const sid = store.value?.id ?? null;
+  try {
+    const { error } = await supabase.from("products").delete().eq("id", id);
+    if (error) {
+      toast.error(error.message);
+      return;
+    }
+    if (sid && target?.image_paths?.length) {
+      const keys = target.image_paths
+        .map((p) => (typeof p === "string" ? p.trim() : ""))
+        .filter(Boolean)
+        .map((p) => (p.includes("/") ? p : `${sid}/${p}`));
+      if (keys.length > 0) {
+        const { error: remErr } = await supabase.storage
+          .from("product-images")
+          .remove(keys);
+        if (remErr) {
+          console.warn(
+            "[confirmDeleteProduct] storage remove:",
+            remErr.message,
+          );
+        }
+      }
+    }
+    deleteProductTargetId.value = null;
+    toast.success("Product removed.");
+    void loadAll({ silent: true });
+  } finally {
+    deleteProductBusy.value = false;
   }
-  deleteProductTargetId.value = null;
-  toast.success("Product removed.");
-  void loadAll({ silent: true });
 }
 
 watch(
   [addProductModalOpen, deleteProductTargetId, storeFeePlanModalOpen],
   ([open, delId, feeOpen]) => {
-    document.body.style.overflow = open || delId || feeOpen ? "hidden" : "";
+    setBodyScrollLocked(
+      "store-manage-overlays",
+      Boolean(open || delId || feeOpen),
+    );
     if (open) {
       void nextTick(() => {
         document.getElementById("modal-add-product-title")?.focus();
@@ -352,12 +483,12 @@ watch(store, (s) => {
     }
     if (deleteProductTargetId.value) deleteProductTargetId.value = null;
     storeFeePlanModalOpen.value = false;
-    document.body.style.overflow = "";
+    clearBodyScrollLock("store-manage-overlays");
   }
 });
 
 onBeforeUnmount(() => {
-  document.body.style.overflow = "";
+  clearBodyScrollLock("store-manage-overlays");
   document.removeEventListener("keydown", onStoreManageDocKeydown);
   if (coverPreviewUrl.value) {
     URL.revokeObjectURL(coverPreviewUrl.value);
@@ -383,9 +514,15 @@ function paystackReturnReference(): string {
 /** After Paystack redirects back to this store page, verify payment and upsert `seller_subscriptions`. */
 async function consumePaystackStoreReturn() {
   const reference = paystackReturnReference();
-  if (!reference.startsWith("sub_")) return;
-  if (!isSupabaseConfigured() || !sessionUserId.value || !storeId.value) return;
-  if (paystackStoreVerifyBusy.value) return;
+  if (!reference.startsWith("sub_")) {
+    return;
+  }
+  if (!isSupabaseConfigured() || !sessionUserId.value || !storeId.value) {
+    return;
+  }
+  if (paystackStoreVerifyBusy.value) {
+    return;
+  }
 
   const lockKey = `paystack_store_verify_${reference}`;
   if (sessionStorage.getItem(lockKey) === "1") {
@@ -479,7 +616,17 @@ function formatSubscriptionPeriodEnd(iso: string | null): string {
   }).format(d);
 }
 const logoBusy = ref(false);
+const storeStatusBusy = ref(false);
+const storeStatusConfirmOpen = ref(false);
+const pendingStoreActiveState = ref<boolean | null>(null);
 const logoUploadInputRef = ref<HTMLInputElement | null>(null);
+const themeIdInput = ref("default");
+const themePrimaryInput = ref("");
+const themeAccentInput = ref("");
+const themeBgInput = ref("");
+const themeSurfaceInput = ref("");
+const themeTextInput = ref("");
+const themeFontInput = ref("system");
 
 const hasSelectedPlan = computed(
   () =>
@@ -495,6 +642,9 @@ const isStoreOwner = computed(
     !!store.value &&
     !!sessionUserId.value &&
     store.value.owner_id === sessionUserId.value,
+);
+const canUseRoleGatedStoreActions = computed(() =>
+  Boolean(store.value && sessionUserId.value),
 );
 
 /** Show store Paystack CTA when free tier, no/lapsed sub, past_due, or renewal window. */
@@ -549,6 +699,30 @@ const showStorePlatformPayCta = computed(() => {
 /** Owners need a chosen plan (or super admin) before changing the shop logo. */
 const canUploadStoreLogo = computed(
   () => isStoreOwner.value && (hasSelectedPlan.value || isSuperAdmin.value),
+);
+
+function normalizeDbErrorMessage(error: { message?: string } | null): string {
+  return String(error?.message ?? "").trim();
+}
+
+function isSubscriptionPolicyBlockMessage(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("row-level security policy") ||
+    m.includes("store subscription expired")
+  );
+}
+
+function publishBlockedMessage(): string {
+  return "Subscription expired. Renew your plan to publish products. You can still save drafts.";
+}
+
+function activationBlockedMessage(): string {
+  return "Subscription expired. Renew your plan to activate your store link.";
+}
+
+const allowedStoreThemeIds = computed(() =>
+  allowedThemeIdsForPlan(sellerPlanId.value),
 );
 
 const storeLogoPublicUrl = computed(() => {
@@ -626,6 +800,68 @@ async function onStoreLogoFileChange(ev: Event) {
   toast.success("Store logo updated.");
 }
 
+function syncThemeInputsFromStore() {
+  const s = store.value;
+  if (!s) return;
+  const allowed = allowedStoreThemeIds.value;
+  const fallbackThemeId = resolveThemePreset(s.theme_id).id;
+  const themeId = allowed.includes(fallbackThemeId as (typeof allowed)[number])
+    ? fallbackThemeId
+    : (allowed[0] ?? "default");
+  themeIdInput.value = themeId;
+  themePrimaryInput.value = s.theme_primary_color ?? "";
+  themeAccentInput.value = s.theme_accent_color ?? "";
+  themeBgInput.value = s.theme_bg_color ?? "";
+  themeSurfaceInput.value = s.theme_surface_color ?? "";
+  themeTextInput.value = s.theme_text_color ?? "";
+  themeFontInput.value = resolveThemeFont(s.theme_font_family).id;
+}
+
+function openStoreLinkStatusModal() {
+  if (!store.value || storeStatusBusy.value) return;
+  pendingStoreActiveState.value = !store.value.is_active;
+  storeStatusConfirmOpen.value = true;
+}
+
+function closeStoreLinkStatusModal() {
+  if (storeStatusBusy.value) return;
+  storeStatusConfirmOpen.value = false;
+  pendingStoreActiveState.value = null;
+}
+
+async function confirmStoreLinkStatusChange() {
+  if (
+    !store.value ||
+    storeStatusBusy.value ||
+    pendingStoreActiveState.value == null
+  )
+    return;
+  const nextActive = pendingStoreActiveState.value;
+  storeStatusBusy.value = true;
+  const supabase = getSupabaseBrowser();
+  const { error } = await supabase
+    .from("stores")
+    .update({ is_active: nextActive })
+    .eq("id", store.value.id);
+  storeStatusBusy.value = false;
+  if (error) {
+    const msg = normalizeDbErrorMessage(error);
+    if (nextActive && isSubscriptionPolicyBlockMessage(msg)) {
+      toast.error(activationBlockedMessage());
+    } else {
+      toast.error(msg || "Could not update store status.");
+    }
+    return;
+  }
+  storeStatusConfirmOpen.value = false;
+  pendingStoreActiveState.value = null;
+  store.value = { ...store.value, is_active: nextActive };
+  toast.success(nextActive ? "Store link activated." : "Store link paused.");
+  if (nextActive && tab.value === "orders") {
+    await loadAll({ silent: true });
+  }
+}
+
 const tickets = ref<
   {
     id: string;
@@ -639,6 +875,32 @@ const ticketSubject = ref("");
 const ticketMessage = ref("");
 const ticketBusy = ref(false);
 const supportTicketModalOpen = ref(false);
+const storeAdmins = ref<
+  {
+    user_id: string;
+    role: "owner" | "admin";
+    display_name: string | null;
+    email: string | null;
+    created_at: string | null;
+  }[]
+>([]);
+
+async function loadStoreAdmins(targetStoreId?: string) {
+  void targetStoreId;
+  if (!store.value) {
+    storeAdmins.value = [];
+    return;
+  }
+  storeAdmins.value = [
+    {
+      user_id: store.value.owner_id,
+      role: "owner",
+      display_name: null,
+      email: null,
+      created_at: null,
+    },
+  ];
+}
 
 function openSupportTicketModal() {
   supportTicketModalOpen.value = true;
@@ -674,29 +936,6 @@ function ticketStatusBadgeClass(status: string): string {
   return `${base} bg-violet-50 text-violet-900 ring-violet-200/80`;
 }
 
-const deliveryForms = ref<
-  Record<
-    string,
-    {
-      stage: string;
-      last_message: string;
-      last_latitude: string;
-      last_longitude: string;
-    }
-  >
->({});
-
-function ensureDeliveryForm(orderId: string) {
-  if (!deliveryForms.value[orderId]) {
-    deliveryForms.value[orderId] = {
-      stage: "pending",
-      last_message: "",
-      last_latitude: "",
-      last_longitude: "",
-    };
-  }
-}
-
 function formatOrderListDate(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
@@ -706,9 +945,56 @@ function formatOrderListDate(iso: string): string {
   }).format(d);
 }
 
+function formatOrderMasterDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const now = new Date();
+  const startOfToday = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime();
+  const startOfTarget = new Date(
+    d.getFullYear(),
+    d.getMonth(),
+    d.getDate(),
+  ).getTime();
+  const dayDiff = Math.round((startOfToday - startOfTarget) / 86_400_000);
+  const timeLabel = new Intl.DateTimeFormat(undefined, {
+    timeStyle: "short",
+  }).format(d);
+  if (dayDiff === 0) return `Today, ${timeLabel}`;
+  if (dayDiff === 1) return `Yesterday, ${timeLabel}`;
+  if (dayDiff > 1 && dayDiff < 7) {
+    const weekday = new Intl.DateTimeFormat(undefined, {
+      weekday: "short",
+    }).format(d);
+    return `${weekday}, ${timeLabel}`;
+  }
+  const dateLabel = new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+  }).format(d);
+  return `${dateLabel}, ${timeLabel}`;
+}
+
 function orderShortId(id: string): string {
   const t = id.replace(/-/g, "");
   return t.length >= 10 ? `${t.slice(0, 6)}…${t.slice(-4)}` : id;
+}
+
+function orderDisplayRef(ord: (typeof orders.value)[0]): string {
+  const ref = ord.order_ref?.trim();
+  if (ref) return ref;
+  return orderShortId(ord.id);
+}
+
+function orderTotalCents(ord: (typeof orders.value)[0]): number {
+  const items = Array.isArray(ord.order_items) ? ord.order_items : [];
+  return items.reduce((sum, item) => {
+    const qty = Number(item?.quantity) || 0;
+    const unit = Number(item?.unit_price_cents) || 0;
+    return sum + qty * unit;
+  }, 0);
 }
 
 /** DD/MM/YYYY for product table "Listed" column. */
@@ -722,31 +1008,58 @@ function formatProductTableDate(iso: string): string {
   return `${dd}/${mm}/${yyyy}`;
 }
 
-function orderStatusPillClass(status: string): string {
-  switch (status) {
-    case "delivered":
-      return "bg-emerald-50 text-emerald-900 ring-emerald-200/70";
-    case "canceled":
-      return "bg-zinc-100 text-zinc-700 ring-zinc-200/80";
-    case "out_for_delivery":
-      return "bg-sky-50 text-sky-900 ring-sky-200/70";
-    case "preparing":
-    case "confirmed":
-      return "bg-amber-50 text-amber-950 ring-amber-200/70";
-    default:
-      return "bg-violet-50 text-violet-900 ring-violet-200/70";
+function orderStatusLabel(status: string): string {
+  return status.replace(/_/g, " ");
+}
+
+const ALLOWED_ORDER_STATUS_TRANSITIONS: Record<string, string[]> = {
+  pending: ["confirmed", "canceled"],
+  confirmed: ["preparing", "canceled"],
+  preparing: ["out_for_delivery", "canceled"],
+  out_for_delivery: ["delivered", "canceled"],
+  delivered: [],
+  canceled: [],
+};
+
+function nextOrderProgressStatus(status: string): string | null {
+  const allowed = ALLOWED_ORDER_STATUS_TRANSITIONS[status] ?? [];
+  return allowed.find((s) => s !== "canceled") ?? null;
+}
+
+function canCancelOrderStatus(status: string): boolean {
+  return (ALLOWED_ORDER_STATUS_TRANSITIONS[status] ?? []).includes("canceled");
+}
+
+function orderProgressActionLabel(status: string): string {
+  const next = nextOrderProgressStatus(status);
+  if (!next) {
+    if (status === "canceled") return "Order canceled";
+    if (status === "delivered") return "Delivered";
+    return "No further action";
   }
+  if (next === "confirmed") return "Confirm order";
+  if (next === "preparing") return "Start preparing";
+  if (next === "out_for_delivery") return "Send out for delivery";
+  if (next === "delivered") return "Mark delivered";
+  return `Move to ${orderStatusLabel(next)}`;
 }
 
 function orderCustomerTitle(ord: (typeof orders.value)[0]): string {
-  if (ord.customer_id) return "Registered buyer";
-  return ord.guest_name?.trim() || "Guest checkout";
+  const guest = ord.guest_name?.trim();
+  if (guest) return guest;
+  if (ord.customer_id) return "Customer checkout";
+  return "Guest checkout";
 }
 
-function orderCustomerSubtitle(ord: (typeof orders.value)[0]): string {
-  if (ord.customer_id) return "Signed-in account";
-  const email = ord.guest_email?.trim();
-  return email || "No email on file";
+function orderCustomerInitials(ord: (typeof orders.value)[0]): string {
+  const raw = orderCustomerTitle(ord).trim();
+  if (!raw) return "GC";
+  const parts = raw.split(/\s+/).filter(Boolean);
+  if (!parts.length) return "GC";
+  const first = parts[0]?.[0] ?? "";
+  const second = parts.length > 1 ? (parts[1]?.[0] ?? "") : "";
+  const initials = `${first}${second}`.toUpperCase();
+  return initials || "GC";
 }
 
 /** Public URL for first product image in `product-images` (same key shape as storefront). */
@@ -764,8 +1077,10 @@ async function loadAll(opts?: { silent?: boolean }) {
   if (!silent) {
     loading.value = true;
     store.value = null;
+    storeOwnerSignupPlan.value = null;
     sellerSubscription.value = null;
     productCategories.value = [];
+    storeAdmins.value = [];
   }
   if (!isSupabaseConfigured() || !sessionUserId.value || !storeId.value) {
     if (!silent) loading.value = false;
@@ -775,29 +1090,74 @@ async function loadAll(opts?: { silent?: boolean }) {
   try {
     const { data: s, error: se } = await supabase
       .from("stores")
-      .select("id, slug, name, whatsapp_phone_e164, owner_id, logo_path")
+      .select(
+        "id, slug, name, is_active, theme_id, theme_primary_color, theme_accent_color, theme_bg_color, theme_surface_color, theme_text_color, theme_font_family, whatsapp_phone_e164, owner_id, logo_path, profiles!stores_owner_id_fkey(signup_plan)",
+      )
       .eq("id", storeId.value)
       .maybeSingle();
     if (se || !s) {
       toast.error(se?.message ?? "Store not found.");
       if (!silent) store.value = null;
+      storeOwnerSignupPlan.value = null;
       productCategories.value = [];
       return;
     }
     if (s.owner_id !== sessionUserId.value && !isPlatformStaff.value) {
-      toast.error("You do not manage this store.");
-      store.value = null;
-      productCategories.value = [];
-      return;
+      const { data: canManage, error: canManageErr } = await supabase.rpc(
+        "auth_is_store_admin",
+        { p_store_id: s.id },
+      );
+      if (canManageErr || !canManage) {
+        toast.error("You do not manage this store.");
+        store.value = null;
+        storeOwnerSignupPlan.value = null;
+        productCategories.value = [];
+        return;
+      }
     }
     store.value = {
       id: s.id,
       slug: s.slug,
       name: s.name,
+      is_active: Boolean(s.is_active),
+      theme_id:
+        typeof s.theme_id === "string" && s.theme_id.trim()
+          ? s.theme_id.trim()
+          : "default",
+      theme_primary_color:
+        typeof s.theme_primary_color === "string" &&
+        s.theme_primary_color.trim()
+          ? s.theme_primary_color.trim()
+          : null,
+      theme_accent_color:
+        typeof s.theme_accent_color === "string" && s.theme_accent_color.trim()
+          ? s.theme_accent_color.trim()
+          : null,
+      theme_bg_color:
+        typeof s.theme_bg_color === "string" && s.theme_bg_color.trim()
+          ? s.theme_bg_color.trim()
+          : null,
+      theme_surface_color:
+        typeof s.theme_surface_color === "string" &&
+        s.theme_surface_color.trim()
+          ? s.theme_surface_color.trim()
+          : null,
+      theme_text_color:
+        typeof s.theme_text_color === "string" && s.theme_text_color.trim()
+          ? s.theme_text_color.trim()
+          : null,
+      theme_font_family:
+        typeof s.theme_font_family === "string" && s.theme_font_family.trim()
+          ? s.theme_font_family.trim()
+          : null,
       whatsapp_phone_e164: s.whatsapp_phone_e164,
       owner_id: s.owner_id,
       logo_path: s.logo_path?.trim() || null,
     };
+    syncThemeInputsFromStore();
+    storeOwnerSignupPlan.value =
+      (s as { profiles?: { signup_plan?: string | null } | null }).profiles
+        ?.signup_plan ?? null;
 
     const { data: subRow } = await supabase
       .from("seller_subscriptions")
@@ -883,13 +1243,20 @@ async function loadAll(opts?: { silent?: boolean }) {
     const { data: o } = await supabase
       .from("orders")
       .select(
-        "id, status, created_at, guest_name, guest_email, delivery_address, customer_id",
+        "id, order_ref, status, created_at, guest_name, guest_email, guest_phone, delivery_address, customer_id, order_items(title_snapshot, quantity, unit_price_cents)",
       )
       .eq("store_id", s.id)
       .order("created_at", { ascending: false })
       .limit(50);
     orders.value = (o ?? []) as typeof orders.value;
-    for (const ord of orders.value) ensureDeliveryForm(ord.id);
+    if (!orders.value.length) {
+      selectedOrderId.value = null;
+    } else if (
+      !selectedOrderId.value ||
+      !orders.value.some((ord) => ord.id === selectedOrderId.value)
+    ) {
+      selectedOrderId.value = orders.value[0]!.id;
+    }
 
     const { data: tk } = await supabase
       .from("support_tickets")
@@ -898,17 +1265,38 @@ async function loadAll(opts?: { silent?: boolean }) {
       .order("created_at", { ascending: false })
       .limit(30);
     tickets.value = (tk ?? []) as typeof tickets.value;
+    await loadStoreAdmins(s.id);
   } finally {
     if (!silent) loading.value = false;
   }
 }
 
 onMounted(() => {
+  tab.value = normalizeManageTab(localStorage.getItem(tabStorageKey()));
   document.addEventListener("keydown", onStoreManageDocKeydown);
   void loadAll();
 });
 watch(storeId, () => {
+  tab.value = normalizeManageTab(localStorage.getItem(tabStorageKey()));
   void loadAll();
+});
+watch(sellerPlanId, () => {
+  syncThemeInputsFromStore();
+});
+watch(
+  () => route.query.panel,
+  async (panel) => {
+    if (panel !== "theme") return;
+    await nextTick();
+    document.getElementById("store-theme-panel")?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  },
+  { immediate: true },
+);
+watch(tab, (next) => {
+  localStorage.setItem(tabStorageKey(), next);
 });
 
 useRealtimeTableRefresh({
@@ -919,6 +1307,7 @@ useRealtimeTableRefresh({
     if (!id) return [];
     return [
       { table: "stores", filter: `id=eq.${id}` },
+      { table: "store_admins", filter: `store_id=eq.${id}` },
       { table: "products", filter: `store_id=eq.${id}` },
       { table: "product_categories", filter: `store_id=eq.${id}` },
       { table: "orders", filter: `store_id=eq.${id}` },
@@ -930,6 +1319,10 @@ useRealtimeTableRefresh({
 });
 
 async function addProduct() {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
   if (!store.value || !sessionUserId.value) return;
   const price = parseGhsInput(newPrice.value);
   if (!newTitle.value.trim() || price === null || price < 0) {
@@ -976,7 +1369,12 @@ async function addProduct() {
       is_published: newPublished.value,
     });
     if (error) {
-      toast.error(error.message);
+      const msg = normalizeDbErrorMessage(error);
+      if (newPublished.value && isSubscriptionPolicyBlockMessage(msg)) {
+        toast.error(publishBlockedMessage());
+      } else {
+        toast.error(msg || "Could not add product.");
+      }
       return;
     }
     closeAddProductModal();
@@ -988,14 +1386,24 @@ async function addProduct() {
 }
 
 async function togglePublish(p: (typeof products.value)[0]) {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
   const supabase = getSupabaseBrowser();
   const nextPublished = !p.is_published;
   const { error } = await supabase
     .from("products")
     .update({ is_published: nextPublished })
     .eq("id", p.id);
-  if (error) toast.error(error.message);
-  else {
+  if (error) {
+    const msg = normalizeDbErrorMessage(error);
+    if (nextPublished && isSubscriptionPolicyBlockMessage(msg)) {
+      toast.error(publishBlockedMessage());
+      return;
+    }
+    toast.error(msg || "Could not update product status.");
+  } else {
     p.is_published = nextPublished;
     toast.success(
       nextPublished ? "Product published." : "Product unpublished.",
@@ -1010,6 +1418,10 @@ async function saveProductCategoryId(
   p: (typeof products.value)[0],
   categoryId: string | null,
 ) {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
   const next =
     typeof categoryId === "string" && categoryId.trim()
       ? categoryId.trim()
@@ -1033,6 +1445,10 @@ async function saveProductCategoryId(
 }
 
 async function addStoreCategory() {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
   if (!store.value) return;
   const name = newCategoryName.value.trim();
   if (!name) {
@@ -1056,6 +1472,10 @@ async function addStoreCategory() {
 }
 
 async function deleteStoreCategory(categoryId: string) {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
   if (deleteCategoryBusyId.value) return;
   const cat = productCategories.value.find((c) => c.id === categoryId);
   const label = cat?.name?.trim() || "this category";
@@ -1079,6 +1499,8 @@ async function deleteStoreCategory(categoryId: string) {
 }
 
 async function setOrderStatus(orderId: string, status: string) {
+  const current = selectedOrder.value?.status;
+  if (current && current === status) return;
   const supabase = getSupabaseBrowser();
   const { error } = await supabase
     .from("orders")
@@ -1087,28 +1509,58 @@ async function setOrderStatus(orderId: string, status: string) {
   if (error) toast.error(error.message);
   else {
     toast.success("Order status updated.");
+    const { data: notifyData, error: notifyErr } =
+      await supabase.functions.invoke("notify-order-status", {
+        body: { order_id: orderId, status },
+      });
+    if (notifyErr) {
+      toast.info(
+        `Status updated, but customer notification may have failed: ${formatFunctionsInvokeError(
+          notifyErr,
+          "notify-order-status",
+        )}`,
+      );
+    } else if (notifyData && typeof notifyData === "object") {
+      if ("error" in notifyData && typeof notifyData.error === "string") {
+        toast.info(`Status updated. Notification issue: ${notifyData.error}`);
+      } else if (
+        "warnings" in notifyData &&
+        Array.isArray(notifyData.warnings) &&
+        notifyData.warnings.length
+      ) {
+        const first = notifyData.warnings.find(
+          (x: unknown): x is string =>
+            typeof x === "string" && x.trim().length > 0,
+        );
+        if (first) {
+          toast.info(`Status updated. Notification note: ${first}`);
+        }
+      }
+    }
     void loadAll({ silent: true });
   }
 }
 
-async function saveDelivery(orderId: string) {
-  const f = deliveryForms.value[orderId];
-  if (!f) return;
-  const supabase = getSupabaseBrowser();
-  const lat = f.last_latitude.trim() ? Number(f.last_latitude) : null;
-  const lng = f.last_longitude.trim() ? Number(f.last_longitude) : null;
-  const { error } = await supabase.from("delivery_tracking").upsert(
-    {
-      order_id: orderId,
-      stage: f.stage,
-      last_message: f.last_message.trim() || null,
-      last_latitude: lat,
-      last_longitude: lng,
-    },
-    { onConflict: "order_id" },
-  );
-  if (error) toast.error(error.message);
-  else toast.success("Delivery update saved.");
+function onCancelSelectedOrder() {
+  const ord = selectedOrder.value;
+  if (!ord || !canCancelOrderStatus(ord.status)) return;
+  cancelOrderConfirmOpen.value = true;
+}
+
+const cancelOrderConfirmOpen = ref(false);
+
+function closeCancelOrderModal() {
+  cancelOrderConfirmOpen.value = false;
+}
+
+function confirmCancelSelectedOrder() {
+  const ord = selectedOrder.value;
+  if (!ord || !canCancelOrderStatus(ord.status)) {
+    cancelOrderConfirmOpen.value = false;
+    return;
+  }
+  cancelOrderConfirmOpen.value = false;
+  void setOrderStatus(ord.id, "canceled");
 }
 
 async function submitSupportTicket() {
@@ -1138,6 +1590,10 @@ async function submitSupportTicket() {
 }
 
 function openStoreFeePlanModal() {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
   if (!store.value || payBusy.value) return;
   const normalized = normalizeSignupPlanId(
     user.value?.user_metadata?.signup_plan,
@@ -1260,13 +1716,26 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
               >
                 {{ store.name }}
               </h1>
-              <p class="mt-2 text-sm text-zinc-600">
+              <p
+                v-if="canUseRoleGatedStoreActions"
+                class="mt-2 text-sm text-zinc-600"
+              >
                 Public shop
                 <RouterLink
                   :to="`/${store.slug}`"
                   class="font-semibold text-teal-700 hover:text-teal-900"
                   >/{{ store.slug }}</RouterLink
                 >
+                <span
+                  class="ml-2 inline-flex rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+                  :class="
+                    store.is_active
+                      ? 'bg-emerald-100 text-emerald-800 ring-1 ring-emerald-300/50'
+                      : 'bg-zinc-200/80 text-zinc-700 ring-1 ring-zinc-300/40'
+                  "
+                >
+                  {{ store.is_active ? "Live" : "Paused" }}
+                </span>
               </p>
               <p
                 v-if="isStoreOwner && !hasSelectedPlan && !isSuperAdmin"
@@ -1277,7 +1746,29 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
             </div>
           </div>
           <div class="flex shrink-0 flex-col items-end gap-2">
-            <template v-if="showStorePlatformPayCta">
+            <button
+              v-if="canUseRoleGatedStoreActions"
+              type="button"
+              class="rounded-full border px-4 py-2 text-xs font-semibold shadow-sm transition disabled:opacity-50"
+              :class="
+                store.is_active
+                  ? 'border-zinc-300 bg-white text-zinc-700 hover:border-zinc-400 hover:bg-zinc-50'
+                  : 'border-emerald-300 bg-emerald-50 text-emerald-800 hover:border-emerald-400 hover:bg-emerald-100/70'
+              "
+              :disabled="storeStatusBusy"
+              @click="openStoreLinkStatusModal"
+            >
+              {{
+                storeStatusBusy
+                  ? "Saving..."
+                  : store.is_active
+                    ? "Pause store link"
+                    : "Activate store link"
+              }}
+            </button>
+            <template
+              v-if="showStorePlatformPayCta && canUseRoleGatedStoreActions"
+            >
               <button
                 type="button"
                 class="rounded-full border border-amber-200/80 bg-gradient-to-r from-amber-50 to-orange-50 px-5 py-2.5 text-sm font-semibold text-amber-950 shadow-sm ring-1 ring-amber-200/50 transition hover:from-amber-100 hover:to-orange-100 disabled:opacity-50"
@@ -1371,6 +1862,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
             </p>
           </div>
           <button
+            v-if="canUseRoleGatedStoreActions"
             type="button"
             class="inline-flex shrink-0 items-center justify-center gap-2 rounded-2xl bg-zinc-900 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-zinc-900/15 transition hover:bg-zinc-800 disabled:pointer-events-none disabled:opacity-40"
             :disabled="!store"
@@ -1382,10 +1874,10 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
         </div>
 
         <div
-          class="flex min-h-0 flex-col gap-6 xl:grid xl:grid-cols-2 xl:items-start xl:gap-6"
+          class="flex min-h-0 flex-col overflow-hidden rounded-3xl border border-zinc-200/70 bg-white/95 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.16)] ring-1 ring-zinc-100/80 xl:grid xl:grid-cols-[minmax(0,60%)_minmax(0,40%)] xl:items-start xl:gap-0"
         >
           <div
-            class="flex max-h-[55dvh] min-h-0 min-w-0 w-full flex-col overflow-hidden rounded-t-3xl rounded-b-none border border-zinc-200/70 bg-white/95 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.16)] ring-1 ring-zinc-100/80 backdrop-blur-md"
+            class="flex max-h-[55dvh] min-h-0 min-w-0 w-full flex-col overflow-hidden border-b border-zinc-200/80 bg-white/95 xl:max-h-[65dvh] xl:border-b-0 xl:border-r xl:border-zinc-200/80"
           >
             <div
               class="flex shrink-0 flex-col gap-2 border-b border-zinc-100 bg-gradient-to-r from-zinc-50/95 to-white px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5"
@@ -1409,119 +1901,283 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
               </span>
             </div>
             <div
-              class="hidden shrink-0 grid-cols-[minmax(0,1.2fr)_10.25rem_4.75rem_5rem_3.75rem_5.75rem] gap-x-2 gap-y-1 border-b border-zinc-200 bg-zinc-100/90 px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500 lg:grid"
+              class="hidden shrink-0 grid-cols-[minmax(0,0.82fr)_9.25rem_4.5rem_5rem_3.75rem_5.75rem] gap-x-4 gap-y-1 border-b border-zinc-200 bg-zinc-100/90 px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500 lg:grid"
             >
               <span class="text-left">Name</span>
               <span class="text-left">Category</span>
               <span class="text-left">Listed</span>
               <span class="text-right">Price</span>
               <span class="text-center">Status</span>
-              <span class="text-right">Action</span>
+              <span class="justify-self-end text-right">Action</span>
             </div>
             <template v-if="products.length">
-            <ul
-              class="min-h-0 flex-1 overflow-x-auto overflow-y-auto overscroll-y-contain"
-            >
-              <li
-                v-for="p in products"
-                :key="p.id"
-                class="border-b border-zinc-100 transition-colors last:border-b-0 hover:bg-zinc-50/80 motion-safe:duration-150"
+              <ul
+                class="min-h-0 flex-1 overflow-x-auto overflow-y-auto overscroll-y-contain"
               >
-                <!-- Mobile: card-style row -->
-                <div class="space-y-3 p-4 lg:hidden">
-                  <div class="flex gap-3">
-                    <div
-                      class="flex h-[3.25rem] w-[3.25rem] shrink-0 overflow-hidden rounded-xl border border-zinc-200/80 bg-zinc-100 shadow-inner"
-                    >
-                      <img
-                        v-if="productCoverPublicUrl(p.image_paths?.[0])"
-                        :src="productCoverPublicUrl(p.image_paths[0])!"
-                        alt=""
-                        class="h-full w-full object-cover"
-                        loading="lazy"
-                        @error="
-                          ($event.target as HTMLImageElement).style.display =
-                            'none'
-                        "
-                      />
+                <li
+                  v-for="p in products"
+                  :key="p.id"
+                  class="border-b border-zinc-100 transition-colors last:border-b-0 hover:bg-zinc-50/80 motion-safe:duration-150"
+                >
+                  <!-- Mobile: card-style row -->
+                  <div class="space-y-3 p-4 lg:hidden">
+                    <div class="flex gap-3">
                       <div
-                        v-else
-                        class="flex h-full w-full items-center justify-center text-zinc-300"
-                        aria-hidden="true"
+                        class="flex h-[3.25rem] w-[3.25rem] shrink-0 overflow-hidden rounded-xl border border-zinc-200/80 bg-zinc-100 shadow-inner"
                       >
-                        <svg
-                          class="h-6 w-6 opacity-60"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="1.5"
+                        <img
+                          v-if="productCoverPublicUrl(p.image_paths?.[0])"
+                          :src="productCoverPublicUrl(p.image_paths[0])!"
+                          alt=""
+                          class="h-full w-full object-cover"
+                          loading="lazy"
+                          @error="
+                            ($event.target as HTMLImageElement).style.display =
+                              'none'
+                          "
+                        />
+                        <div
+                          v-else
+                          class="flex h-full w-full items-center justify-center text-zinc-300"
+                          aria-hidden="true"
                         >
-                          <rect
-                            x="3"
-                            y="3"
-                            width="18"
-                            height="18"
-                            rx="2"
-                            ry="2"
-                          />
-                          <circle cx="8.5" cy="8.5" r="1.5" />
-                          <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
-                        </svg>
+                          <svg
+                            class="h-6 w-6 opacity-60"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.5"
+                          >
+                            <rect
+                              x="3"
+                              y="3"
+                              width="18"
+                              height="18"
+                              rx="2"
+                              ry="2"
+                            />
+                            <circle cx="8.5" cy="8.5" r="1.5" />
+                            <path
+                              d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"
+                            />
+                          </svg>
+                        </div>
+                      </div>
+                      <div class="min-w-0 flex-1">
+                        <p
+                          class="text-[0.9375rem] font-semibold leading-snug tracking-tight text-zinc-900"
+                        >
+                          {{ p.title }}
+                        </p>
+                        <p
+                          v-if="p.description"
+                          class="mt-0.5 line-clamp-2 text-xs leading-relaxed text-zinc-600"
+                        >
+                          {{ p.description }}
+                        </p>
+                        <p
+                          class="mt-1.5 text-[11px] font-medium tabular-nums text-zinc-500"
+                        >
+                          Listed {{ formatProductTableDate(p.created_at) }}
+                        </p>
                       </div>
                     </div>
-                    <div class="min-w-0 flex-1">
-                      <p
-                        class="text-[0.9375rem] font-semibold leading-snug tracking-tight text-zinc-900"
+                    <div class="min-w-0">
+                      <span
+                        class="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
                       >
-                        {{ p.title }}
+                        Category
+                      </span>
+                      <ProductCategoryDropdown
+                        :category-id="p.category_id"
+                        :categories="productCategories"
+                        :pending="categoryBusyId === p.id"
+                        size="md"
+                        @pick="(v) => saveProductCategoryId(p, v)"
+                      />
+                    </div>
+                    <div
+                      class="flex flex-wrap items-center justify-between gap-3 border-t border-zinc-100/90 pt-3"
+                    >
+                      <p class="text-sm font-bold tabular-nums text-zinc-900">
+                        {{ formatGhs(p.price_cents) }}
                       </p>
-                      <p
-                        v-if="p.description"
-                        class="mt-0.5 line-clamp-2 text-xs leading-relaxed text-zinc-600"
+                      <span
+                        class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold"
+                        :class="
+                          p.is_published
+                            ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
+                            : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
+                        "
                       >
-                        {{ p.description }}
-                      </p>
-                      <p
-                        class="mt-1.5 text-[11px] font-medium tabular-nums text-zinc-500"
-                      >
-                        Listed {{ formatProductTableDate(p.created_at) }}
-                      </p>
+                        {{ p.is_published ? "Live" : "Draft" }}
+                      </span>
+                      <div class="ml-auto flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          class="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-teal-300 hover:bg-teal-50/90 hover:text-teal-800 focus-visible:ring-2 focus-visible:ring-teal-500/30"
+                          :aria-label="
+                            p.is_published
+                              ? 'Unpublish product'
+                              : 'Publish product'
+                          "
+                          @click="togglePublish(p)"
+                        >
+                          <svg
+                            v-if="p.is_published"
+                            class="h-[1.125rem] w-[1.125rem]"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.75"
+                            aria-hidden="true"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              d="M5.25 7.5A2.25 2.25 0 017.5 5.25h9a2.25 2.25 0 012.25 2.25v9a2.25 2.25 0 01-2.25 2.25h-9a2.25 2.25 0 01-2.25-2.25v-9z"
+                            />
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              d="M10.5 9.75v4.5m3-2.25h-4.5"
+                            />
+                          </svg>
+                          <svg
+                            v-else
+                            class="h-[1.125rem] w-[1.125rem]"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.75"
+                            aria-hidden="true"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z"
+                            />
+                          </svg>
+                        </button>
+                        <button
+                          type="button"
+                          class="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-rose-600 shadow-sm outline-none transition hover:border-rose-300 hover:bg-rose-50 focus-visible:ring-2 focus-visible:ring-rose-500/25"
+                          aria-label="Delete product"
+                          @click="openDeleteProductDialog(p.id)"
+                        >
+                          <svg
+                            class="h-[1.125rem] w-[1.125rem]"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.75"
+                            aria-hidden="true"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"
+                            />
+                          </svg>
+                        </button>
+                      </div>
                     </div>
                   </div>
-                  <div class="min-w-0">
-                    <span
-                      class="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
-                    >
-                      Category
-                    </span>
-                    <ProductCategoryDropdown
-                      :category-id="p.category_id"
-                      :categories="productCategories"
-                      :pending="categoryBusyId === p.id"
-                      size="md"
-                      @pick="(v) => saveProductCategoryId(p, v)"
-                    />
-                  </div>
+
+                  <!-- Desktop: wide table row -->
                   <div
-                    class="flex flex-wrap items-center justify-between gap-3 border-t border-zinc-100/90 pt-3"
+                    class="hidden min-w-[36rem] grid-cols-[minmax(0,0.82fr)_9.25rem_4.5rem_5rem_3.75rem_5.75rem] gap-x-4 gap-y-1 px-4 py-4 lg:grid lg:items-center"
                   >
-                    <p class="text-sm font-bold tabular-nums text-zinc-900">
+                    <div class="flex min-w-0 items-center gap-3">
+                      <div
+                        class="flex h-11 w-11 shrink-0 overflow-hidden rounded-lg border border-zinc-200/80 bg-zinc-100 shadow-inner"
+                      >
+                        <img
+                          v-if="productCoverPublicUrl(p.image_paths?.[0])"
+                          :src="productCoverPublicUrl(p.image_paths[0])!"
+                          alt=""
+                          class="h-full w-full object-cover"
+                          loading="lazy"
+                          @error="
+                            ($event.target as HTMLImageElement).style.display =
+                              'none'
+                          "
+                        />
+                        <div
+                          v-else
+                          class="flex h-full w-full items-center justify-center text-zinc-300"
+                          aria-hidden="true"
+                        >
+                          <svg
+                            class="h-5 w-5 opacity-60"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.5"
+                          >
+                            <rect
+                              x="3"
+                              y="3"
+                              width="18"
+                              height="18"
+                              rx="2"
+                              ry="2"
+                            />
+                            <circle cx="8.5" cy="8.5" r="1.5" />
+                            <path
+                              d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"
+                            />
+                          </svg>
+                        </div>
+                      </div>
+                      <div class="min-w-0">
+                        <p
+                          class="truncate text-sm font-semibold tracking-tight text-zinc-900"
+                        >
+                          {{ p.title }}
+                        </p>
+                        <p
+                          v-if="p.description"
+                          class="mt-0.5 line-clamp-1 text-xs leading-snug text-zinc-500"
+                        >
+                          {{ p.description }}
+                        </p>
+                      </div>
+                    </div>
+                    <div class="min-w-0 max-w-[10.25rem] justify-self-stretch">
+                      <span class="sr-only">Category</span>
+                      <ProductCategoryDropdown
+                        :category-id="p.category_id"
+                        :categories="productCategories"
+                        :pending="categoryBusyId === p.id"
+                        size="sm"
+                        @pick="(v) => saveProductCategoryId(p, v)"
+                      />
+                    </div>
+                    <p class="text-xs tabular-nums text-zinc-600">
+                      {{ formatProductTableDate(p.created_at) }}
+                    </p>
+                    <p
+                      class="text-right text-sm font-semibold tabular-nums text-zinc-900"
+                    >
                       {{ formatGhs(p.price_cents) }}
                     </p>
-                    <span
-                      class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold"
-                      :class="
-                        p.is_published
-                          ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
-                          : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
-                      "
-                    >
-                      {{ p.is_published ? "Live" : "Draft" }}
-                    </span>
-                    <div class="ml-auto flex items-center gap-1.5">
+                    <div class="flex justify-center">
+                      <span
+                        class="inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold"
+                        :class="
+                          p.is_published
+                            ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
+                            : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
+                        "
+                      >
+                        {{ p.is_published ? "Live" : "Draft" }}
+                      </span>
+                    </div>
+                    <div class="justify-self-end flex justify-end gap-1">
                       <button
                         type="button"
-                        class="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-teal-300 hover:bg-teal-50/90 hover:text-teal-800 focus-visible:ring-2 focus-visible:ring-teal-500/30"
+                        class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-teal-300 hover:bg-teal-50/90 hover:text-teal-800 focus-visible:ring-2 focus-visible:ring-teal-500/30"
                         :aria-label="
                           p.is_published
                             ? 'Unpublish product'
@@ -1567,7 +2223,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                       </button>
                       <button
                         type="button"
-                        class="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-rose-600 shadow-sm outline-none transition hover:border-rose-300 hover:bg-rose-50 focus-visible:ring-2 focus-visible:ring-rose-500/25"
+                        class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-rose-600 shadow-sm outline-none transition hover:border-rose-300 hover:bg-rose-50 focus-visible:ring-2 focus-visible:ring-rose-500/25"
                         aria-label="Delete product"
                         @click="openDeleteProductDialog(p.id)"
                       >
@@ -1588,228 +2244,74 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                       </button>
                     </div>
                   </div>
-                </div>
-
-                <!-- Desktop: wide table row -->
+                </li>
+              </ul>
+              <footer
+                class="shrink-0 border-t border-zinc-200/90 bg-gradient-to-r from-zinc-50/95 to-zinc-100/80 px-4 py-3.5 sm:px-5"
+                aria-label="Product list summary"
+              >
                 <div
-                  class="hidden min-w-[42rem] grid-cols-[minmax(0,1.2fr)_10.25rem_4.75rem_5rem_3.75rem_5.75rem] gap-x-2 gap-y-1 px-4 py-4 lg:grid lg:items-center"
+                  class="flex flex-col gap-3 text-xs text-zinc-600 lg:hidden"
                 >
-                  <div class="flex min-w-0 items-center gap-3">
-                    <div
-                      class="flex h-11 w-11 shrink-0 overflow-hidden rounded-lg border border-zinc-200/80 bg-zinc-100 shadow-inner"
-                    >
-                      <img
-                        v-if="productCoverPublicUrl(p.image_paths?.[0])"
-                        :src="productCoverPublicUrl(p.image_paths[0])!"
-                        alt=""
-                        class="h-full w-full object-cover"
-                        loading="lazy"
-                        @error="
-                          ($event.target as HTMLImageElement).style.display =
-                            'none'
-                        "
-                      />
-                      <div
-                        v-else
-                        class="flex h-full w-full items-center justify-center text-zinc-300"
-                        aria-hidden="true"
-                      >
-                        <svg
-                          class="h-5 w-5 opacity-60"
-                          viewBox="0 0 24 24"
-                          fill="none"
-                          stroke="currentColor"
-                          stroke-width="1.5"
-                        >
-                          <rect
-                            x="3"
-                            y="3"
-                            width="18"
-                            height="18"
-                            rx="2"
-                            ry="2"
-                          />
-                          <circle cx="8.5" cy="8.5" r="1.5" />
-                          <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
-                        </svg>
-                      </div>
-                    </div>
-                    <div class="min-w-0">
-                      <p
-                        class="truncate text-sm font-semibold tracking-tight text-zinc-900"
-                      >
-                        {{ p.title }}
-                      </p>
-                      <p
-                        v-if="p.description"
-                        class="mt-0.5 line-clamp-1 text-xs leading-snug text-zinc-500"
-                      >
-                        {{ p.description }}
-                      </p>
-                    </div>
-                  </div>
-                  <div class="min-w-0 max-w-[10.25rem] justify-self-stretch">
-                    <span class="sr-only">Category</span>
-                    <ProductCategoryDropdown
-                      :category-id="p.category_id"
-                      :categories="productCategories"
-                      :pending="categoryBusyId === p.id"
-                      size="sm"
-                      @pick="(v) => saveProductCategoryId(p, v)"
-                    />
-                  </div>
-                  <p class="text-xs tabular-nums text-zinc-600">
-                    {{ formatProductTableDate(p.created_at) }}
-                  </p>
-                  <p
-                    class="text-right text-sm font-semibold tabular-nums text-zinc-900"
+                  <div
+                    class="flex flex-wrap items-center justify-between gap-2"
                   >
-                    {{ formatGhs(p.price_cents) }}
+                    <span class="font-semibold text-zinc-800">Summary</span>
+                    <span class="tabular-nums text-zinc-500"
+                      >{{ products.length }} products</span
+                    >
+                  </div>
+                  <div class="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+                    <span
+                      >Live
+                      <span class="font-semibold text-emerald-800">{{
+                        productsPublishedCount
+                      }}</span></span
+                    >
+                    <span
+                      >Draft
+                      <span class="font-semibold text-zinc-800">{{
+                        productsDraftCount
+                      }}</span></span
+                    >
+                    <span
+                      class="ml-auto font-semibold tabular-nums text-zinc-900"
+                    >
+                      List total {{ formatGhs(productsPriceTotalCents) }}
+                    </span>
+                  </div>
+                </div>
+                <div
+                  class="hidden min-w-[36rem] grid-cols-[minmax(0,0.82fr)_9.25rem_4.5rem_5rem_3.75rem_5.75rem] gap-x-4 text-[11px] lg:grid lg:items-center"
+                >
+                  <span class="font-bold uppercase tracking-wider text-zinc-500"
+                    >Summary</span
+                  >
+                  <span class="text-zinc-400" aria-hidden="true">—</span>
+                  <span class="text-zinc-400" aria-hidden="true">—</span>
+                  <p
+                    class="text-right text-sm font-bold tabular-nums tracking-tight text-zinc-900"
+                  >
+                    {{ formatGhs(productsPriceTotalCents) }}
                   </p>
                   <div class="flex justify-center">
                     <span
-                      class="inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold"
-                      :class="
-                        p.is_published
-                          ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
-                          : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
-                      "
+                      class="inline-flex max-w-full flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5 text-center text-[11px] font-medium text-zinc-600"
                     >
-                      {{ p.is_published ? "Live" : "Draft" }}
+                      <span class="text-emerald-800"
+                        >{{ productsPublishedCount }} live</span
+                      >
+                      <span class="text-zinc-300" aria-hidden="true">·</span>
+                      <span>{{ productsDraftCount }} draft</span>
                     </span>
                   </div>
-                  <div class="flex justify-end gap-1">
-                    <button
-                      type="button"
-                      class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-teal-300 hover:bg-teal-50/90 hover:text-teal-800 focus-visible:ring-2 focus-visible:ring-teal-500/30"
-                      :aria-label="
-                        p.is_published ? 'Unpublish product' : 'Publish product'
-                      "
-                      @click="togglePublish(p)"
-                    >
-                      <svg
-                        v-if="p.is_published"
-                        class="h-[1.125rem] w-[1.125rem]"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.75"
-                        aria-hidden="true"
-                      >
-                        <path
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          d="M5.25 7.5A2.25 2.25 0 017.5 5.25h9a2.25 2.25 0 012.25 2.25v9a2.25 2.25 0 01-2.25 2.25h-9a2.25 2.25 0 01-2.25-2.25v-9z"
-                        />
-                        <path
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          d="M10.5 9.75v4.5m3-2.25h-4.5"
-                        />
-                      </svg>
-                      <svg
-                        v-else
-                        class="h-[1.125rem] w-[1.125rem]"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.75"
-                        aria-hidden="true"
-                      >
-                        <path
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          d="M5.25 5.653c0-.856.917-1.398 1.667-.986l11.54 6.348a1.125 1.125 0 010 1.971l-11.54 6.347a1.125 1.125 0 01-1.667-.985V5.653z"
-                        />
-                      </svg>
-                    </button>
-                    <button
-                      type="button"
-                      class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-rose-600 shadow-sm outline-none transition hover:border-rose-300 hover:bg-rose-50 focus-visible:ring-2 focus-visible:ring-rose-500/25"
-                      aria-label="Delete product"
-                      @click="openDeleteProductDialog(p.id)"
-                    >
-                      <svg
-                        class="h-[1.125rem] w-[1.125rem]"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.75"
-                        aria-hidden="true"
-                      >
-                        <path
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                          d="M14.74 9l-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 01-2.244 2.077H8.084a2.25 2.25 0 01-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 00-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 013.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 00-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 00-7.5 0"
-                        />
-                      </svg>
-                    </button>
-                  </div>
-                </div>
-              </li>
-            </ul>
-            <footer
-              class="shrink-0 border-t border-zinc-200/90 bg-gradient-to-r from-zinc-50/95 to-zinc-100/80 px-4 py-3.5 sm:px-5"
-              aria-label="Product list summary"
-            >
-              <div
-                class="flex flex-col gap-3 text-xs text-zinc-600 lg:hidden"
-              >
-                <div class="flex flex-wrap items-center justify-between gap-2">
-                  <span class="font-semibold text-zinc-800">Summary</span>
-                  <span class="tabular-nums text-zinc-500"
-                    >{{ products.length }} products</span
-                  >
-                </div>
-                <div class="flex flex-wrap items-center gap-x-4 gap-y-1.5">
                   <span
-                    >Live
-                    <span class="font-semibold text-emerald-800">{{
-                      productsPublishedCount
-                    }}</span></span
+                    class="justify-self-end text-right text-[10px] font-semibold uppercase tracking-wide text-zinc-400"
                   >
-                  <span
-                    >Draft
-                    <span class="font-semibold text-zinc-800">{{
-                      productsDraftCount
-                    }}</span></span
-                  >
-                  <span class="ml-auto font-semibold tabular-nums text-zinc-900">
-                    List total {{ formatGhs(productsPriceTotalCents) }}
+                    {{ products.length }} rows
                   </span>
                 </div>
-              </div>
-              <div
-                class="hidden min-w-[42rem] grid-cols-[minmax(0,1.2fr)_10.25rem_4.75rem_5rem_3.75rem_5.75rem] gap-x-2 text-[11px] lg:grid lg:items-center"
-              >
-                <span class="font-bold uppercase tracking-wider text-zinc-500"
-                  >Summary</span
-                >
-                <span class="text-zinc-400" aria-hidden="true">—</span>
-                <span class="text-zinc-400" aria-hidden="true">—</span>
-                <p
-                  class="text-right text-sm font-bold tabular-nums tracking-tight text-zinc-900"
-                >
-                  {{ formatGhs(productsPriceTotalCents) }}
-                </p>
-                <div class="flex justify-center">
-                  <span
-                    class="inline-flex max-w-full flex-wrap items-center justify-center gap-x-1.5 gap-y-0.5 text-center text-[11px] font-medium text-zinc-600"
-                  >
-                    <span class="text-emerald-800"
-                      >{{ productsPublishedCount }} live</span
-                    >
-                    <span class="text-zinc-300" aria-hidden="true">·</span>
-                    <span>{{ productsDraftCount }} draft</span>
-                  </span>
-                </div>
-                <span
-                  class="text-right text-[10px] font-semibold uppercase tracking-wide text-zinc-400"
-                >
-                  {{ products.length }} rows
-                </span>
-              </div>
-            </footer>
+              </footer>
             </template>
             <p
               v-else
@@ -1845,7 +2347,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
           </div>
 
           <aside
-            class="w-full min-w-0 shrink-0 overflow-hidden rounded-3xl border border-violet-200/50 bg-gradient-to-b from-violet-50/80 via-white to-teal-50/30 p-1 shadow-[0_16px_40px_-24px_rgba(91,33,182,0.2)] ring-1 ring-violet-100/60 xl:sticky xl:top-4 xl:self-start"
+            class="w-full min-w-0 shrink-0 overflow-hidden bg-gradient-to-b from-violet-50/70 via-white to-teal-50/25 p-1 xl:sticky xl:top-4 xl:self-start"
           >
             <div
               class="rounded-[1.35rem] border border-white/80 bg-white/85 p-4 shadow-inner backdrop-blur-sm sm:p-5"
@@ -1926,7 +2428,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                 </span>
               </div>
 
-              <div class="mt-4">
+              <div v-if="canUseRoleGatedStoreActions" class="mt-4">
                 <label for="store-new-category-name" class="sr-only"
                   >New category name</label
                 >
@@ -1998,6 +2500,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                   </span>
                   <span class="min-w-0 flex-1 truncate">{{ c.name }}</span>
                   <button
+                    v-if="canUseRoleGatedStoreActions"
                     type="button"
                     class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-rose-200/70 bg-white text-rose-600 opacity-90 transition hover:bg-rose-50 hover:opacity-100 disabled:pointer-events-none disabled:opacity-40"
                     :disabled="deleteCategoryBusyId === c.id"
@@ -2048,222 +2551,556 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
       </section>
 
       <section v-show="tab === 'orders'" class="space-y-4">
+        <!-- Section header — matches Products section header -->
         <div
-          class="flex max-h-[min(70dvh,42rem)] min-h-0 flex-col overflow-hidden rounded-3xl border border-zinc-200/70 bg-white/95 shadow-[0_16px_48px_-28px_rgba(15,23,42,0.14)] ring-1 ring-zinc-100/80 backdrop-blur-md"
+          class="flex flex-col gap-4 rounded-3xl border border-white/60 bg-white/70 px-5 py-4 shadow-[0_16px_40px_-28px_rgba(15,23,42,0.12)] backdrop-blur-xl sm:flex-row sm:items-center sm:justify-between sm:px-6"
         >
-          <div
-            class="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-zinc-100 bg-gradient-to-r from-zinc-50/95 to-white px-4 py-3.5 sm:px-5"
-          >
-            <div>
-              <h2 class="text-sm font-bold tracking-tight text-zinc-900">
-                Orders &amp; delivery
-              </h2>
-              <p class="mt-0.5 text-[11px] font-medium text-zinc-500">
-                Update fulfilment status and buyer-facing delivery updates.
-              </p>
-            </div>
+          <div class="min-w-0">
+            <h2 class="text-lg font-bold tracking-tight text-zinc-900">
+              Orders &amp; delivery
+            </h2>
+            <p class="mt-1 text-sm text-zinc-600">
+              Update fulfilment status and buyer-facing delivery updates.
+            </p>
+          </div>
+          <!-- Stat chips -->
+          <div class="flex shrink-0 flex-wrap items-center gap-2">
             <span
-              class="inline-flex items-center rounded-full bg-zinc-900/90 px-2.5 py-1 text-[11px] font-bold tabular-nums text-white shadow-sm"
+              class="inline-flex items-center gap-1.5 rounded-full border border-zinc-200/80 bg-white/90 px-3 py-1.5 text-[11px] shadow-sm ring-1 ring-zinc-200/50"
             >
-              {{ orders.length }} total
+              <span class="font-semibold uppercase tracking-wide text-zinc-500"
+                >Total</span
+              >
+              <span class="font-bold text-zinc-900">{{ orders.length }}</span>
+            </span>
+            <span
+              class="inline-flex items-center gap-1.5 rounded-full border border-amber-200/80 bg-amber-50/80 px-3 py-1.5 text-[11px] shadow-sm ring-1 ring-amber-100/60"
+            >
+              <span class="h-1.5 w-1.5 rounded-full bg-amber-400" />
+              <span class="font-semibold text-amber-700"
+                >{{
+                  orders.filter((o) => o.status === "pending").length
+                }}
+                pending</span
+              >
+            </span>
+            <span
+              class="inline-flex items-center gap-1.5 rounded-full border border-emerald-200/80 bg-emerald-50/80 px-3 py-1.5 text-[11px] shadow-sm ring-1 ring-emerald-100/60"
+            >
+              <span class="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              <span class="font-semibold text-emerald-700"
+                >{{
+                  orders.filter((o) => o.status === "delivered").length
+                }}
+                delivered</span
+              >
             </span>
           </div>
+        </div>
 
-          <ul
-            v-if="orders.length"
-            class="min-h-0 flex-1 divide-y divide-zinc-100 overflow-y-auto overscroll-y-contain"
+        <!-- Main split panel — matches Products panel exactly -->
+        <div
+          class="flex h-[80dvh] min-h-[32rem] min-w-0 w-full flex-col overflow-hidden rounded-3xl border border-zinc-200/70 bg-white/95 shadow-[0_20px_50px_-28px_rgba(15,23,42,0.16)] ring-1 ring-zinc-100/80 lg:grid lg:grid-cols-[28%_minmax(0,1fr)] lg:items-stretch xl:h-[56rem]"
+        >
+          <!-- ── LEFT: master list ── -->
+          <div
+            class="flex max-h-[45dvh] min-h-0 min-w-0 w-full flex-col overflow-hidden border-b border-zinc-200/80 bg-white/95 lg:h-full lg:max-h-none lg:min-h-0 lg:border-b-0 lg:border-r lg:border-zinc-200/80"
           >
-            <li
-              v-for="ord in orders"
-              :key="ord.id"
-              class="group/ord transition-colors hover:bg-zinc-50/70"
+            <!-- List header -->
+            <div
+              class="flex shrink-0 flex-col gap-2 border-b border-zinc-100 bg-gradient-to-r from-zinc-50/95 to-white px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between sm:px-5"
             >
-              <div
-                class="flex flex-col gap-4 p-4 sm:flex-row sm:items-start sm:justify-between sm:gap-5 sm:p-5"
+              <div class="min-w-0">
+                <h3 class="text-sm font-bold tracking-tight text-zinc-900">
+                  Order list
+                </h3>
+                <p
+                  class="mt-0.5 text-[11px] font-medium leading-snug text-zinc-500"
+                >
+                  Newest first — click a row to view details.
+                </p>
+              </div>
+              <span
+                class="inline-flex shrink-0 items-center gap-1.5 self-start rounded-full bg-zinc-900/[0.06] px-2.5 py-1 text-[11px] font-bold tabular-nums text-zinc-700 ring-1 ring-zinc-200/80 sm:self-auto"
               >
-                <div class="flex min-w-0 flex-1 gap-3.5">
-                  <div
-                    class="relative mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-2xl border border-zinc-200/80 bg-gradient-to-br from-teal-100 to-sky-100 text-sm font-bold text-teal-900 shadow-inner ring-1 ring-white/80"
-                    aria-hidden="true"
+                <span class="text-zinc-500">Orders</span>
+                {{ orders.length }}
+              </span>
+            </div>
+
+            <!-- Column headers -->
+            <div
+              class="hidden shrink-0 grid-cols-[1fr_7rem] gap-x-3 border-b border-zinc-200 bg-zinc-100/90 px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500 sm:grid"
+            >
+              <span>Customer</span>
+              <span class="text-right">Amount</span>
+            </div>
+
+            <!-- Search -->
+            <div class="shrink-0 border-b border-zinc-100 bg-white px-4 py-2.5">
+              <div class="flex items-center gap-2">
+                <label class="sr-only" for="order-master-search"
+                  >Search orders</label
+                >
+                <div class="relative min-w-0 flex-1">
+                  <span
+                    class="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-zinc-400"
                   >
-                    <span class="select-none">{{
-                      orderCustomerTitle(ord).charAt(0).toUpperCase()
-                    }}</span>
-                  </div>
-                  <div class="min-w-0 flex-1">
-                    <div class="flex flex-wrap items-center gap-2">
-                      <p
-                        class="truncate text-[0.9375rem] font-semibold tracking-tight text-zinc-900"
+                    <svg
+                      class="h-3.5 w-3.5"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                      stroke-width="2"
+                    >
+                      <path
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        d="m21 21-4.35-4.35m1.6-5.4a7 7 0 11-14 0 7 7 0 0114 0z"
+                      />
+                    </svg>
+                  </span>
+                  <input
+                    id="order-master-search"
+                    v-model="orderSearch"
+                    type="search"
+                    placeholder="Search by name or ref…"
+                    class="w-full rounded-lg border border-zinc-200/80 bg-zinc-50/70 py-1.5 pl-8 pr-3 text-xs text-zinc-800 outline-none transition placeholder:text-zinc-400 focus:border-zinc-400 focus:bg-white focus:ring-2 focus:ring-zinc-400/20"
+                  />
+                </div>
+                <label class="sr-only" for="order-master-sort">Sort orders</label>
+                <select
+                  id="order-master-sort"
+                  v-model="orderSortMode"
+                  class="shrink-0 rounded-lg border border-zinc-200/80 bg-zinc-50/70 px-2.5 py-1.5 text-xs font-semibold text-zinc-700 outline-none transition focus:border-zinc-400 focus:bg-white focus:ring-2 focus:ring-zinc-400/20"
+                >
+                  <option value="newest">Newest</option>
+                  <option value="status">Status</option>
+                </select>
+              </div>
+            </div>
+
+            <!-- Rows -->
+            <ul
+              class="min-h-0 flex-1 overflow-y-auto overscroll-y-contain divide-y divide-zinc-100/90"
+            >
+              <li
+                v-for="ord in filteredOrders"
+                :key="ord.id"
+                class="transition-colors last:border-b-0 motion-safe:duration-150"
+                :class="
+                  selectedOrderId === ord.id
+                    ? 'bg-zinc-50/90'
+                    : 'hover:bg-zinc-50/60'
+                "
+              >
+                <button
+                  type="button"
+                  class="w-full px-4 py-3 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-zinc-400/40"
+                  :class="
+                    selectedOrderId === ord.id
+                      ? 'border-l-2 border-l-zinc-900'
+                      : ''
+                  "
+                  @click="selectedOrderId = ord.id"
+                >
+                  <div class="flex items-center gap-3">
+                    <!-- Avatar -->
+                    <span
+                      class="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-[11px] font-bold tracking-wide"
+                      :class="
+                        selectedOrderId === ord.id
+                          ? 'bg-zinc-900 text-white'
+                          : 'bg-zinc-200/80 text-zinc-600'
+                      "
+                      aria-hidden="true"
+                      >{{ orderCustomerInitials(ord) }}</span
+                    >
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-baseline justify-between gap-2">
+                        <p
+                          class="truncate text-[13px] font-semibold text-zinc-900"
+                        >
+                          {{ orderCustomerTitle(ord) }}
+                        </p>
+                        <p
+                          class="shrink-0 font-mono text-[12px] font-semibold tabular-nums text-zinc-700"
+                        >
+                          {{ formatGhs(orderTotalCents(ord)) }}
+                        </p>
+                      </div>
+                      <div
+                        class="mt-0.5 flex items-center justify-between gap-2"
                       >
-                        {{ orderCustomerTitle(ord) }}
+                        <p class="font-mono text-[11px] text-zinc-400">
+                          {{ orderDisplayRef(ord) }}
+                        </p>
+                        <div class="flex items-center gap-1.5">
+                          <span
+                            class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold"
+                            :class="{
+                              'bg-amber-100 text-amber-700':
+                                ord.status === 'pending',
+                              'bg-sky-100 text-sky-700':
+                                ord.status === 'confirmed',
+                              'bg-violet-100 text-violet-700':
+                                ord.status === 'preparing',
+                              'bg-blue-100 text-blue-700':
+                                ord.status === 'out_for_delivery',
+                              'bg-emerald-100 text-emerald-700':
+                                ord.status === 'delivered',
+                              'bg-red-100 text-red-600':
+                                ord.status === 'canceled',
+                            }"
+                            >{{ orderStatusLabel(ord.status) }}</span
+                          >
+                          <p class="text-[10px] text-zinc-400">
+                            {{ formatOrderMasterDate(ord.created_at) }}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </button>
+              </li>
+              <li
+                v-if="!filteredOrders.length && orders.length"
+                class="px-4 py-8 text-center text-xs text-zinc-400"
+              >
+                No orders match "{{ orderSearch }}".
+              </li>
+              <li v-if="!orders.length" class="px-4 py-14 text-center">
+                <p class="text-sm font-semibold text-zinc-800">No orders yet</p>
+                <p class="mt-1 text-xs text-zinc-500">
+                  When buyers check out, orders appear here.
+                </p>
+              </li>
+            </ul>
+          </div>
+
+          <!-- ── RIGHT: detail panel ── -->
+          <div
+            class="flex min-h-0 flex-col overflow-hidden bg-white/95"
+            aria-live="polite"
+          >
+            <template v-if="selectedOrder">
+              <!-- Detail header — matches right panel pattern -->
+              <div
+                class="flex shrink-0 flex-col gap-3 border-b border-zinc-100 bg-gradient-to-r from-zinc-50/95 to-white px-5 py-4 sm:flex-row sm:items-start sm:justify-between"
+              >
+                <div class="flex min-w-0 items-center gap-3">
+                  <span
+                    class="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-zinc-900 text-sm font-bold text-white"
+                    aria-hidden="true"
+                    >{{ orderCustomerInitials(selectedOrder) }}</span
+                  >
+                  <div class="min-w-0">
+                    <p class="text-base font-bold tracking-tight text-zinc-900">
+                      {{ orderCustomerTitle(selectedOrder) }}
+                    </p>
+                    <div
+                      class="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5"
+                    >
+                      <span
+                        class="font-mono text-[11px] font-semibold text-zinc-500"
+                        >{{ orderDisplayRef(selectedOrder) }}</span
+                      >
+                      <span class="text-zinc-300">·</span>
+                      <span class="text-[11px] text-zinc-400">{{
+                        formatOrderListDate(selectedOrder.created_at)
+                      }}</span>
+                      <span
+                        class="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold"
+                        :class="{
+                          'bg-amber-100 text-amber-700':
+                            selectedOrder.status === 'pending',
+                          'bg-sky-100 text-sky-700':
+                            selectedOrder.status === 'confirmed',
+                          'bg-violet-100 text-violet-700':
+                            selectedOrder.status === 'preparing',
+                          'bg-blue-100 text-blue-700':
+                            selectedOrder.status === 'out_for_delivery',
+                          'bg-emerald-100 text-emerald-700':
+                            selectedOrder.status === 'delivered',
+                          'bg-red-100 text-red-600':
+                            selectedOrder.status === 'canceled',
+                        }"
+                        >{{ orderStatusLabel(selectedOrder.status) }}</span
+                      >
+                    </div>
+                  </div>
+                </div>
+                <!-- Status progression -->
+                <div class="shrink-0">
+                  <p
+                    class="mb-1 text-[10px] font-semibold uppercase tracking-wider text-zinc-400"
+                  >
+                    Progress status
+                  </p>
+                  <div class="flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      class="inline-flex min-w-[13rem] items-center justify-center gap-1.5 rounded-xl border border-zinc-200/80 bg-white px-3 py-2 text-sm font-semibold text-zinc-800 shadow-sm outline-none transition hover:border-zinc-300 hover:bg-zinc-50 disabled:pointer-events-none disabled:opacity-50"
+                      :disabled="!nextOrderProgressStatus(selectedOrder.status)"
+                      @click="
+                        nextOrderProgressStatus(selectedOrder.status) &&
+                        setOrderStatus(
+                          selectedOrder.id,
+                          nextOrderProgressStatus(selectedOrder.status)!,
+                        )
+                      "
+                    >
+                      <svg
+                        class="h-4 w-4"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M5 12h14" />
+                        <path d="m12 5 7 7-7 7" />
+                      </svg>
+                      {{ orderProgressActionLabel(selectedOrder.status) }}
+                    </button>
+                    <button
+                      v-if="canCancelOrderStatus(selectedOrder.status)"
+                      type="button"
+                      class="inline-flex items-center justify-center gap-1.5 rounded-xl border border-rose-200/80 bg-rose-50 px-3 py-2 text-sm font-semibold text-rose-700 shadow-sm outline-none transition hover:bg-rose-100"
+                      @click="onCancelSelectedOrder"
+                    >
+                      <svg
+                        class="h-4 w-4"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                      >
+                        <path d="M18 6 6 18" />
+                        <path d="m6 6 12 12" />
+                      </svg>
+                      Cancel order
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Quick facts row -->
+              <div
+                class="hidden shrink-0 grid-cols-4 gap-x-3 border-b border-zinc-100 bg-zinc-100/90 px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500 sm:grid"
+              >
+                <span>Type</span>
+                <span>Email</span>
+                <span>Phone</span>
+                <span class="text-right">Items</span>
+              </div>
+              <div
+                class="shrink-0 grid-cols-4 gap-3 border-b border-zinc-100 bg-white/95 px-4 py-3 text-sm sm:grid"
+              >
+                <p class="font-medium text-zinc-800">Guest</p>
+                <p class="truncate font-medium text-zinc-800">
+                  {{ selectedOrder.guest_email || "—" }}
+                </p>
+                <p class="font-medium text-zinc-800">
+                  {{ selectedOrder.guest_phone || "—" }}
+                </p>
+                <p class="text-right font-semibold tabular-nums text-zinc-800">
+                  {{ selectedOrderItems.length }}
+                </p>
+              </div>
+
+              <!-- Items table — scrollable body -->
+              <div class="min-h-0 flex-1 overflow-y-auto overscroll-y-contain">
+                <div class="p-4">
+                  <div
+                    class="overflow-hidden rounded-2xl border border-zinc-200/70"
+                  >
+                    <div
+                      class="flex items-center justify-between border-b border-zinc-100 bg-gradient-to-r from-zinc-50/95 to-white px-5 py-3"
+                    >
+                      <p class="text-sm font-bold tracking-tight text-zinc-900">
+                        Ordered items
                       </p>
                       <span
-                        class="inline-flex shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ring-1"
-                        :class="orderStatusPillClass(ord.status)"
+                        class="inline-flex items-center gap-1.5 rounded-full bg-zinc-900/[0.06] px-2.5 py-1 text-[11px] font-bold tabular-nums text-zinc-700 ring-1 ring-zinc-200/80"
+                        >{{ selectedOrderItems.length }}</span
                       >
-                        {{ ord.status.replace(/_/g, " ") }}
-                      </span>
                     </div>
-                    <p class="mt-0.5 truncate text-xs text-zinc-500">
-                      {{ orderCustomerSubtitle(ord) }}
-                    </p>
-                    <p
-                      class="mt-1 font-mono text-[10px] font-medium text-zinc-400"
+                    <div
+                      v-if="selectedOrderItems.length"
+                      class="overflow-x-auto"
                     >
-                      {{ orderShortId(ord.id) }}
-                      <span class="text-zinc-300">·</span>
-                      {{ formatOrderListDate(ord.created_at) }}
-                    </p>
+                      <table class="min-w-full text-left">
+                        <thead>
+                          <tr
+                            class="border-b border-zinc-100 bg-zinc-100/90 text-[10px] font-bold uppercase tracking-wider text-zinc-500"
+                          >
+                            <th class="px-5 py-3">Product</th>
+                            <th class="px-4 py-3 text-center">Qty</th>
+                            <th class="px-4 py-3 text-right">Unit</th>
+                            <th class="px-5 py-3 text-right">Subtotal</th>
+                          </tr>
+                        </thead>
+                        <tbody class="divide-y divide-zinc-100/90">
+                          <tr
+                            v-for="(item, idx) in selectedOrderItems"
+                            :key="`${selectedOrder.id}-item-${idx}`"
+                            class="bg-white transition-colors hover:bg-zinc-50/80 motion-safe:duration-150"
+                          >
+                            <td
+                              class="px-5 py-3 text-sm font-medium text-zinc-800"
+                            >
+                              {{ item.title }}
+                            </td>
+                            <td class="px-4 py-3 text-center">
+                              <span
+                                class="inline-flex h-6 w-6 items-center justify-center rounded-full bg-zinc-100 text-xs font-semibold tabular-nums text-zinc-700"
+                                >{{ item.quantity }}</span
+                              >
+                            </td>
+                            <td
+                              class="px-4 py-3 text-right text-sm tabular-nums text-zinc-500"
+                            >
+                              {{ formatGhs(item.unitPriceCents) }}
+                            </td>
+                            <td
+                              class="px-5 py-3 text-right text-sm font-semibold tabular-nums text-zinc-900"
+                            >
+                              {{
+                                formatGhs(item.unitPriceCents * item.quantity)
+                              }}
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
                     <p
-                      v-if="ord.delivery_address"
-                      class="mt-2 line-clamp-2 text-xs leading-relaxed text-zinc-600"
+                      v-else
+                      class="px-5 py-4 text-center text-xs text-zinc-400"
                     >
-                      <span class="font-semibold text-zinc-500">Drop-off</span>
-                      {{ ord.delivery_address }}
+                      No items found on this order.
+                    </p>
+                    <div
+                      v-if="selectedOrderItems.length"
+                      class="flex items-center justify-between border-t border-zinc-100 bg-zinc-50/80 px-5 py-3"
+                    >
+                      <span class="text-xs text-zinc-400"
+                        >{{ selectedOrderItems.length }} item{{
+                          selectedOrderItems.length !== 1 ? "s" : ""
+                        }}</span
+                      >
+                      <div class="flex items-center gap-2">
+                        <span
+                          class="text-[11px] font-semibold uppercase tracking-wider text-zinc-500"
+                          >Total</span
+                        >
+                        <span
+                          class="text-sm font-bold tabular-nums text-zinc-900"
+                        >
+                          {{
+                            formatGhs(
+                              selectedOrderItems.reduce(
+                                (sum, it) =>
+                                  sum + it.unitPriceCents * it.quantity,
+                                0,
+                              ),
+                            )
+                          }}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <!-- Delivery address -->
+                  <div
+                    v-if="selectedOrder.delivery_address"
+                    class="mt-3 overflow-hidden rounded-2xl border border-zinc-200/70"
+                  >
+                    <div
+                      class="flex items-center gap-2 border-b border-zinc-100 bg-gradient-to-r from-zinc-50/95 to-white px-5 py-3"
+                    >
+                      <svg
+                        class="h-3.5 w-3.5 text-zinc-400"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        stroke-width="2"
+                      >
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"
+                        />
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"
+                        />
+                      </svg>
+                      <p class="text-sm font-bold tracking-tight text-zinc-900">
+                        Drop-off address
+                      </p>
+                    </div>
+                    <p
+                      class="bg-white px-5 py-3.5 text-sm leading-relaxed text-zinc-700"
+                    >
+                      {{ selectedOrder.delivery_address }}
                     </p>
                   </div>
                 </div>
-                <div class="shrink-0 sm:pt-0.5">
-                  <label class="sr-only" :for="`order-status-${ord.id}`"
-                    >Order status</label
-                  >
-                  <select
-                    :id="`order-status-${ord.id}`"
-                    class="w-full min-w-[11.5rem] cursor-pointer appearance-none rounded-xl border border-zinc-200/90 bg-white py-2.5 pl-3 pr-9 text-sm font-semibold text-zinc-900 shadow-sm outline-none transition hover:border-zinc-300 focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20 sm:w-auto"
-                    :value="ord.status"
-                    @change="
-                      setOrderStatus(
-                        ord.id,
-                        ($event.target as HTMLSelectElement).value,
-                      )
-                    "
-                  >
-                    <option value="pending">Pending</option>
-                    <option value="confirmed">Confirmed</option>
-                    <option value="preparing">Preparing</option>
-                    <option value="out_for_delivery">Out for delivery</option>
-                    <option value="delivered">Delivered</option>
-                    <option value="canceled">Canceled</option>
-                  </select>
-                </div>
               </div>
 
+              <!-- Action footer -->
               <div
-                v-if="deliveryForms[ord.id]"
-                class="border-t border-zinc-100/90 bg-gradient-to-b from-zinc-50/40 to-white/60 px-4 pb-4 pt-3 sm:px-5 sm:pb-5"
+                class="shrink-0 border-t border-zinc-100 bg-white/95 px-5 py-3.5"
               >
-                <div
-                  class="flex flex-wrap items-center justify-between gap-2 border-l-2 border-teal-400/80 pl-3"
-                >
-                  <h3
-                    class="text-[11px] font-bold uppercase tracking-wider text-teal-900/80"
-                  >
-                    Delivery tracking
-                  </h3>
-                  <button
-                    type="button"
-                    class="inline-flex items-center justify-center rounded-full bg-zinc-900 px-4 py-1.5 text-[11px] font-bold uppercase tracking-wide text-white shadow-md transition hover:bg-zinc-800 active:scale-[0.98]"
-                    @click="saveDelivery(ord.id)"
-                  >
-                    Save tracking
-                  </button>
-                </div>
-                <div
-                  class="mt-3 grid gap-3 border-l-2 border-transparent pl-3 sm:grid-cols-2 lg:grid-cols-12"
-                >
-                  <div class="sm:col-span-2 lg:col-span-4">
-                    <label
-                      class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
-                      :for="`del-stage-${ord.id}`"
-                      >Stage</label
-                    >
-                    <select
-                      :id="`del-stage-${ord.id}`"
-                      v-model="deliveryForms[ord.id].stage"
-                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-white px-3 py-2 text-sm font-medium text-zinc-900 shadow-sm outline-none transition focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20"
-                    >
-                      <option value="pending">Pending</option>
-                      <option value="picked_up">Picked up</option>
-                      <option value="in_transit">In transit</option>
-                      <option value="delivered">Delivered</option>
-                    </select>
-                  </div>
-                  <div class="sm:col-span-2 lg:col-span-8">
-                    <label
-                      class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
-                      :for="`del-msg-${ord.id}`"
-                      >Message to customer</label
-                    >
-                    <input
-                      :id="`del-msg-${ord.id}`"
-                      v-model="deliveryForms[ord.id].last_message"
-                      type="text"
-                      placeholder="e.g. Rider is 10 minutes away"
-                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-white px-3 py-2 text-sm text-zinc-900 shadow-sm outline-none transition placeholder:text-zinc-400 focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20"
-                    />
-                  </div>
-                  <div class="sm:col-span-1 lg:col-span-3">
-                    <label
-                      class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
-                      :for="`del-lat-${ord.id}`"
-                      >Latitude</label
-                    >
-                    <input
-                      :id="`del-lat-${ord.id}`"
-                      v-model="deliveryForms[ord.id].last_latitude"
-                      type="text"
-                      inputmode="decimal"
-                      placeholder="5.6037"
-                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-white px-3 py-2 font-mono text-sm text-zinc-900 shadow-sm outline-none transition focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20"
-                    />
-                  </div>
-                  <div class="sm:col-span-1 lg:col-span-3">
-                    <label
-                      class="text-[11px] font-semibold uppercase tracking-wide text-zinc-500"
-                      :for="`del-lng-${ord.id}`"
-                      >Longitude</label
-                    >
-                    <input
-                      :id="`del-lng-${ord.id}`"
-                      v-model="deliveryForms[ord.id].last_longitude"
-                      type="text"
-                      inputmode="decimal"
-                      placeholder="-0.1870"
-                      class="mt-1.5 w-full rounded-xl border border-zinc-200/90 bg-white px-3 py-2 font-mono text-sm text-zinc-900 shadow-sm outline-none transition focus:border-teal-400 focus:ring-2 focus:ring-teal-500/20"
-                    />
-                  </div>
+                <div class="flex items-center justify-end gap-3">
+                  <p class="text-[11px] font-medium text-zinc-400">
+                    {{
+                      formatGhs(
+                        selectedOrderItems.reduce(
+                          (sum, it) => sum + it.unitPriceCents * it.quantity,
+                          0,
+                        ),
+                      )
+                    }}
+                  </p>
                 </div>
               </div>
-            </li>
-          </ul>
+            </template>
 
-          <div
-            v-else
-            class="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center"
-          >
+            <!-- Empty detail state -->
             <div
-              class="flex h-12 w-12 items-center justify-center rounded-2xl border border-zinc-200/80 bg-zinc-50 text-zinc-400"
-              aria-hidden="true"
+              v-else
+              class="flex flex-1 flex-col items-center justify-center gap-2 px-6 py-16 text-center"
             >
-              <svg
-                class="h-6 w-6"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                stroke-width="1.5"
+              <div
+                class="flex h-12 w-12 items-center justify-center rounded-2xl border border-zinc-200/80 bg-zinc-50 text-zinc-400"
               >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z"
-                />
-              </svg>
+                <svg
+                  class="h-6 w-6"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  stroke-width="1.5"
+                >
+                  <path
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z"
+                  />
+                </svg>
+              </div>
+              <p class="text-sm font-semibold text-zinc-800">Select an order</p>
+              <p class="max-w-[16rem] text-xs leading-relaxed text-zinc-500">
+                Click any row on the left to view full details here.
+              </p>
             </div>
-            <p class="text-sm font-semibold text-zinc-800">No orders yet</p>
-            <p class="max-w-xs text-xs leading-relaxed text-zinc-500">
-              When buyers check out, each order appears here with delivery tools
-              underneath.
-            </p>
           </div>
         </div>
       </section>
@@ -2308,8 +3145,8 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
               <p
                 class="mt-0.5 text-[11px] font-medium leading-snug text-zinc-500"
               >
-                Subject, status, and when each ticket was opened — newest at
-                the top.
+                Subject, status, and when each ticket was opened — newest at the
+                top.
               </p>
             </div>
             <span
@@ -2393,9 +3230,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
             <footer
               class="shrink-0 border-t border-zinc-200/90 bg-gradient-to-r from-zinc-50/95 to-zinc-100/80 px-4 py-3 sm:px-5"
             >
-              <div
-                class="flex flex-col gap-2 text-xs text-zinc-600 lg:hidden"
-              >
+              <div class="flex flex-col gap-2 text-xs text-zinc-600 lg:hidden">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <span class="font-semibold text-zinc-800">Summary</span>
                   <span class="tabular-nums text-zinc-500"
@@ -2420,8 +3255,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
               <div
                 class="hidden min-w-[44rem] grid-cols-[minmax(0,1.05fr)_7rem_10.25rem_minmax(0,1.15fr)] gap-x-3 text-[11px] lg:grid lg:items-center"
               >
-                <span
-                  class="font-bold uppercase tracking-wider text-zinc-500"
+                <span class="font-bold uppercase tracking-wider text-zinc-500"
                   >Summary</span
                 >
                 <span class="text-zinc-500" aria-hidden="true">—</span>
@@ -2486,6 +3320,148 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
       </section>
 
       <Teleport to="body">
+        <Transition name="del-product-modal">
+          <div
+            v-if="cancelOrderConfirmOpen && selectedOrder"
+            class="fixed inset-0 z-[275] flex items-center justify-center p-4"
+            role="presentation"
+          >
+            <div
+              class="absolute inset-0 bg-zinc-900/50 backdrop-blur-[1px]"
+              aria-hidden="true"
+            />
+            <div
+              class="del-product-dialog relative z-10 w-full max-w-md rounded-3xl border border-zinc-200/80 bg-white p-5 shadow-[0_32px_90px_-28px_rgba(15,23,42,0.4)] sm:p-6"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="cancel-order-modal-title"
+              @click.stop
+            >
+              <div class="flex items-start gap-3">
+                <span
+                  class="mt-0.5 inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-rose-100 text-rose-700"
+                  aria-hidden="true"
+                >
+                  !
+                </span>
+                <div class="min-w-0 flex-1">
+                  <h3
+                    id="cancel-order-modal-title"
+                    class="text-base font-bold tracking-tight text-zinc-900"
+                  >
+                    Cancel this order?
+                  </h3>
+                  <p class="mt-2 text-sm leading-relaxed text-zinc-600">
+                    This will move the order to canceled and notify the buyer of
+                    the update.
+                  </p>
+                </div>
+              </div>
+              <div class="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  class="rounded-2xl border border-zinc-200/80 bg-white px-4 py-2 text-sm font-semibold text-zinc-700 shadow-sm transition hover:bg-zinc-50"
+                  @click="closeCancelOrderModal"
+                >
+                  Keep order
+                </button>
+                <button
+                  type="button"
+                  class="rounded-2xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-rose-700"
+                  @click="confirmCancelSelectedOrder"
+                >
+                  Cancel order
+                </button>
+              </div>
+            </div>
+          </div>
+        </Transition>
+      </Teleport>
+
+      <Teleport to="body">
+        <Transition name="del-product-modal">
+          <div
+            v-if="storeStatusConfirmOpen && store"
+            class="fixed inset-0 z-[274] flex items-center justify-center p-4"
+            role="presentation"
+          >
+            <div
+              class="absolute inset-0 bg-zinc-900/50 backdrop-blur-[1px]"
+              aria-hidden="true"
+            />
+            <div
+              class="del-product-dialog relative z-10 w-full max-w-md rounded-3xl border border-zinc-200/80 bg-white p-5 shadow-[0_32px_90px_-28px_rgba(15,23,42,0.4)] sm:p-6"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="store-status-modal-title"
+            >
+              <div class="flex items-start gap-3">
+                <span
+                  class="mt-0.5 inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-base"
+                  :class="
+                    pendingStoreActiveState
+                      ? 'bg-emerald-100 text-emerald-700'
+                      : 'bg-amber-100 text-amber-700'
+                  "
+                  aria-hidden="true"
+                >
+                  {{ pendingStoreActiveState ? "✓" : "!" }}
+                </span>
+                <div class="min-w-0 flex-1">
+                  <h3
+                    id="store-status-modal-title"
+                    class="text-base font-bold tracking-tight text-zinc-900"
+                  >
+                    {{
+                      pendingStoreActiveState
+                        ? "Activate store link?"
+                        : "Pause store link?"
+                    }}
+                  </h3>
+                  <p class="mt-2 text-sm leading-relaxed text-zinc-600">
+                    {{
+                      pendingStoreActiveState
+                        ? "Customers will be able to open your storefront and place new orders."
+                        : "Customers will not be able to open your storefront or place new orders while paused."
+                    }}
+                  </p>
+                </div>
+              </div>
+              <div class="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  class="rounded-2xl border border-zinc-200/80 bg-white px-4 py-2 text-sm font-semibold text-zinc-700 shadow-sm transition hover:bg-zinc-50 disabled:opacity-50"
+                  :disabled="storeStatusBusy"
+                  @click="closeStoreLinkStatusModal"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  class="rounded-2xl px-4 py-2 text-sm font-semibold text-white shadow-sm transition disabled:opacity-50"
+                  :class="
+                    pendingStoreActiveState
+                      ? 'bg-emerald-700 hover:bg-emerald-800'
+                      : 'bg-zinc-900 hover:bg-zinc-800'
+                  "
+                  :disabled="storeStatusBusy"
+                  @click="confirmStoreLinkStatusChange"
+                >
+                  {{
+                    storeStatusBusy
+                      ? "Saving..."
+                      : pendingStoreActiveState
+                        ? "Activate"
+                        : "Pause"
+                  }}
+                </button>
+              </div>
+            </div>
+          </div>
+        </Transition>
+      </Teleport>
+
+      <Teleport to="body">
         <Transition name="aproduct-modal">
           <div
             v-if="supportTicketModalOpen && store"
@@ -2537,7 +3513,9 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                 class="flex min-h-0 flex-1 flex-col"
                 @submit.prevent="submitSupportTicket"
               >
-                <div class="space-y-4 overflow-y-auto overscroll-y-contain px-5 py-5 sm:px-6">
+                <div
+                  class="space-y-4 overflow-y-auto overscroll-y-contain px-5 py-5 sm:px-6"
+                >
                   <div>
                     <label
                       for="support-ticket-subject"

@@ -9,15 +9,14 @@ import {
   watch,
 } from "vue";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
+import type { RealtimeChannel } from "@supabase/supabase-js";
 import { storeToRefs } from "pinia";
-import {
-  AUTH_SESSION_CONSOLE_ACCESS_PENDING_KEY,
-  useAuthStore,
-} from "../../stores/auth";
+import { useAuthStore } from "../../stores/auth";
 import { useCartStore } from "../../stores/cart";
 import { useUiStore } from "../../stores/ui";
 import CreateStoreModal from "../../components/dashboard/CreateStoreModal.vue";
 import { PRICING_PLANS } from "../../constants/pricingPlans";
+import { copyTextToClipboard } from "../../lib/copyToClipboard";
 import { userDisplayName } from "../../lib/userDisplayName";
 import { getSupabaseBrowser, isSupabaseConfigured } from "../../lib/supabase";
 import { platformConsolePresenceOnlineKey } from "../../lib/consolePresenceInjection";
@@ -25,6 +24,7 @@ import { usePlatformConsolePresence } from "../../composables/usePlatformConsole
 import { useProfileLastSeenHeartbeat } from "../../composables/useProfileLastSeenHeartbeat";
 import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefresh";
 import { useToastStore } from "../../stores/toast";
+import { AUTH_SESSION_CONSOLE_ACCESS_PENDING_KEY } from "../../stores/auth";
 
 const route = useRoute();
 const router = useRouter();
@@ -38,6 +38,9 @@ const {
   adminPendingConsoleGrantCount,
   adminOpenTicketCount,
   sellerConsoleAccessReadyBellCount,
+  sellerNewOrderBellCount,
+  sellerPlatformAnnouncementBellCount,
+  sellerPlatformAnnouncementsPreview,
 } = storeToRefs(ui);
 const toast = useToastStore();
 
@@ -57,35 +60,45 @@ useProfileLastSeenHeartbeat({
   userId: () => authSessionUserId.value,
 });
 
-/** Signed-in user opened /admin but has no admin_roles row: block shell + child routes. */
+/** Signed-in user opened /admin, role is resolved, but account is not super-admin. */
 const adminAccessBlocked = computed(
   () =>
-    isAdminShell.value && auth.isSignedIn && !auth.isPlatformStaff,
+    isAdminShell.value &&
+    auth.isSignedIn &&
+    auth.platformStaffRoleResolved &&
+    !auth.isSuperAdmin,
+);
+watch(
+  adminAccessBlocked,
+  (blocked) => {
+    if (!blocked || !isAdminShell.value) return;
+    void router.replace({ name: "dashboard" });
+  },
+  { immediate: true },
 );
 
-/** Seller hub: `signup_plan` never set on the session user (metadata); mirrors DashboardHome gating. */
-const isSellerSignupPlanUnset = computed(() => {
-  const raw = auth.user?.user_metadata?.signup_plan;
-  return typeof raw !== "string" || !raw.trim();
-});
-
-/** Desktop header: blocked /admin shell, seller without plan metadata, or visited console-access-pending this session. */
-const showHeaderAccountUnderReview = computed(() => {
-  if (adminAccessBlocked.value) return true;
-  /** Console role granted: never show seller “under review” copy (plan/pending flags may still be true). */
-  if (auth.isPlatformStaff) return false;
-  if (isAdminShell.value || !auth.isSignedIn) return false;
-  let pendingConsole = false;
+/** Desktop header: show pending notice only when role is resolved and still not set. */
+const consoleAccessPendingNotice = ref(false);
+const sellerOwnedStoreIds = ref(new Set<string>());
+onMounted(() => {
   try {
-    pendingConsole =
-      typeof sessionStorage !== "undefined" &&
+    consoleAccessPendingNotice.value =
       sessionStorage.getItem(AUTH_SESSION_CONSOLE_ACCESS_PENDING_KEY) === "1";
   } catch {
-    /* private mode */
+    consoleAccessPendingNotice.value = false;
   }
-  return isSellerSignupPlanUnset.value || pendingConsole;
 });
-
+const sellerOwnershipResolved = ref(false);
+const suppressDefaultGreetingUntilOwnershipResolved = computed(() => {
+  if (isAdminShell.value || !auth.isSignedIn) return false;
+  if (!auth.platformStaffRoleResolved) {
+    if (!sellerOwnershipResolved.value) return true;
+    return sellerOwnedStoreIds.value.size > 0;
+  }
+  if (auth.platformAdminRole !== "none") return false;
+  if (consoleAccessPendingNotice.value) return false;
+  return !sellerOwnershipResolved.value;
+});
 const adminShellStaffForTickets = computed(
   () => isAdminShell.value && auth.isPlatformStaff,
 );
@@ -109,11 +122,73 @@ const adminBellBadgeRose = computed(
 
 /** Seller hub: cart + optional "console access granted" bell badge. */
 const sellerHubBellCombinedCount = computed(
-  () => sellerConsoleAccessReadyBellCount.value + cart.itemCount,
+  () =>
+    sellerConsoleAccessReadyBellCount.value +
+    cart.itemCount +
+    sellerNewOrderBellCount.value +
+    sellerPlatformAnnouncementBellCount.value,
 );
 
-const sellerHubBellUsesEmerald = computed(
-  () => sellerConsoleAccessReadyBellCount.value > 0,
+/** Bell badge color priority: console (emerald) → orders (amber) → platform news (indigo) → cart (violet). */
+const sellerHubBellBadgeTone = computed(() => {
+  if (sellerConsoleAccessReadyBellCount.value > 0) return "emerald" as const;
+  if (sellerNewOrderBellCount.value > 0) return "amber" as const;
+  if (sellerPlatformAnnouncementBellCount.value > 0) return "indigo" as const;
+  return "violet" as const;
+});
+const activeBellCount = computed(() =>
+  isAdminShell.value
+    ? adminBellCombinedCount.value
+    : sellerHubBellCombinedCount.value,
+);
+const bellSoundPrimed = ref(false);
+const bellSoundSeenFirstCount = ref(false);
+const bellAudioContextRef = ref<AudioContext | null>(null);
+
+function primeBellSound() {
+  if (bellSoundPrimed.value) return;
+  bellSoundPrimed.value = true;
+  document.removeEventListener("pointerdown", primeBellSound, true);
+  document.removeEventListener("keydown", primeBellSound, true);
+}
+
+function playBellNotificationSound() {
+  if (!bellSoundPrimed.value) return;
+  if (typeof window === "undefined" || document.hidden) return;
+  const Ctx = window.AudioContext;
+  if (!Ctx) return;
+  if (!bellAudioContextRef.value) bellAudioContextRef.value = new Ctx();
+  const ctx = bellAudioContextRef.value;
+  if (!ctx) return;
+  if (ctx.state === "suspended") {
+    void ctx.resume().catch(() => {});
+  }
+  const now = ctx.currentTime;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(1046, now);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(0.075, now + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.22);
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+  osc.start(now);
+  osc.stop(now + 0.24);
+}
+
+watch(
+  activeBellCount,
+  (next, prev) => {
+    if (!bellSoundSeenFirstCount.value) {
+      bellSoundSeenFirstCount.value = true;
+      return;
+    }
+    if ((next ?? 0) > (prev ?? 0)) {
+      playBellNotificationSound();
+    }
+  },
+  { immediate: true },
 );
 
 const adminBellAriaLabel = computed(() => {
@@ -122,6 +197,16 @@ const adminBellAriaLabel = computed(() => {
       const bits: string[] = [];
       if (sellerConsoleAccessReadyBellCount.value > 0) {
         bits.push("platform console access ready");
+      }
+      if (sellerNewOrderBellCount.value > 0) {
+        bits.push(
+          `${sellerNewOrderBellCount.value} active order${sellerNewOrderBellCount.value === 1 ? "" : "s"}`,
+        );
+      }
+      if (sellerPlatformAnnouncementBellCount.value > 0) {
+        bits.push(
+          `${sellerPlatformAnnouncementBellCount.value} unread platform update${sellerPlatformAnnouncementBellCount.value === 1 ? "" : "s"}`,
+        );
       }
       if (cart.itemCount > 0) {
         bits.push(`${cart.itemCount} in cart`);
@@ -134,9 +219,7 @@ const adminBellAriaLabel = computed(() => {
   }
   const parts: string[] = [];
   if (auth.isSuperAdmin && adminPendingConsoleGrantCount.value > 0) {
-    parts.push(
-      `${adminPendingConsoleGrantCount.value} need console access`,
-    );
+    parts.push(`${adminPendingConsoleGrantCount.value} need console access`);
   }
   if (adminOpenTicketCount.value > 0) {
     parts.push(`${adminOpenTicketCount.value} open tickets`);
@@ -148,8 +231,10 @@ const adminBellAriaLabel = computed(() => {
 watch(
   adminShellStaffForTickets,
   (on) => {
-    if (on) void ui.refreshAdminOpenTicketCount();
-    else ui.setAdminOpenTicketCount(0);
+    if (on) {
+      void ui.refreshAdminOpenTicketCount();
+      if (auth.isSuperAdmin) void ui.refreshAdminPendingConsoleGrantCount();
+    } else ui.setAdminOpenTicketCount(0);
   },
   { immediate: true },
 );
@@ -163,6 +248,114 @@ useRealtimeTableRefresh({
     void ui.refreshAdminOpenTicketCount();
   },
 });
+
+useRealtimeTableRefresh({
+  channelName: "layout-admin-pending-console-grants",
+  deps: adminShellStaffForTickets,
+  debounceMs: 250,
+  getTables: () =>
+    adminShellStaffForTickets.value && auth.isSuperAdmin
+      ? [{ table: "profiles" }, { table: "admin_roles" }, { table: "stores" }]
+      : [],
+  onEvent: () => {
+    if (!auth.isSuperAdmin) return;
+    void ui.refreshAdminPendingConsoleGrantCount();
+  },
+});
+
+let sellerOrderBellChannel: RealtimeChannel | null = null;
+
+/** order_status values that still need seller attention (not delivered / canceled). */
+const SELLER_BELL_OPEN_ORDER_STATUSES = [
+  "pending",
+  "confirmed",
+  "preparing",
+  "out_for_delivery",
+] as const;
+
+function teardownSellerOrderBellChannel() {
+  if (sellerOrderBellChannel && isSupabaseConfigured()) {
+    void getSupabaseBrowser().removeChannel(sellerOrderBellChannel);
+  }
+  sellerOrderBellChannel = null;
+}
+
+async function refreshSellerOwnedStoreIds(ownerId: string) {
+  if (!isSupabaseConfigured()) return;
+  const { data, error } = await getSupabaseBrowser()
+    .from("stores")
+    .select("id")
+    .eq("owner_id", ownerId);
+  if (error) return;
+  sellerOwnedStoreIds.value = new Set(
+    (data ?? []).map((r) => r.id as string).filter(Boolean),
+  );
+}
+
+async function refreshSellerOrderBellCount() {
+  if (!isSupabaseConfigured()) return;
+  const ids = [...sellerOwnedStoreIds.value];
+  if (ids.length === 0) {
+    ui.setSellerNewOrderBellCount(0);
+    return;
+  }
+  const { count, error } = await getSupabaseBrowser()
+    .from("orders")
+    .select("id", { count: "exact", head: true })
+    .in("store_id", ids)
+    .in("status", [...SELLER_BELL_OPEN_ORDER_STATUSES]);
+  if (error) return;
+  ui.setSellerNewOrderBellCount(count ?? 0);
+}
+
+watch(
+  () =>
+    ({
+      admin: isAdminShell.value,
+      signed: auth.isSignedIn,
+      uid: authSessionUserId.value,
+    }) as const,
+  async ({ admin, signed, uid }) => {
+    teardownSellerOrderBellChannel();
+    sellerOwnedStoreIds.value = new Set();
+    sellerOwnershipResolved.value = false;
+    if (admin || !signed || !uid || !isSupabaseConfigured()) {
+      ui.clearSellerNewOrderBellCount();
+      sellerOwnershipResolved.value = true;
+      return;
+    }
+
+    await refreshSellerOwnedStoreIds(uid);
+    sellerOwnershipResolved.value = true;
+    await refreshSellerOrderBellCount();
+    const sb = getSupabaseBrowser();
+    const ch = sb
+      .channel(`layout-seller-order-bell:${uid}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "orders" },
+        () => {
+          void refreshSellerOrderBellCount();
+        },
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "*",
+          schema: "public",
+          table: "stores",
+          filter: `owner_id=eq.${uid}`,
+        },
+        async () => {
+          await refreshSellerOwnedStoreIds(uid);
+          await refreshSellerOrderBellCount();
+        },
+      );
+    void ch.subscribe();
+    sellerOrderBellChannel = ch;
+  },
+  { immediate: true },
+);
 
 const avatarFileInput = ref<HTMLInputElement | null>(null);
 
@@ -240,6 +433,12 @@ function toggleNotificationsPanel() {
   notificationsOpen.value = !notificationsOpen.value;
   if (notificationsOpen.value) {
     closeAccountMenu();
+    if (!isAdminShell.value && authSessionUserId.value) {
+      void refreshSellerOrderBellCount();
+      if (sellerPlatformAnnouncementBellCount.value > 0) {
+        ui.markSellerPlatformAnnouncementsRead(authSessionUserId.value);
+      }
+    }
     void nextTick(() => layoutNotificationsPanel());
   }
 }
@@ -281,6 +480,15 @@ function openCartFromNotifications() {
   ui.openCart();
 }
 
+function goToSellerCustomerOrdersFromNotifications() {
+  closeNotificationsPanel();
+  void router.push({ name: "dashboard", hash: "#seller-customer-orders" });
+}
+
+function dismissSellerNewOrderBellFromNotifications() {
+  closeNotificationsPanel();
+}
+
 function openPlatformConsoleFromSellerNotification() {
   ui.clearSellerConsoleAccessReadyBell();
   closeNotificationsPanel();
@@ -298,12 +506,9 @@ function toggleAccountMenu() {
 async function copyAccountEmail() {
   const e = auth.user?.email;
   if (!e) return;
-  try {
-    await navigator.clipboard.writeText(e);
-    toast.success("Email copied to clipboard.");
-  } catch {
-    toast.error("Unable to copy. Select the email and copy manually.");
-  }
+  const ok = await copyTextToClipboard(e);
+  if (ok) toast.success("Email copied to clipboard.");
+  else toast.error("Unable to copy. Select the email and copy manually.");
 }
 
 function layoutAccountMenuPanel() {
@@ -399,20 +604,31 @@ onMounted(() => {
   void auth.refreshSuperAdminRole();
   document.addEventListener("pointerdown", onShellPointerDownCapture, true);
   document.addEventListener("visibilitychange", onVisibilityRefreshSellerRole);
+  document.addEventListener("pointerdown", primeBellSound, true);
+  document.addEventListener("keydown", primeBellSound, true);
   window.addEventListener("resize", onWindowRepositionMenu);
   window.addEventListener("scroll", onWindowRepositionMenu, true);
   window.addEventListener("keydown", onGlobalKeydown);
 });
 
 onBeforeUnmount(() => {
+  teardownSellerOrderBellChannel();
   document.removeEventListener("pointerdown", onShellPointerDownCapture, true);
   document.removeEventListener(
     "visibilitychange",
     onVisibilityRefreshSellerRole,
   );
+  document.removeEventListener("pointerdown", primeBellSound, true);
+  document.removeEventListener("keydown", primeBellSound, true);
   window.removeEventListener("resize", onWindowRepositionMenu);
   window.removeEventListener("scroll", onWindowRepositionMenu, true);
   window.removeEventListener("keydown", onGlobalKeydown);
+  try {
+    bellAudioContextRef.value?.close();
+  } catch {
+    /* noop */
+  }
+  bellAudioContextRef.value = null;
   if (sellerRolePollTimer) {
     clearInterval(sellerRolePollTimer);
     sellerRolePollTimer = null;
@@ -435,7 +651,7 @@ watch(
     closeAccountMenu();
     closeNotificationsPanel();
     closeSignOutConfirm();
-    ui.closeCreateStoreModal();
+    if (!ui.createStoreModalForced) ui.closeCreateStoreModal();
   },
 );
 
@@ -484,7 +700,14 @@ function onVisibilityRefreshSellerRole() {
   }
 }
 
-type ShellNavIcon = "grid" | "plus" | "cog" | "megaphone" | "ticket";
+type ShellNavIcon =
+  | "grid"
+  | "plus"
+  | "palette"
+  | "cog"
+  | "megaphone"
+  | "ticket"
+  | "shield";
 
 type ShellNavItem = {
   to: string;
@@ -514,6 +737,14 @@ const sellerNavItems: ShellNavItem[] = [
     icon: "plus",
     action: "create-store-modal",
   },
+  {
+    to: "/dashboard/themes",
+    key: "seller-theme",
+    routeName: "dashboard-themes",
+    label: "Theme settings",
+    short: "Theme",
+    icon: "palette",
+  },
 ];
 
 const adminNavItems: ShellNavItem[] = [
@@ -524,6 +755,14 @@ const adminNavItems: ShellNavItem[] = [
     label: "Overview",
     short: "Home",
     icon: "grid",
+  },
+  {
+    to: "/admin/settings",
+    key: "admin-settings",
+    routeName: "admin-settings",
+    label: "Settings",
+    short: "Settings",
+    icon: "cog",
   },
   {
     to: "/admin/announcements",
@@ -540,6 +779,14 @@ const adminNavItems: ShellNavItem[] = [
     label: "Tickets",
     short: "Tix",
     icon: "ticket",
+  },
+  {
+    to: "/admin/verifications",
+    key: "admin-verifications",
+    routeName: "admin-verifications",
+    label: "Verifications",
+    short: "KYC",
+    icon: "shield",
   },
 ];
 
@@ -605,6 +852,9 @@ const headerLine = computed(() => {
     if (route.name === "admin-tickets") {
       return "Seller and buyer support requests.";
     }
+    if (route.name === "admin-verifications") {
+      return "Mandatory seller identity verification approvals.";
+    }
     return "Platform administration.";
   }
   if (ui.createStoreModalOpen) {
@@ -635,6 +885,7 @@ const platformRoleBadgeClass = computed(() =>
 
 /** Earliest `current_period_end` among this user's active/trialing shop subs (matches DashboardHome renewal guard). */
 const headerSellerSubscriptionRenewalEnd = ref<string | null>(null);
+const firstStoreGateBusy = ref(false);
 
 function formatHeaderSubscriptionPeriodEnd(iso: string): string {
   const d = new Date(iso);
@@ -704,6 +955,57 @@ watch(
   },
   { immediate: true },
 );
+
+async function enforceFirstStoreGate() {
+  if (firstStoreGateBusy.value) return;
+  if (!isSupabaseConfigured()) return;
+  if (!auth.isSignedIn || auth.isPlatformStaff || isAdminShell.value) return;
+  if (!authSessionUserId.value) return;
+  if (route.name === "dashboard-store-new") return;
+  firstStoreGateBusy.value = true;
+  try {
+    const supabase = getSupabaseBrowser();
+    const [
+      { count: ownedCount, error: ownedErr },
+      { count: adminCount, error: adminErr },
+    ] = await Promise.all([
+      supabase
+        .from("stores")
+        .select("id", { count: "exact", head: true })
+        .eq("owner_id", authSessionUserId.value),
+      supabase
+        .from("store_admins")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", authSessionUserId.value),
+    ]);
+    const count = ownedCount ?? 0;
+    const assigned = adminCount ?? 0;
+    const error = ownedErr ?? adminErr;
+    if (!error && count === 0 && assigned === 0) {
+      ui.setCreateStoreModalForced(true);
+      if (!ui.createStoreModalOpen) ui.openCreateStoreModal();
+    } else if (!error) {
+      ui.setCreateStoreModalForced(false);
+    }
+  } finally {
+    firstStoreGateBusy.value = false;
+  }
+}
+
+watch(
+  () =>
+    [
+      auth.isSignedIn,
+      authSessionUserId.value,
+      route.name,
+      route.fullPath,
+      isAdminShell.value,
+    ] as const,
+  () => {
+    void enforceFirstStoreGate();
+  },
+  { immediate: true },
+);
 </script>
 
 <template>
@@ -739,10 +1041,15 @@ watch(
     >
       <div class="flex items-center justify-between gap-3">
         <div
-          class="pointer-events-none flex h-11 w-11 shrink-0 select-none items-center justify-center rounded-2xl bg-zinc-900 text-[10px] font-extrabold tracking-tight text-lime-200 shadow-lg shadow-zinc-900/20"
+          class="pointer-events-none flex h-11 w-11 shrink-0 select-none items-center justify-center rounded-2xl bg-transparent p-0 shadow-lg shadow-zinc-900/20"
           aria-hidden="true"
         >
-          U&amp;I
+          <img
+            src="/src/assets/logo/uanditech.png"
+            alt=""
+            class="h-full w-full rounded-xl object-cover"
+            aria-hidden="true"
+          />
         </div>
         <p
           class="min-w-0 flex-1 text-center text-[11px] font-bold uppercase tracking-[0.2em] text-zinc-400"
@@ -852,10 +1159,15 @@ watch(
       class="relative z-30 hidden w-[4.75rem] flex-col gap-1 border border-white/80 bg-[#e9ecf8]/95 py-6 shadow-[0_24px_60px_-28px_rgba(15,23,42,0.18)] backdrop-blur-xl md:fixed md:left-4 md:top-4 md:flex md:h-[calc(100svh-2rem)] md:max-h-[calc(100svh-2rem)] md:overflow-y-auto md:rounded-[1.875rem]"
     >
       <div
-        class="pointer-events-none mx-auto flex h-12 w-12 select-none items-center justify-center rounded-2xl bg-zinc-900 text-[10px] font-extrabold tracking-tight text-lime-200 shadow-lg shadow-zinc-900/25 ring-1 ring-zinc-800/40"
+        class="pointer-events-none mx-auto flex h-12 w-12 select-none items-center justify-center rounded-2xl bg-transparent p-0 shadow-lg shadow-zinc-900/25"
         aria-hidden="true"
       >
-        U&amp;I
+        <img
+          src="/src/assets/logo/uanditech.png"
+          alt=""
+          class="h-full w-full rounded-xl object-cover"
+          aria-hidden="true"
+        />
       </div>
 
       <nav class="mt-8 flex flex-col items-center gap-2.5 px-2">
@@ -931,6 +1243,20 @@ watch(
               />
             </svg>
             <svg
+              v-else-if="item.icon === 'palette'"
+              class="h-6 w-6"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path
+                d="M12 21a9 9 0 1 1 0-18 9 9 0 0 1 0 18Zm0-16a7 7 0 1 0 0 14h.5a1.5 1.5 0 0 0 0-3H12a2.5 2.5 0 0 1 0-5h4a2 2 0 0 0 0-4h-4Z"
+              />
+            </svg>
+            <svg
               v-else-if="item.icon === 'cog'"
               class="h-6 w-6"
               fill="none"
@@ -979,6 +1305,21 @@ watch(
               <path d="M13 5v2" />
               <path d="M13 17v2" />
               <path d="M13 11v2" />
+            </svg>
+            <svg
+              v-else-if="item.icon === 'shield'"
+              class="h-6 w-6"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path
+                d="M12 3 4.5 6v6c0 5.2 3.4 8.8 7.5 10 4.1-1.2 7.5-4.8 7.5-10V6L12 3z"
+              />
+              <path d="m9.5 12 1.8 1.8L14.8 10.3" />
             </svg>
           </RouterLink>
         </template>
@@ -1046,7 +1387,12 @@ watch(
                 />
                 <button
                   type="button"
-                  class="group relative flex h-[4.5rem] w-[4.5rem] shrink-0 items-center justify-center overflow-hidden rounded-2xl border-2 border-white bg-gradient-to-br from-violet-500 to-indigo-600 text-white shadow-lg shadow-indigo-900/25 ring-2 ring-indigo-200/80 transition hover:ring-indigo-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 sm:h-[5.25rem] sm:w-[5.25rem] sm:rounded-[1.35rem] md:h-24 md:w-24 lg:h-[6.75rem] lg:w-[6.75rem] lg:rounded-3xl"
+                  class="group relative flex h-[4.5rem] w-[4.5rem] shrink-0 items-center justify-center overflow-hidden rounded-2xl border-2 border-white text-white shadow-lg shadow-indigo-900/25 ring-2 ring-indigo-200/80 transition hover:ring-indigo-300 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 sm:h-[5.25rem] sm:w-[5.25rem] sm:rounded-[1.35rem] md:h-24 md:w-24 lg:h-[6.75rem] lg:w-[6.75rem] lg:rounded-3xl"
+                  :class="
+                    auth.profileAvatarPublicUrl
+                      ? 'bg-white'
+                      : 'bg-gradient-to-br from-violet-500 to-indigo-600'
+                  "
                   :title="
                     auth.profileAvatarPublicUrl
                       ? 'Change profile photo'
@@ -1059,7 +1405,7 @@ watch(
                     v-if="auth.profileAvatarPublicUrl"
                     :src="auth.profileAvatarPublicUrl"
                     alt=""
-                    class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]"
+                    class="h-full w-full bg-white object-cover transition duration-300 group-hover:scale-[1.03]"
                     @error="onHeaderAvatarImageError"
                   />
                   <span
@@ -1094,20 +1440,9 @@ watch(
                 </button>
               </div>
               <div class="min-w-0 flex-1 pt-0.5">
-                <template v-if="showHeaderAccountUnderReview">
-                  <h1
-                    class="text-pretty text-2xl font-bold tracking-tight text-red-800 sm:text-[1.65rem]"
-                  >
-                    Your account is under review
-                  </h1>
-                  <p
-                    class="mt-1.5 max-w-xl text-sm font-medium leading-relaxed text-red-700"
-                  >
-                    This usually takes less than an hour. Please wait—we will
-                    notify you as soon as your access is ready.
-                  </p>
-                </template>
-                <template v-else>
+                <template
+                  v-if="!suppressDefaultGreetingUntilOwnershipResolved"
+                >
                   <h1
                     class="text-pretty text-2xl font-bold tracking-tight text-zinc-900 sm:text-[1.65rem]"
                   >
@@ -1116,6 +1451,9 @@ watch(
                   <p class="mt-1.5 text-sm leading-relaxed text-zinc-500">
                     {{ headerLine }}
                   </p>
+                </template>
+                <template v-else>
+                  <div class="h-14" aria-hidden="true" />
                 </template>
                 <p
                   v-if="
@@ -1241,23 +1579,29 @@ watch(
                       adminBellCombinedCount > 0
                     "
                     class="absolute -right-0.5 -top-0.5 flex h-5 min-w-5 items-center justify-center rounded-full px-1 text-[10px] font-bold text-white shadow-sm ring-2 ring-white"
-                    :class="
-                      adminBellBadgeRose ? 'bg-rose-500' : 'bg-amber-500'
-                    "
+                    :class="adminBellBadgeRose ? 'bg-rose-500' : 'bg-amber-500'"
                     >{{
                       adminBellCombinedCount > 9 ? "9+" : adminBellCombinedCount
-                    }}</span>
+                    }}</span
+                  >
                   <span
                     v-else-if="!isAdminShell && sellerHubBellCombinedCount > 0"
                     class="absolute -right-0.5 -top-0.5 flex h-5 min-w-5 items-center justify-center rounded-full px-1 text-[10px] font-bold text-white shadow-sm ring-2 ring-white"
                     :class="
-                      sellerHubBellUsesEmerald ? 'bg-emerald-500' : 'bg-violet-500'
+                      sellerHubBellBadgeTone === 'emerald'
+                        ? 'bg-emerald-500'
+                        : sellerHubBellBadgeTone === 'amber'
+                          ? 'bg-amber-500'
+                          : sellerHubBellBadgeTone === 'indigo'
+                            ? 'bg-indigo-500'
+                            : 'bg-violet-500'
                     "
                     >{{
                       sellerHubBellCombinedCount > 9
                         ? "9+"
                         : sellerHubBellCombinedCount
-                    }}</span>
+                    }}</span
+                  >
                 </button>
 
                 <Teleport to="body">
@@ -1284,111 +1628,92 @@ watch(
                           </h2>
                         </div>
 
-                        <div class="space-y-2 p-3 sm:p-4">
-                          <div
+                        <div class="divide-y divide-zinc-200/90 bg-zinc-50/80">
+                          <button
                             v-if="
                               isAdminShell &&
                               auth.isSuperAdmin &&
                               adminPendingConsoleGrantCount > 0
                             "
-                            class="rounded-xl border border-zinc-200/80 border-l-[3px] border-l-rose-500 bg-white px-3 py-2.5 shadow-sm sm:px-3.5 sm:py-3"
+                            type="button"
+                            class="flex w-full cursor-pointer items-start gap-3.5 px-4 py-3.5 text-left transition hover:bg-zinc-100/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-400/35 sm:px-5 sm:py-4"
+                            @click="goToGrantAccessFromNotifications"
                           >
-                            <div class="flex items-start gap-2.5">
-                              <span
-                                class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-rose-50 text-rose-600 ring-1 ring-rose-100"
-                                aria-hidden="true"
+                            <span
+                              class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-rose-50 text-rose-600 ring-1 ring-rose-100/90"
+                              aria-hidden="true"
+                            >
+                              <svg
+                                class="h-5 w-5"
+                                fill="none"
+                                viewBox="0 0 24 24"
+                                stroke="currentColor"
+                                stroke-width="1.75"
                               >
-                                <svg
-                                  class="h-4 w-4"
-                                  fill="none"
-                                  viewBox="0 0 24 24"
-                                  stroke="currentColor"
-                                  stroke-width="1.75"
-                                >
-                                  <path
-                                    stroke-linecap="round"
-                                    stroke-linejoin="round"
-                                    d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.433-2.554M19.128 15l2.023 2.023M4.875 19.125a9.38 9.38 0 01-2.625-.372m0 0a9.343 9.343 0 01-4.122-.952M4.875 15l-2.023 2.023M12 12h.008v.008H12V12z"
-                                  />
-                                </svg>
-                              </span>
-                              <div class="min-w-0 flex-1">
-                                <p
-                                  class="text-sm font-semibold leading-tight text-zinc-900"
-                                >
-                                  Console access
-                                </p>
-                                <p class="mt-0.5 text-xs leading-snug text-zinc-600">
-                                  <template
-                                    v-if="adminPendingConsoleGrantCount === 1"
-                                  >
-                                    1 account needs a role.
-                                  </template>
-                                  <template v-else>
-                                    {{ adminPendingConsoleGrantCount }}
-                                    accounts need roles.
-                                  </template>
-                                </p>
-                                <button
-                                  type="button"
-                                  class="mt-2 w-full rounded-lg bg-rose-600 px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-rose-500"
-                                  @click="goToGrantAccessFromNotifications"
-                                >
-                                  Grant access
-                                </button>
-                              </div>
-                            </div>
-                          </div>
+                                <path
+                                  stroke-linecap="round"
+                                  stroke-linejoin="round"
+                                  d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.433-2.554M19.128 15l2.023 2.023M4.875 19.125a9.38 9.38 0 01-2.625-.372m0 0a9.343 9.343 0 01-4.122-.952M4.875 15l-2.023 2.023M12 12h.008v.008H12V12z"
+                                />
+                              </svg>
+                            </span>
+                            <p
+                              class="min-w-0 flex-1 pt-0.5 text-[13px] leading-snug text-zinc-500 sm:text-sm"
+                            >
+                              <span class="font-bold text-zinc-900"
+                                >Console access</span
+                              >{{ " " }}
+                              <template
+                                v-if="adminPendingConsoleGrantCount === 1"
+                              >
+                                1 account needs a role.
+                              </template>
+                              <template v-else>
+                                {{ adminPendingConsoleGrantCount }} accounts
+                                need roles.
+                              </template>
+                            </p>
+                          </button>
 
-                          <div
+                          <button
                             v-if="
                               isAdminShell &&
                               auth.isPlatformStaff &&
                               adminOpenTicketCount > 0
                             "
-                            class="rounded-xl border border-zinc-200/80 border-l-[3px] border-l-amber-500 bg-white px-3 py-2.5 shadow-sm sm:px-3.5 sm:py-3"
+                            type="button"
+                            class="flex w-full cursor-pointer items-start gap-3.5 px-4 py-3.5 text-left transition hover:bg-zinc-100/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-400/35 sm:px-5 sm:py-4"
+                            @click="goToTicketsFromNotifications"
                           >
-                            <div class="flex items-start gap-2.5">
-                              <span
-                                class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-amber-50 text-amber-600 ring-1 ring-amber-100"
-                                aria-hidden="true"
+                            <span
+                              class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-amber-50 text-amber-600 ring-1 ring-amber-100/90"
+                              aria-hidden="true"
+                            >
+                              <svg
+                                class="h-5 w-5"
+                                fill="none"
+                                viewBox="0 0 24 24"
+                                stroke="currentColor"
+                                stroke-width="2"
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
                               >
-                                <svg
-                                  class="h-4 w-4"
-                                  fill="none"
-                                  viewBox="0 0 24 24"
-                                  stroke="currentColor"
-                                  stroke-width="2"
-                                  stroke-linecap="round"
-                                  stroke-linejoin="round"
-                                >
-                                  <path
-                                    d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"
-                                  />
-                                  <path d="M13 5v2" />
-                                  <path d="M13 17v2" />
-                                  <path d="M13 11v2" />
-                                </svg>
-                              </span>
-                              <div class="min-w-0 flex-1">
-                                <p
-                                  class="text-sm font-semibold leading-tight text-zinc-900"
-                                >
-                                  Support tickets
-                                </p>
-                                <p class="mt-0.5 text-xs leading-snug text-zinc-600">
-                                  {{ adminOpenTicketCount }} open.
-                                </p>
-                                <button
-                                  type="button"
-                                  class="mt-2 w-full rounded-lg bg-amber-600 px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-amber-500"
-                                  @click="goToTicketsFromNotifications"
-                                >
-                                  View tickets
-                                </button>
-                              </div>
-                            </div>
-                          </div>
+                                <path
+                                  d="M2 9a3 3 0 0 1 0 6v2a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-2a3 3 0 0 1 0-6V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z"
+                                />
+                                <path d="M13 5v2" />
+                                <path d="M13 17v2" />
+                                <path d="M13 11v2" />
+                              </svg>
+                            </span>
+                            <p
+                              class="min-w-0 flex-1 pt-0.5 text-[13px] leading-snug text-zinc-500 sm:text-sm"
+                            >
+                              <span class="font-bold text-zinc-900"
+                                >Support tickets</span
+                              >{{ " " }}{{ adminOpenTicketCount }} open.
+                            </p>
+                          </button>
 
                           <div
                             v-if="
@@ -1396,70 +1721,64 @@ watch(
                               auth.isPlatformStaff &&
                               adminBellCombinedCount === 0
                             "
-                            class="rounded-xl border border-dashed border-zinc-200 bg-zinc-50/70 px-3 py-5 text-center"
+                            class="px-4 py-8 text-center sm:px-5"
                           >
-                            <p class="text-sm text-zinc-600">Nothing new.</p>
+                            <p class="text-sm text-zinc-500">Nothing new.</p>
                           </div>
 
-                          <div
+                          <button
                             v-if="
                               !isAdminShell &&
                               auth.isPlatformStaff &&
                               sellerConsoleAccessReadyBellCount > 0
                             "
-                            class="rounded-xl border border-zinc-200/80 border-l-[3px] border-l-emerald-500 bg-white px-3 py-2.5 shadow-sm sm:px-3.5 sm:py-3"
+                            type="button"
+                            class="flex w-full cursor-pointer items-start gap-3.5 px-4 py-3.5 text-left transition hover:bg-zinc-100/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-400/35 sm:px-5 sm:py-4"
+                            @click="openPlatformConsoleFromSellerNotification"
                           >
-                            <div class="flex items-start gap-2.5">
-                              <span
-                                class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100"
-                                aria-hidden="true"
+                            <span
+                              class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-emerald-50 text-emerald-600 ring-1 ring-emerald-100/90"
+                              aria-hidden="true"
+                            >
+                              <svg
+                                class="h-5 w-5"
+                                fill="none"
+                                viewBox="0 0 24 24"
+                                stroke="currentColor"
+                                stroke-width="2"
                               >
-                                <svg
-                                  class="h-4 w-4"
-                                  fill="none"
-                                  viewBox="0 0 24 24"
-                                  stroke="currentColor"
-                                  stroke-width="2"
-                                >
-                                  <path
-                                    stroke-linecap="round"
-                                    stroke-linejoin="round"
-                                    d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-                                  />
-                                </svg>
-                              </span>
-                              <div class="min-w-0 flex-1">
-                                <p
-                                  class="text-sm font-semibold leading-tight text-zinc-900"
-                                >
-                                  Platform console access
-                                </p>
-                                <p class="mt-0.5 text-xs leading-snug text-zinc-600">
-                                  Your account now has a console role. Open the
-                                  platform admin workspace when you are ready.
-                                </p>
-                                <button
-                                  type="button"
-                                  class="mt-2 w-full rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-emerald-500"
-                                  @click="openPlatformConsoleFromSellerNotification"
-                                >
-                                  Open platform console
-                                </button>
-                              </div>
-                            </div>
-                          </div>
+                                <path
+                                  stroke-linecap="round"
+                                  stroke-linejoin="round"
+                                  d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+                                />
+                              </svg>
+                            </span>
+                            <p
+                              class="min-w-0 flex-1 pt-0.5 text-[13px] leading-snug text-zinc-500 sm:text-sm"
+                            >
+                              <span class="font-bold text-zinc-900"
+                                >Platform console</span
+                              >{{ " " }}Your account now has a console role.
+                              Open the platform admin workspace when you are
+                              ready.
+                            </p>
+                          </button>
 
                           <div
-                            v-if="!isAdminShell && cart.itemCount > 0"
-                            class="rounded-xl border border-zinc-200/80 border-l-[3px] border-l-violet-500 bg-white px-3 py-2.5 shadow-sm sm:px-3.5 sm:py-3"
+                            v-if="
+                              !isAdminShell &&
+                              sellerPlatformAnnouncementsPreview.length > 0
+                            "
+                            class="px-4 py-3.5 sm:px-5 sm:py-4"
                           >
-                            <div class="flex items-start gap-2.5">
+                            <div class="flex items-start gap-3.5">
                               <span
-                                class="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-50 text-violet-600 ring-1 ring-violet-100"
+                                class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-indigo-50 text-indigo-600 ring-1 ring-indigo-100/90"
                                 aria-hidden="true"
                               >
                                 <svg
-                                  class="h-4 w-4"
+                                  class="h-5 w-5"
                                   fill="none"
                                   viewBox="0 0 24 24"
                                   stroke="currentColor"
@@ -1468,37 +1787,145 @@ watch(
                                   <path
                                     stroke-linecap="round"
                                     stroke-linejoin="round"
-                                    d="M15.75 10.5V6a3.75 3.75 0 10-7.5 0v4.5m11.356-1.993l1.263 12c.07.665-.45 1.243-1.119 1.243H4.25a1.125 1.125 0 01-1.12-1.243l1.264-12A1.125 1.125 0 015.513 6.75h12.974c.576 0 1.059.435 1.119 1.007z"
+                                    d="M11 6a13 13 0 0 0 8.4-2.8A1 1 0 0 1 21 4v12a1 1 0 0 1-1.6.8A13 13 0 0 0 11 14H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2z"
+                                  />
+                                  <path
+                                    stroke-linecap="round"
+                                    stroke-linejoin="round"
+                                    d="M6 14a12 12 0 0 0 2.4 7.2 2 2 0 0 0 3.2-2.4A8 8 0 0 1 10 14"
                                   />
                                 </svg>
                               </span>
-                              <div class="min-w-0 flex-1">
+                              <div class="min-w-0 flex-1 pt-0.5">
                                 <p
-                                  class="text-sm font-semibold leading-tight text-zinc-900"
+                                  class="text-[13px] font-bold leading-snug text-zinc-900 sm:text-sm"
                                 >
-                                  Cart
+                                  Platform news
                                 </p>
-                                <p class="mt-0.5 text-xs leading-snug text-zinc-600">
-                                  {{ cart.itemCount }} item{{
-                                    cart.itemCount === 1 ? "" : "s"
-                                  }}.
-                                </p>
-                                <button
-                                  type="button"
-                                  class="mt-2 w-full rounded-lg bg-violet-600 px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-violet-500"
-                                  @click="openCartFromNotifications"
+                                <p
+                                  class="mt-0.5 text-[11px] leading-relaxed text-zinc-500"
                                 >
-                                  Open cart
-                                </button>
+                                  From the U&amp;I Tech team — newest first.
+                                </p>
+                                <div
+                                  class="mt-3 max-h-64 space-y-2.5 overflow-y-auto overscroll-y-contain pr-0.5"
+                                >
+                                  <div
+                                    v-for="a in sellerPlatformAnnouncementsPreview"
+                                    :key="a.id"
+                                    class="rounded-xl border border-zinc-100/90 bg-white px-3 py-2.5 shadow-sm"
+                                  >
+                                    <p class="text-sm font-semibold text-zinc-900">
+                                      {{ a.title }}
+                                    </p>
+                                    <p
+                                      class="mt-1 text-xs leading-relaxed text-zinc-600 whitespace-pre-wrap"
+                                    >
+                                      {{ a.message }}
+                                    </p>
+                                  </div>
+                                </div>
                               </div>
                             </div>
                           </div>
 
                           <div
-                            v-if="!isAdminShell && sellerHubBellCombinedCount === 0"
-                            class="rounded-xl border border-dashed border-zinc-200 bg-zinc-50/70 px-3 py-5 text-center"
+                            v-if="!isAdminShell && sellerNewOrderBellCount > 0"
+                            class="flex items-start gap-3.5 px-4 py-3.5 sm:px-5 sm:py-4"
                           >
-                            <p class="text-sm text-zinc-600">Nothing new.</p>
+                            <span
+                              class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-amber-50 text-amber-600 ring-1 ring-amber-100/90"
+                              aria-hidden="true"
+                            >
+                              <svg
+                                class="h-5 w-5"
+                                fill="none"
+                                viewBox="0 0 24 24"
+                                stroke="currentColor"
+                                stroke-width="1.75"
+                              >
+                                <path
+                                  stroke-linecap="round"
+                                  stroke-linejoin="round"
+                                  d="M20.25 7.5l-.416 9.563A1.125 1.125 0 0118.873 18H5.127a1.125 1.125 0 01-1.109-.937L3.75 7.5M10 11.25h4M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z"
+                                />
+                              </svg>
+                            </span>
+                            <div class="min-w-0 flex-1 pt-0.5">
+                              <button
+                                type="button"
+                                class="w-full cursor-pointer rounded-md text-left text-[13px] leading-snug text-zinc-500 transition hover:bg-zinc-100/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/35 sm:text-sm"
+                                @click="
+                                  goToSellerCustomerOrdersFromNotifications
+                                "
+                              >
+                                <span class="font-bold text-zinc-900"
+                                  >Active orders</span
+                                >{{ " " }}
+                                <template v-if="sellerNewOrderBellCount === 1">
+                                  1 order is not delivered or canceled yet.
+                                  Update status under Orders from Customers.
+                                </template>
+                                <template v-else>
+                                  {{ sellerNewOrderBellCount }} orders are not
+                                  delivered or canceled yet. Update status under
+                                  Orders from Customers.
+                                </template>
+                              </button>
+                              <button
+                                type="button"
+                                class="mt-1.5 block w-full cursor-pointer rounded-md px-0 py-0.5 text-left text-xs font-medium text-zinc-500 underline decoration-zinc-300 underline-offset-2 transition hover:text-zinc-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/35"
+                                @click="
+                                  dismissSellerNewOrderBellFromNotifications
+                                "
+                              >
+                                Dismiss
+                              </button>
+                            </div>
+                          </div>
+
+                          <button
+                            v-if="!isAdminShell && cart.itemCount > 0"
+                            type="button"
+                            class="flex w-full cursor-pointer items-start gap-3.5 px-4 py-3.5 text-left transition hover:bg-zinc-100/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-400/35 sm:px-5 sm:py-4"
+                            @click="openCartFromNotifications"
+                          >
+                            <span
+                              class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-violet-50 text-violet-600 ring-1 ring-violet-100/90"
+                              aria-hidden="true"
+                            >
+                              <svg
+                                class="h-5 w-5"
+                                fill="none"
+                                viewBox="0 0 24 24"
+                                stroke="currentColor"
+                                stroke-width="1.75"
+                              >
+                                <path
+                                  stroke-linecap="round"
+                                  stroke-linejoin="round"
+                                  d="M15.75 10.5V6a3.75 3.75 0 10-7.5 0v4.5m11.356-1.993l1.263 12c.07.665-.45 1.243-1.119 1.243H4.25a1.125 1.125 0 01-1.12-1.243l1.264-12A1.125 1.125 0 015.513 6.75h12.974c.576 0 1.059.435 1.119 1.007z"
+                                />
+                              </svg>
+                            </span>
+                            <p
+                              class="min-w-0 flex-1 pt-0.5 text-[13px] leading-snug text-zinc-500 sm:text-sm"
+                            >
+                              <span class="font-bold text-zinc-900">Cart</span
+                              >{{ " " }}{{ cart.itemCount }} item{{
+                                cart.itemCount === 1 ? "" : "s"
+                              }}
+                              in your cart.
+                            </p>
+                          </button>
+
+                          <div
+                            v-if="
+                              !isAdminShell && sellerHubBellCombinedCount === 0
+                            "
+                            class="px-4 py-8 text-center sm:px-5"
+                          >
+                            <p class="text-sm text-zinc-500">Nothing new.</p>
                           </div>
                         </div>
                       </div>
@@ -1523,13 +1950,18 @@ watch(
                   @click="toggleAccountMenu"
                 >
                   <div
-                    class="relative flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 text-sm font-bold text-white shadow-sm ring-2 ring-white"
+                    class="relative flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-full text-sm font-bold text-white shadow-sm ring-2 ring-white"
+                    :class="
+                      auth.profileAvatarPublicUrl
+                        ? 'bg-white'
+                        : 'bg-gradient-to-br from-violet-500 to-indigo-600'
+                    "
                   >
                     <img
                       v-if="auth.profileAvatarPublicUrl"
                       :src="auth.profileAvatarPublicUrl"
                       alt=""
-                      class="h-full w-full object-cover"
+                      class="h-full w-full bg-white object-cover"
                       @error="onHeaderAvatarImageError"
                     />
                     <span v-else aria-hidden="true">{{
@@ -1581,7 +2013,8 @@ watch(
                         >
                           <span
                             class="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-400"
-                            >Account</span>
+                            >Account</span
+                          >
                           <span
                             class="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-800 ring-1 ring-emerald-200/80"
                           >
@@ -1601,7 +2034,8 @@ watch(
                         </div>
                         <div class="relative flex gap-4">
                           <div
-                            class="relative flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-gradient-to-br from-violet-500 via-violet-600 to-indigo-700 text-lg font-bold text-white shadow-lg shadow-violet-900/25 ring-[3px] ring-white/95"
+                            class="relative flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-2xl text-lg font-bold text-white shadow-lg shadow-violet-900/25 ring-[3px] ring-white/95"
+                            :class="auth.profileAvatarPublicUrl ? 'bg-white' : 'bg-gradient-to-br from-violet-500 via-violet-600 to-indigo-700'"
                           >
                             <img
                               v-if="auth.profileAvatarPublicUrl"
@@ -1691,10 +2125,12 @@ watch(
                             <span class="min-w-0 flex-1">
                               <span
                                 class="block text-[10px] font-medium uppercase tracking-wide text-zinc-400"
-                                >Plan</span>
+                                >Plan</span
+                              >
                               <span
                                 class="block truncate text-xs font-semibold text-zinc-800"
-                                >{{ accountPlanLabel }}</span>
+                                >{{ accountPlanLabel }}</span
+                              >
                             </span>
                           </span>
                           <span
@@ -1722,10 +2158,12 @@ watch(
                             <span class="min-w-0 flex-1">
                               <span
                                 class="block text-[10px] font-medium uppercase tracking-wide text-violet-600/90"
-                                >Console</span>
+                                >Console</span
+                              >
                               <span
                                 class="block truncate text-xs font-semibold text-violet-950"
-                                >{{ auth.platformAdminRoleLabel }}</span>
+                                >{{ auth.platformAdminRoleLabel }}</span
+                              >
                             </span>
                           </span>
                         </div>
@@ -1761,7 +2199,8 @@ watch(
                               <span>Sign out</span>
                               <span
                                 class="text-[10px] font-normal text-zinc-400 transition group-hover:text-rose-600/90"
-                                >End session on this device</span>
+                                >End session on this device</span
+                              >
                             </span>
                           </span>
                           <svg
@@ -1788,18 +2227,15 @@ watch(
           </div>
         </header>
 
-        <div
-          class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
-        >
+        <div class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <div
             class="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto overscroll-y-contain"
           >
             <div class="min-w-0 flex-1 px-0.5 pb-4 md:px-1">
-              <RouterView v-if="!adminAccessBlocked" />
+              <RouterView />
             </div>
           </div>
           <footer
-            v-if="!adminAccessBlocked"
             class="shrink-0 border-t border-zinc-200/80 bg-white/90 px-4 py-2.5 shadow-[0_-8px_24px_-12px_rgba(15,23,42,0.08)] backdrop-blur-md md:rounded-b-2xl md:px-5"
             :style="{
               paddingBottom: 'max(0.625rem, env(safe-area-inset-bottom, 0px))',
@@ -1843,267 +2279,236 @@ watch(
       </div>
     </div>
 
-  <Teleport to="body">
-    <div
-      v-if="adminAccessBlocked"
-      class="fixed inset-0 z-[500] flex items-center justify-center bg-zinc-900/45 px-4 backdrop-blur-[2px]"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="console-access-block-title"
-    >
-      <div
-        class="w-full max-w-md rounded-3xl border border-white/60 bg-white/95 p-8 shadow-[0_30px_90px_-36px_rgba(0,0,0,0.45)] ring-1 ring-zinc-200/70 backdrop-blur-xl sm:p-10"
-      >
-        <p
-          class="text-center text-[11px] font-semibold uppercase tracking-[0.2em] text-violet-700/80"
-        >
-          Platform console
-        </p>
-        <h2
-          id="console-access-block-title"
-          class="mt-3 text-center text-2xl font-bold tracking-tight text-red-800"
-        >
-          Access pending
-        </h2>
-        <p
-          class="mt-4 text-center text-sm font-medium leading-relaxed text-red-700"
-        >
-          Your account is signed in, but it does not have admin access yet.
-          Please wait until a super administrator grants you access before you
-          can use the console.
-        </p>
-        <div class="mt-8 flex flex-col gap-3 sm:flex-row sm:justify-center">
-          <button
-            type="button"
-            class="inline-flex w-full items-center justify-center rounded-2xl bg-zinc-900 px-5 py-3 text-sm font-semibold text-white shadow-md transition hover:bg-zinc-800 sm:w-auto"
-            @click="openSignOutConfirm"
-          >
-            Sign out
-          </button>
-          <RouterLink
-            to="/"
-            class="inline-flex w-full items-center justify-center rounded-2xl border border-zinc-200/90 bg-white px-5 py-3 text-sm font-semibold text-zinc-800 shadow-sm transition hover:bg-zinc-50 sm:w-auto"
-          >
-            Back to home
-          </RouterLink>
-        </div>
-      </div>
-    </div>
-  </Teleport>
-
-  <Teleport to="body">
-    <Transition name="so-dim">
-      <div
-        v-if="signOutConfirmOpen"
-        class="so-dim-root fixed inset-0 z-[560] flex items-center justify-center bg-zinc-950/55 px-4 py-8 backdrop-blur-md"
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="sign-out-confirm-title"
-        aria-describedby="sign-out-confirm-desc"
-        :aria-busy="signOutConfirmLoading"
-      >
-        <!-- Backdrop intentionally does not dismiss (no click handler). -->
+    <Teleport to="body">
+      <Transition name="so-dim">
         <div
-          class="so-dim-panel relative w-full max-w-lg overflow-hidden rounded-[1.75rem] border border-white/70 bg-white shadow-[0_32px_100px_-32px_rgba(15,23,42,0.55)] ring-1 ring-zinc-900/[0.06]"
+          v-if="signOutConfirmOpen"
+          class="so-dim-root fixed inset-0 z-[560] flex items-center justify-center bg-zinc-950/55 px-4 py-8 backdrop-blur-md"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="sign-out-confirm-title"
+          aria-describedby="sign-out-confirm-desc"
+          :aria-busy="signOutConfirmLoading"
         >
+          <!-- Backdrop intentionally does not dismiss (no click handler). -->
           <div
-            class="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-400/60 to-transparent"
-            aria-hidden="true"
-          />
-          <div
-            class="absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r from-violet-500 via-fuchsia-500 to-indigo-500"
-            aria-hidden="true"
-          />
-          <div
-            class="pointer-events-none absolute -right-20 -top-24 h-56 w-56 rounded-full bg-violet-400/20 blur-3xl"
-            aria-hidden="true"
-          />
-          <div
-            class="pointer-events-none absolute -bottom-16 -left-16 h-48 w-48 rounded-full bg-indigo-400/15 blur-3xl"
-            aria-hidden="true"
-          />
+            class="so-dim-panel relative w-full max-w-lg overflow-hidden rounded-[1.75rem] border border-white/70 bg-white shadow-[0_32px_100px_-32px_rgba(15,23,42,0.55)] ring-1 ring-zinc-900/[0.06]"
+          >
+            <div
+              class="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-400/60 to-transparent"
+              aria-hidden="true"
+            />
+            <div
+              class="absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r from-violet-500 via-fuchsia-500 to-indigo-500"
+              aria-hidden="true"
+            />
+            <div
+              class="pointer-events-none absolute -right-20 -top-24 h-56 w-56 rounded-full bg-violet-400/20 blur-3xl"
+              aria-hidden="true"
+            />
+            <div
+              class="pointer-events-none absolute -bottom-16 -left-16 h-48 w-48 rounded-full bg-indigo-400/15 blur-3xl"
+              aria-hidden="true"
+            />
 
-          <div class="relative px-6 pb-6 pt-9 sm:px-8 sm:pb-8 sm:pt-10">
-            <div class="flex flex-col items-center text-center">
+            <div class="relative px-6 pb-5 pt-7 sm:px-8 sm:pb-6 sm:pt-8">
+              <div class="flex flex-col items-center text-center">
+                <div
+                  class="relative flex h-[3.75rem] w-[3.75rem] items-center justify-center rounded-2xl bg-gradient-to-br from-zinc-800 via-zinc-900 to-zinc-950 text-white shadow-xl shadow-zinc-900/35 ring-4 ring-white/90"
+                >
+                  <svg
+                    class="h-8 w-8 opacity-95"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"
+                    />
+                  </svg>
+                  <span
+                    class="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full border-2 border-white bg-amber-400 text-[10px] font-bold text-amber-950 shadow-sm"
+                    aria-hidden="true"
+                    >!</span
+                  >
+                </div>
+                <p
+                  class="mt-3.5 text-[11px] font-semibold uppercase tracking-[0.22em] text-violet-600/90"
+                >
+                  Session
+                </p>
+                <h2
+                  id="sign-out-confirm-title"
+                  class="mt-1 text-2xl font-bold tracking-tight text-zinc-900"
+                >
+                  End this session?
+                </h2>
+                <p
+                  id="sign-out-confirm-desc"
+                  class="mt-1.5 max-w-sm text-sm leading-relaxed text-zinc-600"
+                >
+                  You will leave the dashboard
+                  {{ isAdminShell ? "and the platform console" : "" }}. Sign
+                  back in anytime with the same email.
+                </p>
+              </div>
+
               <div
-                class="relative flex h-[4.25rem] w-[4.25rem] items-center justify-center rounded-2xl bg-gradient-to-br from-zinc-800 via-zinc-900 to-zinc-950 text-white shadow-xl shadow-zinc-900/35 ring-4 ring-white/90"
+                class="mt-4 rounded-2xl border border-zinc-200/80 bg-gradient-to-b from-zinc-50/90 to-white/80 p-3.5 shadow-inner shadow-zinc-900/[0.03]"
+              >
+                <div class="flex items-center gap-3">
+                  <div
+                    class="relative flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-xl text-sm font-bold text-white shadow-md ring-2 ring-white"
+                    :class="
+                      auth.profileAvatarPublicUrl
+                        ? 'bg-white'
+                        : 'bg-gradient-to-br from-violet-500 to-indigo-600'
+                    "
+                  >
+                    <img
+                      v-if="auth.profileAvatarPublicUrl"
+                      :src="auth.profileAvatarPublicUrl"
+                      alt=""
+                      class="h-full w-full bg-white object-cover"
+                      @error="onHeaderAvatarImageError"
+                    />
+                    <span v-else aria-hidden="true">{{
+                      auth.userDisplayInitial
+                    }}</span>
+                  </div>
+                  <div class="min-w-0 flex-1 text-left">
+                    <p class="truncate text-sm font-semibold text-zinc-900">
+                      {{ displayName }}
+                    </p>
+                    <p class="truncate text-xs text-zinc-500">
+                      {{ auth.user?.email ?? "Signed in" }}
+                    </p>
+                  </div>
+                  <span
+                    class="hidden shrink-0 rounded-full border border-emerald-200/90 bg-emerald-50 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-800 sm:inline"
+                    >Active</span
+                  >
+                </div>
+                <ul
+                  class="mt-3 space-y-2 border-t border-zinc-200/70 pt-3 text-left text-xs leading-relaxed text-zinc-600"
+                >
+                  <li class="flex gap-2.5">
+                    <span
+                      class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-violet-100 text-violet-700"
+                      aria-hidden="true"
+                    >
+                      <svg
+                        class="h-3 w-3"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        stroke-width="2.5"
+                      >
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          d="M4.5 12.75l6 6 9-13.5"
+                        />
+                      </svg>
+                    </span>
+                    <span
+                      >Signed-in areas including your stores{{
+                        isAdminShell ? " and the platform console" : ""
+                      }}
+                      lock until you sign in again.</span
+                    >
+                  </li>
+                  <li class="flex gap-2.5">
+                    <span
+                      class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-indigo-100 text-indigo-700"
+                      aria-hidden="true"
+                    >
+                      <svg
+                        class="h-3 w-3"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                        stroke-width="2.5"
+                      >
+                        <path
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                          d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z"
+                        />
+                      </svg>
+                    </span>
+                    <span
+                      >Your account and saved data stay on our servers; only
+                      this browser session ends.</span
+                    >
+                  </li>
+                </ul>
+              </div>
+
+              <p
+                class="mt-3 flex items-start justify-center gap-2 text-center text-[11px] leading-snug text-zinc-400"
               >
                 <svg
-                  class="h-9 w-9 opacity-95"
+                  class="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-400"
                   fill="none"
                   viewBox="0 0 24 24"
                   stroke="currentColor"
-                  stroke-width="1.5"
+                  stroke-width="2"
                   aria-hidden="true"
                 >
                   <path
                     stroke-linecap="round"
                     stroke-linejoin="round"
-                    d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"
+                    d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z"
                   />
                 </svg>
                 <span
-                  class="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full border-2 border-white bg-amber-400 text-[10px] font-bold text-amber-950 shadow-sm"
-                  aria-hidden="true"
-                  >!</span>
-              </div>
-              <p
-                class="mt-5 text-[11px] font-semibold uppercase tracking-[0.22em] text-violet-600/90"
-              >
-                Session
-              </p>
-              <h2
-                id="sign-out-confirm-title"
-                class="mt-1.5 text-2xl font-bold tracking-tight text-zinc-900"
-              >
-                End this session?
-              </h2>
-              <p
-                id="sign-out-confirm-desc"
-                class="mt-2 max-w-sm text-sm leading-relaxed text-zinc-600"
-              >
-                You will leave the dashboard
-                {{ isAdminShell ? "and the platform console" : "" }}. Sign
-                back in anytime with the same email.
-              </p>
-            </div>
-
-            <div
-              class="mt-6 rounded-2xl border border-zinc-200/80 bg-gradient-to-b from-zinc-50/90 to-white/80 p-4 shadow-inner shadow-zinc-900/[0.03]"
-            >
-              <div class="flex items-center gap-3">
-                <div
-                  class="relative flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-gradient-to-br from-violet-500 to-indigo-600 text-sm font-bold text-white shadow-md ring-2 ring-white"
+                  >Tip: use
+                  <kbd
+                    class="rounded border border-zinc-200 bg-zinc-100 px-1 py-0.5 font-mono text-[10px] font-semibold text-zinc-600"
+                    >Esc</kbd
+                  >
+                  to go back without signing out.</span
                 >
-                  <img
-                    v-if="auth.profileAvatarPublicUrl"
-                    :src="auth.profileAvatarPublicUrl"
-                    alt=""
-                    class="h-full w-full object-cover"
-                    @error="onHeaderAvatarImageError"
+              </p>
+
+              <div
+                class="mt-4 flex flex-col gap-2.5 sm:mt-5 sm:flex-row-reverse sm:justify-center sm:gap-3"
+              >
+                <button
+                  type="button"
+                  class="group relative inline-flex w-full items-center justify-center gap-2 overflow-hidden rounded-2xl bg-gradient-to-r from-rose-600 to-rose-700 px-5 py-3.5 text-sm font-semibold text-white shadow-lg shadow-rose-900/25 transition hover:from-rose-500 hover:to-rose-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600 disabled:cursor-not-allowed disabled:opacity-55 sm:w-auto sm:min-w-[9.5rem]"
+                  :disabled="signOutConfirmLoading"
+                  @click="confirmSignOut"
+                >
+                  <span
+                    v-if="signOutConfirmLoading"
+                    class="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/30 border-t-white"
+                    aria-hidden="true"
                   />
-                  <span v-else aria-hidden="true">{{
-                    auth.userDisplayInitial
+                  <span>{{
+                    signOutConfirmLoading ? "Signing out…" : "Sign out"
                   }}</span>
-                </div>
-                <div class="min-w-0 flex-1 text-left">
-                  <p class="truncate text-sm font-semibold text-zinc-900">
-                    {{ displayName }}
-                  </p>
-                  <p class="truncate text-xs text-zinc-500">
-                    {{ auth.user?.email ?? "Signed in" }}
-                  </p>
-                </div>
-                <span
-                  class="hidden shrink-0 rounded-full border border-emerald-200/90 bg-emerald-50 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-800 sm:inline"
-                  >Active</span>
+                </button>
+                <button
+                  ref="signOutCancelBtnRef"
+                  type="button"
+                  class="inline-flex w-full items-center justify-center rounded-2xl border border-zinc-200/90 bg-white px-5 py-3.5 text-sm font-semibold text-zinc-800 shadow-sm transition hover:border-zinc-300 hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-400 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:min-w-[9.5rem]"
+                  :disabled="signOutConfirmLoading"
+                  @click="closeSignOutConfirm"
+                >
+                  Stay signed in
+                </button>
               </div>
-              <ul
-                class="mt-4 space-y-2.5 border-t border-zinc-200/70 pt-4 text-left text-xs leading-relaxed text-zinc-600"
-              >
-                <li class="flex gap-2.5">
-                  <span
-                    class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-violet-100 text-violet-700"
-                    aria-hidden="true"
-                  >
-                    <svg
-                      class="h-3 w-3"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      stroke-width="2.5"
-                    >
-                      <path
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        d="M4.5 12.75l6 6 9-13.5"
-                      />
-                    </svg>
-                  </span>
-                  <span
-                    >Signed-in areas including your stores{{
-                      isAdminShell ? " and the platform console" : ""
-                    }}
-                    lock until you sign in again.</span>
-                </li>
-                <li class="flex gap-2.5">
-                  <span
-                    class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-indigo-100 text-indigo-700"
-                    aria-hidden="true"
-                  >
-                    <svg
-                      class="h-3 w-3"
-                      fill="none"
-                      viewBox="0 0 24 24"
-                      stroke="currentColor"
-                      stroke-width="2.5"
-                    >
-                      <path
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        d="M16.5 10.5V6.75a4.5 4.5 0 10-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 002.25-2.25v-6.75a2.25 2.25 0 00-2.25-2.25H6.75a2.25 2.25 0 00-2.25 2.25v6.75a2.25 2.25 0 002.25 2.25z"
-                      />
-                    </svg>
-                  </span>
-                  <span
-                    >Your account and saved data stay on our servers; only this
-                    browser session ends.</span>
-                </li>
-              </ul>
-            </div>
-
-            <p
-              class="mt-4 flex items-start justify-center gap-2 text-center text-[11px] leading-snug text-zinc-400"
-            >
-              <svg
-                class="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-400"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                stroke-width="2"
-                aria-hidden="true"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  d="M11.25 11.25l.041-.02a.75.75 0 011.063.852l-.708 2.836a.75.75 0 001.063.853l.041-.021M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-9-3.75h.008v.008H12V8.25z"
-                />
-              </svg>
-              <span
-                >Tip: use <kbd class="rounded border border-zinc-200 bg-zinc-100 px-1 py-0.5 font-mono text-[10px] font-semibold text-zinc-600">Esc</kbd> to go back without signing out.</span>
-            </p>
-
-            <div
-              class="mt-6 flex flex-col gap-3 sm:mt-7 sm:flex-row-reverse sm:justify-center sm:gap-3"
-            >
-              <button
-                type="button"
-                class="group relative inline-flex w-full items-center justify-center gap-2 overflow-hidden rounded-2xl bg-gradient-to-r from-rose-600 to-rose-700 px-5 py-3.5 text-sm font-semibold text-white shadow-lg shadow-rose-900/25 transition hover:from-rose-500 hover:to-rose-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600 disabled:cursor-not-allowed disabled:opacity-55 sm:w-auto sm:min-w-[9.5rem]"
-                :disabled="signOutConfirmLoading"
-                @click="confirmSignOut"
-              >
-                <span
-                  v-if="signOutConfirmLoading"
-                  class="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/30 border-t-white"
-                  aria-hidden="true"
-                />
-                <span>{{ signOutConfirmLoading ? "Signing out…" : "Sign out" }}</span>
-              </button>
-              <button
-                ref="signOutCancelBtnRef"
-                type="button"
-                class="inline-flex w-full items-center justify-center rounded-2xl border border-zinc-200/90 bg-white px-5 py-3.5 text-sm font-semibold text-zinc-800 shadow-sm transition hover:border-zinc-300 hover:bg-zinc-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-zinc-400 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:min-w-[9.5rem]"
-                :disabled="signOutConfirmLoading"
-                @click="closeSignOutConfirm"
-              >
-                Stay signed in
-              </button>
             </div>
           </div>
         </div>
-      </div>
-    </Transition>
-  </Teleport>
+      </Transition>
+    </Teleport>
 
     <CreateStoreModal v-if="!isAdminShell" />
   </div>

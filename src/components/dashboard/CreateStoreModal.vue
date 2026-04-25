@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { Transition, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { clearBodyScrollLock, setBodyScrollLocked } from "../../lib/bodyScrollLock";
 import { useUiStore } from "../../stores/ui";
 import CreateStorePanel from "./CreateStorePanel.vue";
 
@@ -7,7 +8,7 @@ const ui = useUiStore();
 const panelRef = ref<{ loadGate?: () => void } | null>(null);
 
 function onKeydown(e: KeyboardEvent) {
-  if (e.key === "Escape" && ui.createStoreModalOpen) {
+  if (e.key === "Escape" && ui.createStoreModalOpen && !ui.createStoreModalForced) {
     e.preventDefault();
     ui.closeCreateStoreModal();
   }
@@ -16,7 +17,7 @@ function onKeydown(e: KeyboardEvent) {
 watch(
   () => ui.createStoreModalOpen,
   async (open) => {
-    document.body.style.overflow = open ? "hidden" : "";
+    setBodyScrollLocked("create-store-modal", open);
     if (open) {
       await nextTick();
       panelRef.value?.loadGate?.();
@@ -30,7 +31,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   document.removeEventListener("keydown", onKeydown);
-  document.body.style.overflow = "";
+  clearBodyScrollLock("create-store-modal");
 });
 </script>
 
@@ -62,6 +63,7 @@ onBeforeUnmount(() => {
             New storefront
           </p>
           <button
+            v-if="!ui.createStoreModalForced"
             type="button"
             class="flex h-9 w-9 items-center justify-center rounded-xl border border-zinc-200/80 bg-white text-lg leading-none text-zinc-500 shadow-sm transition hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-800"
             aria-label="Close"

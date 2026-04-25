@@ -23,6 +23,8 @@ export const PLAN_FEATURE_LIMITS: Record<
   {
     /** Max storefronts owned; `null` = no fixed cap (Pro). */
     maxStores: number | null;
+    /** Max admin users per store, including the owner seat. */
+    maxAdminUsers: number | null;
     maxProducts: number | null;
     maxOrdersPerMonth: number | null;
     /** Single product cover file size cap (matches pricing page). */
@@ -31,24 +33,28 @@ export const PLAN_FEATURE_LIMITS: Record<
 > = {
   free: {
     maxStores: MAX_STORES_BY_PLAN.free,
+    maxAdminUsers: 1,
     maxProducts: 5,
     maxOrdersPerMonth: 15,
     maxProductCoverImageBytes: MAX_PRODUCT_COVER_IMAGE_BYTES_BY_PLAN.free,
   },
   starter: {
     maxStores: MAX_STORES_BY_PLAN.starter,
+    maxAdminUsers: 1,
     maxProducts: 30,
     maxOrdersPerMonth: 100,
     maxProductCoverImageBytes: MAX_PRODUCT_COVER_IMAGE_BYTES_BY_PLAN.starter,
   },
   growth: {
     maxStores: MAX_STORES_BY_PLAN.growth,
+    maxAdminUsers: 1,
     maxProducts: 150,
     maxOrdersPerMonth: 500,
     maxProductCoverImageBytes: MAX_PRODUCT_COVER_IMAGE_BYTES_BY_PLAN.growth,
   },
   pro: {
     maxStores: MAX_STORES_BY_PLAN.pro,
+    maxAdminUsers: 1,
     maxProducts: null,
     maxOrdersPerMonth: null,
     maxProductCoverImageBytes: MAX_PRODUCT_COVER_IMAGE_BYTES_BY_PLAN.pro,

@@ -125,8 +125,13 @@ onBeforeUnmount(() => {
 
 const triggerClass = computed(() =>
   [
-    "flex w-full min-w-0 items-center justify-between gap-2 rounded-xl border border-zinc-200/90 bg-white text-left font-semibold text-zinc-900 shadow-sm outline-none transition hover:border-zinc-300 hover:bg-zinc-50/80 focus-visible:border-teal-400 focus-visible:ring-2 focus-visible:ring-teal-500/20 disabled:cursor-wait disabled:opacity-60",
-    props.size === "md" ? "py-2.5 pl-3 pr-2.5 text-sm" : "py-2 pl-2.5 pr-2 text-xs",
+    "group flex w-full min-w-0 items-center justify-between gap-2 rounded-xl border text-left font-semibold shadow-sm outline-none transition focus-visible:ring-2 focus-visible:ring-teal-500/25 disabled:cursor-wait disabled:opacity-60",
+    open.value
+      ? "border-teal-300 bg-teal-50/45 text-zinc-900 ring-1 ring-teal-200/70"
+      : "border-zinc-200/90 bg-white text-zinc-900 hover:border-teal-300/80 hover:bg-teal-50/35",
+    props.size === "md"
+      ? "py-2.5 pl-3 pr-2.5 text-sm focus-visible:border-teal-400"
+      : "py-2 pl-2.5 pr-2 text-xs focus-visible:border-teal-400",
   ].join(" "),
 );
 </script>
@@ -152,8 +157,8 @@ const triggerClass = computed(() =>
       />
       <svg
         v-else
-        class="h-4 w-4 shrink-0 text-zinc-400 transition duration-200"
-        :class="open ? 'rotate-180' : ''"
+        class="h-4 w-4 shrink-0 text-zinc-400 transition duration-200 group-hover:text-teal-700"
+        :class="open ? 'rotate-180 text-teal-700' : ''"
         viewBox="0 0 20 20"
         fill="currentColor"
         aria-hidden="true"

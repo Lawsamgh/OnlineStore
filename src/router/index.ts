@@ -3,16 +3,19 @@ import { getSupabaseBrowser, isSupabaseConfigured } from "../lib/supabase";
 import { useAuthStore } from "../stores/auth";
 import CheckoutView from "../views/store/CheckoutView.vue";
 import OrderSuccessView from "../views/store/OrderSuccessView.vue";
+import OrderTrackView from "../views/store/OrderTrackView.vue";
 import StorefrontLayout from "../views/store/StorefrontLayout.vue";
 import StoreView from "../views/store/StoreView.vue";
 import CreateStoreView from "../views/dashboard/CreateStoreView.vue";
 import DashboardHome from "../views/dashboard/DashboardHome.vue";
 import DashboardLayout from "../views/dashboard/DashboardLayout.vue";
 import StoreManageView from "../views/dashboard/StoreManageView.vue";
+import ThemeSettingsView from "../views/dashboard/ThemeSettingsView.vue";
 import AdminAnnouncementsView from "../views/admin/AnnouncementsView.vue";
 import AdminHomeView from "../views/admin/AdminHomeView.vue";
 import PlatformSettingsView from "../views/admin/PlatformSettingsView.vue";
 import SupportTicketsView from "../views/admin/SupportTicketsView.vue";
+import SellerVerificationsView from "../views/admin/SellerVerificationsView.vue";
 import HomeView from "../views/HomeView.vue";
 import LoginView from "../views/LoginView.vue";
 import ConsoleAccessPendingView from "../views/ConsoleAccessPendingView.vue";
@@ -63,6 +66,11 @@ const router = createRouter({
           name: "dashboard-store",
           component: StoreManageView,
         },
+        {
+          path: "themes",
+          name: "dashboard-themes",
+          component: ThemeSettingsView,
+        },
       ],
     },
     {
@@ -90,6 +98,11 @@ const router = createRouter({
           name: "admin-tickets",
           component: SupportTicketsView,
         },
+        {
+          path: "verifications",
+          name: "admin-verifications",
+          component: SellerVerificationsView,
+        },
       ],
     },
     {
@@ -105,6 +118,11 @@ const router = createRouter({
           path: "checkout",
           name: "store-checkout",
           component: CheckoutView,
+        },
+        {
+          path: "track",
+          name: "store-order-track",
+          component: OrderTrackView,
         },
         {
           path: "order/:orderId/success",
@@ -142,6 +160,19 @@ router.beforeEach(async (to) => {
     const { data } = await getSupabaseBrowser().auth.getSession();
     auth.syncSession(data.session);
   }
+  if (
+    auth.isSignedIn &&
+    auth.passwordUserNeedsEmailVerification &&
+    to.name !== "login"
+  ) {
+    return {
+      name: "login",
+      query: {
+        redirect: to.fullPath,
+        verify: "required",
+      },
+    };
+  }
 
   if (to.name === "console-access-pending") {
     if (!auth.isSignedIn) {
@@ -172,12 +203,13 @@ router.beforeEach(async (to) => {
     if (!auth.isSignedIn) {
       return { name: "login", query: { redirect: to.fullPath } };
     }
+    // /admin is super-admin only. Always await role resolution before allowing
+    // route entry to prevent non-admin users from briefly rendering admin views.
     await auth.refreshSuperAdminRole();
-    if (!auth.isPlatformStaff) {
-      // Stay on /admin shell: DashboardLayout shows blocking overlay + skips child views.
-      // (Redirect to console-access-pending would prevent that overlay from ever mounting.)
-      return true;
+    if (!auth.isSuperAdmin) {
+      return { name: "dashboard" };
     }
+    return true;
   }
   return true;
 });

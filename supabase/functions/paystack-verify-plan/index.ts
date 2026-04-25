@@ -1,4 +1,4 @@
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1'
+import { createClient } from '@supabase/supabase-js'
 import { sendSellerPlanSubscribedEmail } from '../_shared/sendSellerPlanEmail.ts'
 import {
   extractPaystackPaymentFields,
@@ -16,6 +16,11 @@ const PLAN_MONTHLY_PESEWAS: Record<string, number> = {
   starter: 15000,
   growth: 35000,
   pro: 65000,
+}
+const PLAN_PRICING_KEYS: Record<string, string> = {
+  starter: 'seller_subscription_monthly_pesewas_starter',
+  growth: 'seller_subscription_monthly_pesewas_growth',
+  pro: 'seller_subscription_monthly_pesewas_pro',
 }
 
 const PAID_PLAN_IDS = new Set(Object.keys(PLAN_MONTHLY_PESEWAS))
@@ -111,13 +116,25 @@ Deno.serve(async (req) => {
       return Response.json({ error: 'Invalid plan in payment' }, { status: 400, headers: cors })
     }
 
-    const expected = PLAN_MONTHLY_PESEWAS[planId]
+    const admin = createClient(supabaseUrl, serviceKey)
+    const dynamicPlanMonthlyPesewas = { ...PLAN_MONTHLY_PESEWAS }
+    const { data: pricingRows } = await admin
+      .from('platform_settings')
+      .select('key, value')
+      .in('key', Object.values(PLAN_PRICING_KEYS))
+    if (Array.isArray(pricingRows)) {
+      for (const [id, key] of Object.entries(PLAN_PRICING_KEYS)) {
+        const row = pricingRows.find((r) => r?.key === key)
+        const n = Number.parseInt(String(row?.value ?? '').trim(), 10)
+        if (Number.isFinite(n) && n > 0) dynamicPlanMonthlyPesewas[id] = n
+      }
+    }
+
+    const expected = dynamicPlanMonthlyPesewas[planId]
     const paid = intPesewasFromUnknown(d.amount)
     if (paid == null || paid !== expected) {
       return Response.json({ error: 'Amount mismatch' }, { status: 400, headers: cors })
     }
-
-    const admin = createClient(supabaseUrl, serviceKey)
     const { data: existing, error: guErr } = await admin.auth.admin.getUserById(user.id)
     if (guErr || !existing?.user) {
       return Response.json(
@@ -184,7 +201,10 @@ Deno.serve(async (req) => {
 
     await sendSellerPlanSubscribedEmail({
       resendApiKey: Deno.env.get('RESEND_API_KEY') ?? undefined,
-      resendFromEmail: Deno.env.get('RESEND_FROM_EMAIL') ?? 'onboarding@resend.dev',
+      resendFromEmail:
+        Deno.env.get('RESEND_FROM_BILLING_EMAIL') ??
+        Deno.env.get('RESEND_FROM_EMAIL') ??
+        'onboarding@resend.dev',
       to: existing.user.email ?? user.email ?? undefined,
       planId,
       source: 'account',

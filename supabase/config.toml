@@ -1,19 +1,42 @@
-# Edge Function config (see https://supabase.com/docs/guides/functions/function-configuration)
+# Edge Function JWT verification (per function; CLI requires this shape — no boolean on `[functions]`).
+# https://supabase.com/docs/guides/functions/function-configuration
 #
-# Projects using ES256 JWT signing hit gateway error:
-#   UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM / "Unsupported JWT algorithm ES256"
-# until gateway verification supports it. We disable ingress JWT verification and
-# rely on each function's own checks (e.g. getUser() with the Bearer token).
-# paystack-verify-store-subscription upserts public.seller_subscriptions after store checkout.
+# Gateway verifies JWT before the request reaches your handler. Clients use a
+# valid Supabase JWT (session or anon). Scheduled jobs: Authorization Bearer
+# service_role (or anon) plus any function secrets (e.g. x-cron-secret).
+#
+# ES256 gateway errors: see project JWT settings or set verify_jwt = false on
+# the affected function only, with strong checks inside the handler.
 
 [functions.paystack-init]
-verify_jwt = false
+verify_jwt = true
 
 [functions.paystack-verify-plan]
-verify_jwt = false
-
-[functions.notify-order]
-verify_jwt = false
+verify_jwt = true
 
 [functions.paystack-verify-store-subscription]
-verify_jwt = false
+verify_jwt = true
+
+[functions.sync-seller-subscription-for-store]
+verify_jwt = true
+
+[functions.notify-order]
+verify_jwt = true
+
+[functions.notify-order-status]
+verify_jwt = true
+
+[functions.notify-seller-subscription-renewal]
+verify_jwt = true
+
+[functions.notify-seller-verification]
+verify_jwt = true
+
+[functions.notify-super-admin-new-seller]
+verify_jwt = true
+
+[functions.notify-platform-staff-announcement]
+verify_jwt = true
+
+[functions.track-order-safe]
+verify_jwt = true

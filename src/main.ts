@@ -9,8 +9,8 @@ const app = createApp(App)
 const pinia = createPinia()
 
 app.use(pinia)
-initSupabaseAuth(pinia)
 app.use(router)
+initSupabaseAuth(pinia, router)
 // Avoid a one-frame marketing header flash on deep links (e.g. /dashboard):
 // App.vue reads `useRoute()` before the initial navigation + guards finish.
 await router.isReady()

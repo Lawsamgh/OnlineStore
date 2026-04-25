@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
 import { RouterLink, useRouter } from "vue-router";
-import { PRICING_PLANS } from "../constants/pricingPlans";
 import PricingPlanCard from "../components/marketing/PricingPlanCard.vue";
 import { useAuthStore } from "../stores/auth";
+import { usePlanPricingSettings } from "../composables/usePlanPricingSettings";
 import happySellerPhone from "../assets/marketing/happy-seller-phone.webp";
 
 const auth = useAuthStore();
@@ -18,6 +18,7 @@ const pricingCarouselAtEnd = ref(false);
 
 let pricingCarouselScrollRaf = 0;
 let pricingCarouselResizeObs: ResizeObserver | null = null;
+const { plans: pricingPlans } = usePlanPricingSettings();
 
 function pricingCarouselPrefersReducedMotion(): boolean {
   if (typeof window === "undefined") return false;
@@ -81,7 +82,7 @@ function gotoPricingSlide(i: number): void {
 
 function scrollPricingCarousel(delta: 1 | -1): void {
   const next = Math.min(
-    PRICING_PLANS.length - 1,
+    pricingPlans.value.length - 1,
     Math.max(0, currentPricingSlideIndex() + delta),
   );
   gotoPricingSlide(next);
@@ -99,7 +100,7 @@ function onPricingCarouselKeydown(ev: KeyboardEvent): void {
     gotoPricingSlide(0);
   } else if (ev.key === "End") {
     ev.preventDefault();
-    gotoPricingSlide(PRICING_PLANS.length - 1);
+    gotoPricingSlide(pricingPlans.value.length - 1);
   }
 }
 
@@ -194,7 +195,7 @@ onBeforeUnmount(() => {
 const featureItems = [
   {
     t: "Your branded shop",
-    d: "Catalog, cart, and a clear path to WhatsApp so buyers reach you in one tap.",
+    d: "Catalog, cart, and a clear path to call or SMS so buyers reach you quickly.",
     icon: "store" as const,
   },
   {
@@ -209,10 +210,10 @@ const featureItems = [
   },
 ];
 
-const trustChips = ["MoMo", "WhatsApp", "GHS", "Delivery tracking"];
+const trustChips = ["MoMo", "SMS", "GHS", "Delivery tracking"];
 
 const heroDetails = [
-  "Hosted storefront at your own path — share one link on Instagram, WhatsApp status, or SMS.",
+  "Hosted storefront at your own path — share one link on Instagram, SMS, or any social channel.",
   "Orders land in your dashboard with buyer notes, phone numbers, and delivery addresses.",
   "Customers follow live delivery states; you confirm handover when cash or MoMo hits your account.",
   "Upgrade tiers when you need more themes, automation, or team seats — no replatforming.",
@@ -222,7 +223,7 @@ const howItWorks = [
   {
     step: "01",
     title: "Create your store",
-    body: "Sign up, choose a slug, upload products, and set WhatsApp so buyers can message you instantly.",
+    body: "Sign up, choose a slug, upload products, and set your store phone so buyers can reach you instantly.",
   },
   {
     step: "02",
@@ -282,7 +283,7 @@ const howItWorks = [
             <p
               class="ui-anim-fade-up ui-delay-3 mt-5 max-w-2xl text-pretty text-base leading-relaxed text-zinc-600 sm:text-lg sm:leading-relaxed"
             >
-              Built for Ghanaian sellers who already close on WhatsApp: your
+              Built for Ghanaian sellers who already close through direct chat: your
               shop stays the catalogue, while you keep your payout rhythm —
               MoMo, cash on delivery, or in-person pickup.
             </p>
@@ -684,7 +685,7 @@ const howItWorks = [
                         <div
                           class="rounded-2xl bg-lime-400 py-3 text-center text-sm font-bold text-zinc-900 shadow-lg shadow-lime-900/10"
                         >
-                          Message on WhatsApp
+                          Message seller
                         </div>
                       </div>
 
@@ -1224,7 +1225,7 @@ const howItWorks = [
               aria-label="Choose a pricing plan"
             >
               <button
-                v-for="(plan, i) in PRICING_PLANS"
+                v-for="(plan, i) in pricingPlans"
                 :key="plan.id"
                 type="button"
                 role="radio"
@@ -1253,14 +1254,14 @@ const howItWorks = [
               class="text-center text-sm font-semibold tabular-nums tracking-tight text-zinc-600 sm:text-base"
             >
               <span class="text-zinc-900">{{
-                PRICING_PLANS[pricingCarouselIndex]?.name ?? ""
+                pricingPlans[pricingCarouselIndex]?.name ?? ""
               }}</span>
               <span class="mx-2 text-zinc-400 font-normal" aria-hidden="true"
                 >·</span
               >
               <span class="font-bold text-zinc-800"
                 >{{ pricingCarouselIndex + 1 }} /
-                {{ PRICING_PLANS.length }}</span
+                {{ pricingPlans.length }}</span
               >
             </p>
           </div>
@@ -1270,13 +1271,13 @@ const howItWorks = [
             class="flex snap-x snap-mandatory gap-5 overflow-x-auto scroll-smooth scroll-px-4 pb-4 pt-1 [-ms-overflow-style:none] [scrollbar-color:rgba(24,24,27,0.22)_transparent] [scrollbar-width:thin] sm:scroll-px-6 sm:gap-6 [&::-webkit-scrollbar]:h-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-zinc-300/90 [&::-webkit-scrollbar-track]:bg-transparent"
           >
             <div
-              v-for="(plan, slideIndex) in PRICING_PLANS"
+              v-for="(plan, slideIndex) in pricingPlans"
               :id="`pricing-slide-${plan.id}`"
               :key="plan.id"
               data-pricing-slide
               class="ui-reveal shrink-0 snap-center overflow-visible [flex:0_0_min(20rem,calc(100vw-2.75rem))] sm:[flex:0_0_calc(50%-0.75rem)] lg:[flex:0_0_calc((100%-3rem)/3)]"
               role="group"
-              :aria-roledescription="`Slide ${slideIndex + 1} of ${PRICING_PLANS.length}`"
+              :aria-roledescription="`Slide ${slideIndex + 1} of ${pricingPlans.length}`"
               :aria-label="`${plan.name} plan`"
             >
               <PricingPlanCard

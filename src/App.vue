@@ -1,19 +1,10 @@
 <script setup lang="ts">
-import {
-  computed,
-  onBeforeUnmount,
-  onMounted,
-  ref,
-  watch,
-} from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { RouterLink, RouterView, useRoute, useRouter } from "vue-router";
 import AppToastStack from "./components/AppToastStack.vue";
 import CartDrawer from "./components/CartDrawer.vue";
 import { isSupabaseConfigured } from "./lib/supabase";
-import {
-  AUTH_OAUTH_REDIRECT_PENDING_KEY,
-  useAuthStore,
-} from "./stores/auth";
+import { AUTH_OAUTH_REDIRECT_PENDING_KEY, useAuthStore } from "./stores/auth";
 import { useCartStore } from "./stores/cart";
 import { useUiStore } from "./stores/ui";
 
@@ -23,9 +14,25 @@ const auth = useAuthStore();
 const cart = useCartStore();
 const ui = useUiStore();
 const supabaseReady = isSupabaseConfigured();
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const IDLE_ACTIVITY_THROTTLE_MS = 1000;
+let idleTimer: number | null = null;
+let lastIdleActivityAt = 0;
+const idleActivityEvents: (keyof WindowEventMap)[] = [
+  "pointerdown",
+  "keydown",
+  "mousemove",
+  "scroll",
+  "touchstart",
+];
 
 const isStorefrontRoute = computed(() =>
-  ["store", "store-checkout", "order-success"].includes(String(route.name)),
+  [
+    "store",
+    "store-checkout",
+    "store-order-track",
+    "order-success",
+  ].includes(String(route.name)),
 );
 
 /** Marketing + cart header hidden on dashboard, admin, storefront, and console-pending. */
@@ -69,6 +76,8 @@ const navMobileActive =
 
 const navProfileOpen = ref(false);
 const navProfileWrapRef = ref<HTMLElement | null>(null);
+let savedBodyOverflow = "";
+let savedHtmlOverflow = "";
 
 function closeNavProfileMenu() {
   navProfileOpen.value = false;
@@ -101,9 +110,74 @@ async function signOut() {
   }
 }
 
+function clearIdleTimer() {
+  if (idleTimer != null) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+}
+
+async function handleIdleTimeout() {
+  if (!auth.isSignedIn) return;
+  try {
+    await auth.signOut();
+  } finally {
+    ui.showSessionExpiredModal(
+      "Session expired after 30 minutes of inactivity. Please sign in again.",
+    );
+    if (route.name !== "login") {
+      await router.replace({ name: "login", query: { reason: "expired" } });
+    }
+  }
+}
+
+function handleSessionExpiredModalSignIn() {
+  ui.hideSessionExpiredModal();
+  if (route.name !== "login") {
+    void router.replace({ name: "login" });
+  }
+}
+
+function syncSessionExpiredModalBodyLock(open: boolean) {
+  const html = document.documentElement;
+  const body = document.body;
+  if (open) {
+    savedHtmlOverflow = html.style.overflow;
+    savedBodyOverflow = body.style.overflow;
+    html.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+    return;
+  }
+  html.style.overflow = savedHtmlOverflow;
+  body.style.overflow = savedBodyOverflow;
+}
+
+function scheduleIdleTimer() {
+  clearIdleTimer();
+  if (!auth.isSignedIn) return;
+  idleTimer = window.setTimeout(() => {
+    void handleIdleTimeout();
+  }, IDLE_TIMEOUT_MS);
+}
+
+function markIdleActivity() {
+  if (!auth.isSignedIn) return;
+  const now = Date.now();
+  if (now - lastIdleActivityAt < IDLE_ACTIVITY_THROTTLE_MS) return;
+  lastIdleActivityAt = now;
+  scheduleIdleTimer();
+}
+
 onMounted(() => {
-  document.addEventListener("pointerdown", onNavProfilePointerDownCapture, true);
+  document.addEventListener(
+    "pointerdown",
+    onNavProfilePointerDownCapture,
+    true,
+  );
   document.addEventListener("keydown", onNavProfileKeydown);
+  for (const ev of idleActivityEvents) {
+    window.addEventListener(ev, markIdleActivity, { passive: true });
+  }
 });
 
 onBeforeUnmount(() => {
@@ -113,6 +187,11 @@ onBeforeUnmount(() => {
     true,
   );
   document.removeEventListener("keydown", onNavProfileKeydown);
+  for (const ev of idleActivityEvents) {
+    window.removeEventListener(ev, markIdleActivity);
+  }
+  clearIdleTimer();
+  syncSessionExpiredModalBodyLock(false);
 });
 
 function onNavAvatarError() {
@@ -131,7 +210,21 @@ watch(
   () => route.fullPath,
   () => {
     closeNavProfileMenu();
+    markIdleActivity();
   },
+);
+
+watch(
+  () => auth.isSignedIn,
+  (signedIn) => {
+    if (!signedIn) {
+      clearIdleTimer();
+      return;
+    }
+    lastIdleActivityAt = Date.now();
+    scheduleIdleTimer();
+  },
+  { immediate: true },
 );
 
 watch(
@@ -144,6 +237,14 @@ watch(
     await auth.refreshSuperAdminRole();
     await router.replace({ name: auth.isSuperAdmin ? "admin" : "dashboard" });
   },
+);
+
+watch(
+  () => ui.sessionExpiredModalOpen,
+  (open) => {
+    syncSessionExpiredModalBodyLock(open);
+  },
+  { immediate: true },
 );
 </script>
 
@@ -168,12 +269,12 @@ watch(
           class="group shrink-0 inline-flex items-center gap-2.5 rounded-xl py-0.5 pr-1 text-lg font-bold tracking-tight text-zinc-950 transition-colors duration-200 hover:text-zinc-700"
           aria-label="U and I Tech Solutions — Home"
         >
-          <span
-            class="flex h-9 w-9 shrink-0 select-none items-center justify-center rounded-xl bg-zinc-900 text-[11px] font-extrabold leading-none tracking-tight text-lime-400 shadow-md shadow-zinc-900/20 ring-1 ring-zinc-800/80 transition-transform duration-200 group-hover:scale-[1.04] motion-reduce:group-hover:scale-100"
+          <img
+            src="/src/assets/logo/uanditech.png"
+            alt=""
+            class="h-9 w-9 shrink-0 rounded-xl object-cover shadow-md shadow-zinc-900/20 transition-transform duration-200 group-hover:scale-[1.04] motion-reduce:group-hover:scale-100"
             aria-hidden="true"
-          >
-            UI
-          </span>
+          />
           <span class="min-w-0 leading-tight">U&amp;I Tech Solutions</span>
         </RouterLink>
 
@@ -252,11 +353,7 @@ watch(
             >
               Sign up
             </RouterLink>
-            <div
-              v-else
-              ref="navProfileWrapRef"
-              class="relative shrink-0"
-            >
+            <div v-else ref="navProfileWrapRef" class="relative shrink-0">
               <button
                 type="button"
                 class="inline-flex items-center gap-1.5 rounded-full border border-zinc-200/90 bg-white py-1 pl-1 pr-2 shadow-md shadow-zinc-900/10 transition-all duration-200 hover:border-zinc-300 hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500/50 focus-visible:ring-offset-2 focus-visible:ring-offset-white active:scale-[0.98]"
@@ -369,13 +466,12 @@ watch(
                       </svg>
                     </span>
                     <span class="min-w-0 flex-1">
+                      <span class="block text-sm font-semibold text-zinc-900">{{
+                        auth.isSuperAdmin ? "Platform admin" : "Dashboard"
+                      }}</span>
                       <span
-                        class="block text-sm font-semibold text-zinc-900"
-                        >{{
-                          auth.isSuperAdmin ? "Platform admin" : "Dashboard"
-                        }}</span
+                        class="mt-0.5 block text-xs font-medium text-zinc-500"
                       >
-                      <span class="mt-0.5 block text-xs font-medium text-zinc-500">
                         {{
                           auth.isSuperAdmin
                             ? "Network tools & oversight"
@@ -426,7 +522,8 @@ watch(
                       <span class="block text-sm font-semibold text-zinc-800"
                         >Sign out</span
                       >
-                      <span class="mt-0.5 block text-xs font-medium text-zinc-500"
+                      <span
+                        class="mt-0.5 block text-xs font-medium text-zinc-500"
                         >End session on this device</span
                       >
                     </span>
@@ -456,7 +553,9 @@ watch(
             :to="{ name: 'home', hash: '#features' }"
             :class="[
               navMobileBase,
-              homeNavSection === 'features' ? navMobileActive : navMobileInactive,
+              homeNavSection === 'features'
+                ? navMobileActive
+                : navMobileInactive,
             ]"
           >
             Features
@@ -465,7 +564,9 @@ watch(
             :to="{ name: 'home', hash: '#pricing' }"
             :class="[
               navMobileBase,
-              homeNavSection === 'pricing' ? navMobileActive : navMobileInactive,
+              homeNavSection === 'pricing'
+                ? navMobileActive
+                : navMobileInactive,
             ]"
           >
             Pricing
@@ -499,6 +600,42 @@ watch(
       <RouterView />
     </main>
     <CartDrawer />
+    <div
+      v-if="ui.sessionExpiredModalOpen"
+      class="fixed inset-0 z-[10020] flex items-center justify-center bg-zinc-950/55 px-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="session-expired-title"
+      aria-describedby="session-expired-desc"
+      @click.prevent.stop
+      @mousedown.prevent.stop
+      @mouseup.prevent.stop
+      @pointerdown.prevent.stop
+      @pointerup.prevent.stop
+    >
+      <div
+        class="w-full max-w-md rounded-2xl border border-zinc-200 bg-white p-6 shadow-2xl"
+      >
+        <h2
+          id="session-expired-title"
+          class="text-xl font-bold tracking-tight text-zinc-900"
+        >
+          Session expired
+        </h2>
+        <p id="session-expired-desc" class="mt-2 text-sm text-zinc-600">
+          {{ ui.sessionExpiredMessage }}
+        </p>
+        <div class="mt-5 flex justify-end">
+          <button
+            type="button"
+            class="rounded-full bg-zinc-900 px-4 py-2 text-sm font-semibold text-white transition hover:bg-zinc-800"
+            @click="handleSessionExpiredModalSignIn"
+          >
+            Sign in again
+          </button>
+        </div>
+      </div>
+    </div>
     <AppToastStack />
   </div>
 </template>

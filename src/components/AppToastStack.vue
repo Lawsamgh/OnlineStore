@@ -17,7 +17,7 @@ function styles(t: (typeof items.value)[0]["type"]) {
 <template>
   <Teleport to="body">
     <div
-      class="pointer-events-none fixed inset-x-0 top-0 z-[200] flex flex-col items-end gap-2 p-4 sm:p-5"
+      class="pointer-events-none fixed inset-x-0 top-0 z-[400] flex flex-col items-end gap-2 p-4 sm:p-5"
       aria-live="polite"
     >
       <TransitionGroup name="toast">

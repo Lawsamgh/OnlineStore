@@ -13,7 +13,7 @@ export type PlaceOrderInput = {
   deliveryAddress: string
   customerNotes: string
   lines: CartLine[]
-  guest: CheckoutGuest | null
+  guest: CheckoutGuest
 }
 
 export type PlacedOrder = {
@@ -25,6 +25,8 @@ export async function placeOrder(input: PlaceOrderInput): Promise<{
   order: PlacedOrder
   notifyOk: boolean
   notifyError: string | null
+  /** Non-fatal issues from notify-order (e.g. email skipped or Resend rejected). */
+  notifyWarnings: string[]
 }> {
   if (!isSupabaseConfigured()) {
     throw new Error('Supabase is not configured')
@@ -43,9 +45,9 @@ export async function placeOrder(input: PlaceOrderInput): Promise<{
       p_lines: payloadLines,
       p_delivery_address: input.deliveryAddress,
       p_customer_notes: input.customerNotes,
-      p_guest_name: input.guest?.guestName ?? null,
-      p_guest_email: input.guest?.guestEmail ?? null,
-      p_guest_phone: input.guest?.guestPhone ?? null,
+      p_guest_name: input.guest.guestName.trim(),
+      p_guest_email: input.guest.guestEmail.trim(),
+      p_guest_phone: input.guest.guestPhone.trim(),
     },
   )
 
@@ -62,6 +64,7 @@ export async function placeOrder(input: PlaceOrderInput): Promise<{
 
   let notifyOk = false
   let notifyError: string | null = null
+  const notifyWarnings: string[] = []
   const { data: fnData, error: fnErr } = await supabase.functions.invoke(
     'notify-order',
     {
@@ -78,11 +81,18 @@ export async function placeOrder(input: PlaceOrderInput): Promise<{
     notifyError = String((fnData as { error: string }).error)
   } else {
     notifyOk = true
+    const w = (fnData as { warnings?: unknown } | null)?.warnings
+    if (Array.isArray(w)) {
+      for (const x of w) {
+        if (typeof x === 'string' && x.trim()) notifyWarnings.push(x.trim())
+      }
+    }
   }
 
   return {
     order: { id: orderId, notify_token: notifyToken },
     notifyOk,
     notifyError,
+    notifyWarnings,
   }
 }

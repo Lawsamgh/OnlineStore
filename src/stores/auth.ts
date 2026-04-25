@@ -48,10 +48,36 @@ export const useAuthStore = defineStore("auth", () => {
   const suppressNextConsoleAccessBell = ref(false);
   /** Public URL for `profiles.avatar_path` in `profile-avatars` bucket. */
   const profileAvatarPublicUrl = ref<string | null>(null);
+  /**
+   * Set to true just before a deliberate sign-out so the auth-sync listener
+   * can tell the difference between a manual sign-out and a token expiry.
+   */
+  const isManualSignOut = ref(false);
 
   const user = computed(() => session.value?.user ?? null);
   const sessionUserId = computed(() => user.value?.id ?? null);
   const isSignedIn = computed(() => user.value !== null);
+  const passwordUserNeedsEmailVerification = computed(() => {
+    const u = user.value;
+    if (!u) return false;
+    const provider =
+      typeof (u.app_metadata as { provider?: unknown } | null)?.provider ===
+      "string"
+        ? String((u.app_metadata as { provider?: unknown }).provider)
+        : "";
+    const hasEmailIdentity =
+      provider === "email" ||
+      (Array.isArray(u.identities) &&
+        u.identities.some(
+          (identity) =>
+            typeof identity?.provider === "string" &&
+            identity.provider === "email",
+        ));
+    const emailConfirmed =
+      typeof u.email_confirmed_at === "string" &&
+      u.email_confirmed_at.trim().length > 0;
+    return hasEmailIdentity && !emailConfirmed;
+  });
 
   const isSuperAdmin = computed(
     () => platformAdminRole.value === "super_admin",
@@ -106,26 +132,38 @@ export const useAuthStore = defineStore("auth", () => {
   async function refreshSuperAdminRole() {
     if (!isSupabaseConfigured() || !session.value?.user?.id) {
       platformAdminRole.value = "none";
+      platformStaffRoleResolved.value = true;
       return;
     }
     const uid = session.value.user.id;
     const previousRole = platformAdminRole.value;
     const myGen = ++adminRoleRefreshGen.value;
-    const { data } = await getSupabaseBrowser()
-      .from("admin_roles")
-      .select("role")
-      .eq("user_id", uid)
-      .maybeSingle();
-    if (myGen !== adminRoleRefreshGen.value) return;
-    if (!session.value?.user?.id || session.value.user.id !== uid) return;
+    try {
+      const { data } = await getSupabaseBrowser()
+        .from("admin_roles")
+        .select("role")
+        .eq("user_id", uid)
+        .maybeSingle();
+      if (myGen !== adminRoleRefreshGen.value) return;
+      if (!session.value?.user?.id || session.value.user.id !== uid) return;
 
-    const r =
-      data && typeof (data as { role?: unknown }).role === "string"
-        ? (data as { role: string }).role
-        : null;
-    platformAdminRole.value = "none";
-    if (r === "super_admin") platformAdminRole.value = "super_admin";
-    else if (r === "admin") platformAdminRole.value = "admin";
+      const r =
+        data && typeof (data as { role?: unknown }).role === "string"
+          ? (data as { role: string }).role
+          : null;
+      let nextRole: PlatformAdminRole = "none";
+      if (r === "super_admin") nextRole = "super_admin";
+      else if (r === "admin") nextRole = "admin";
+      platformAdminRole.value = nextRole;
+    } catch {
+      if (myGen !== adminRoleRefreshGen.value) return;
+      if (!session.value?.user?.id || session.value.user.id !== uid) return;
+      platformAdminRole.value = "none";
+    } finally {
+      if (myGen !== adminRoleRefreshGen.value) return;
+      if (!session.value?.user?.id || session.value.user.id !== uid) return;
+      platformStaffRoleResolved.value = true;
+    }
 
     const gainedConsoleAccess =
       previousRole === "none" && platformAdminRole.value !== "none";
@@ -182,9 +220,7 @@ export const useAuthStore = defineStore("auth", () => {
     } catch {
       /* Pinia may not be ready in edge tests */
     }
-    void refreshSuperAdminRole().finally(() => {
-      platformStaffRoleResolved.value = true;
-    });
+    void refreshSuperAdminRole();
     void refreshProfileAvatar();
   }
 
@@ -234,6 +270,30 @@ export const useAuthStore = defineStore("auth", () => {
    * After Google OAuth, copy sign-up choices from sessionStorage into
    * `user_metadata` (only fills keys that are still missing).
    */
+  /**
+   * Notifies super admins (SMS) once per seller profile when a non-staff user
+   * establishes a session. Idempotent via `profiles.seller_join_sms_sent_at`.
+   */
+  async function notifySuperAdminNewSellerJoinIfNeeded() {
+    if (!isSupabaseConfigured()) return;
+    const sb = getSupabaseBrowser();
+    const {
+      data: { session },
+    } = await sb.auth.getSession();
+    if (!session?.access_token) return;
+    try {
+      const { error } = await sb.functions.invoke(
+        "notify-super-admin-new-seller",
+        { headers: { Authorization: `Bearer ${session.access_token}` } },
+      );
+      if (error) {
+        console.warn("[notify-super-admin-new-seller]", error.message);
+      }
+    } catch (e) {
+      console.warn("[notify-super-admin-new-seller]", e);
+    }
+  }
+
   async function flushPendingSignupPlanToMetadata() {
     if (!isSupabaseConfigured()) return;
     const planRaw = sessionStorage.getItem(AUTH_PENDING_SIGNUP_PLAN_KEY);
@@ -304,10 +364,12 @@ export const useAuthStore = defineStore("auth", () => {
   }
 
   async function signOut() {
+    isManualSignOut.value = true;
     const uid = session.value?.user?.id ?? null;
     if (!isSupabaseConfigured()) {
       syncSession(null);
       platformAdminRole.value = "none";
+      isManualSignOut.value = false;
       return;
     }
     if (uid) {
@@ -321,11 +383,15 @@ export const useAuthStore = defineStore("auth", () => {
       }
     }
     const { error } = await getSupabaseBrowser().auth.signOut();
-    if (error) throw error;
+    if (error) {
+      isManualSignOut.value = false;
+      throw error;
+    }
     platformAdminRole.value = "none";
     // Clear Pinia immediately; onAuthStateChange can lag, which left the UI "signed in"
     // until a full page reload.
     syncSession(null);
+    isManualSignOut.value = false;
   }
 
   return {
@@ -333,6 +399,7 @@ export const useAuthStore = defineStore("auth", () => {
     user,
     sessionUserId,
     isSignedIn,
+    passwordUserNeedsEmailVerification,
     platformAdminRole,
     platformStaffRoleResolved,
     isSuperAdmin,
@@ -349,7 +416,9 @@ export const useAuthStore = defineStore("auth", () => {
     signInWithEmail,
     signUpWithEmail,
     flushPendingSignupPlanToMetadata,
+    notifySuperAdminNewSellerJoinIfNeeded,
     signInWithGoogle,
     signOut,
+    isManualSignOut,
   };
 });

@@ -101,8 +101,7 @@ function applySellerSubscriptionBilling(
 
   const withPayment = subscriptionSnapRows.value.filter(
     (r) =>
-      typeof r.paid_amount_pesewas === "number" &&
-      r.paid_amount_pesewas > 0,
+      typeof r.paid_amount_pesewas === "number" && r.paid_amount_pesewas > 0,
   );
   let totalPesewas = 0;
   for (const r of withPayment) {
@@ -153,7 +152,10 @@ const subscriptionCashflowMonths = computed((): SubscriptionCashflowMonth[] => {
     for (const r of rows) {
       const d = new Date(r.updated_at);
       if (Number.isNaN(d.getTime()) || d.getFullYear() !== y) continue;
-      if (typeof r.paid_amount_pesewas !== "number" || r.paid_amount_pesewas <= 0)
+      if (
+        typeof r.paid_amount_pesewas !== "number" ||
+        r.paid_amount_pesewas <= 0
+      )
         continue;
       const mi = d.getMonth();
       acc[mi]!.incomeGhs += r.paid_amount_pesewas / 100;
@@ -188,7 +190,10 @@ const subscriptionCashflowMonths = computed((): SubscriptionCashflowMonth[] => {
         dr.getMonth() !== mi
       )
         continue;
-      if (typeof r.paid_amount_pesewas !== "number" || r.paid_amount_pesewas <= 0)
+      if (
+        typeof r.paid_amount_pesewas !== "number" ||
+        r.paid_amount_pesewas <= 0
+      )
         continue;
       incomeGhs += r.paid_amount_pesewas / 100;
       const fee =
@@ -299,7 +304,6 @@ watch(
   () => pendingConsoleUsers.value.length,
   (len) => {
     if (authStore.isSuperAdmin) {
-      ui.setAdminPendingConsoleGrantCount(len);
       const prev = prevPendingConsoleLen.value;
       prevPendingConsoleLen.value = len;
       if (prev >= 0 && len > prev) {
@@ -447,6 +451,10 @@ const modalOwnerPlanLabel = ref("");
 const modalOwnerAvatarUrl = ref<string | null>(null);
 const modalOwnerInitial = ref("?");
 const modalStores = ref<OwnerStore[]>([]);
+const modalStoreStatusBusy = ref<Record<string, boolean>>({});
+const modalStoreConfirmOpen = ref(false);
+const modalStoreConfirmTarget = ref<OwnerStore | null>(null);
+const modalStoreConfirmNextActive = ref<boolean>(false);
 
 const revokeConfirmUser = ref<AdminStaffRow | null>(null);
 const revokeBusy = ref(false);
@@ -480,8 +488,67 @@ function modalProductsForStore(storeId: string): ModalProductRow[] {
   return modalProductsByStoreId.value[storeId] ?? [];
 }
 
+function isModalStoreStatusBusy(storeId: string): boolean {
+  return modalStoreStatusBusy.value[storeId] === true;
+}
+
+function applyStoreActiveState(storeId: string, nextActive: boolean) {
+  modalStores.value = modalStores.value.map((s) =>
+    s.id === storeId ? { ...s, is_active: nextActive } : s,
+  );
+  storesFlat.value = storesFlat.value.map((s) =>
+    s.id === storeId ? { ...s, is_active: nextActive } : s,
+  );
+}
+
+async function toggleModalStoreActive(storeRow: OwnerStore) {
+  if (!authStore.isSuperAdmin) return;
+  if (isModalStoreStatusBusy(storeRow.id)) return;
+  modalStoreConfirmTarget.value = storeRow;
+  modalStoreConfirmNextActive.value = !storeRow.is_active;
+  modalStoreConfirmOpen.value = true;
+}
+
+function closeModalStoreConfirm() {
+  if (!modalStoreConfirmTarget.value) return;
+  if (isModalStoreStatusBusy(modalStoreConfirmTarget.value.id)) return;
+  modalStoreConfirmOpen.value = false;
+  modalStoreConfirmTarget.value = null;
+}
+
+async function confirmModalStoreActive() {
+  const storeRow = modalStoreConfirmTarget.value;
+  if (!storeRow) return;
+  if (!authStore.isSuperAdmin) return;
+  if (isModalStoreStatusBusy(storeRow.id)) return;
+  const nextActive = modalStoreConfirmNextActive.value;
+  modalStoreStatusBusy.value = {
+    ...modalStoreStatusBusy.value,
+    [storeRow.id]: true,
+  };
+  const { error } = await getSupabaseBrowser()
+    .from("stores")
+    .update({ is_active: nextActive })
+    .eq("id", storeRow.id);
+  modalStoreStatusBusy.value = {
+    ...modalStoreStatusBusy.value,
+    [storeRow.id]: false,
+  };
+  if (error) {
+    toast.error(error.message);
+    return;
+  }
+  modalStoreConfirmOpen.value = false;
+  modalStoreConfirmTarget.value = null;
+  applyStoreActiveState(storeRow.id, nextActive);
+  toast.success(nextActive ? "Storefront activated." : "Storefront paused.");
+}
+
 const modalCatalogProductTotal = computed(() =>
-  Object.values(modalProductsByStoreId.value).reduce((n, arr) => n + arr.length, 0),
+  Object.values(modalProductsByStoreId.value).reduce(
+    (n, arr) => n + arr.length,
+    0,
+  ),
 );
 
 async function loadModalStoreProducts() {
@@ -560,11 +627,19 @@ function closeOwnerStoresModal() {
   modalOpen.value = false;
   modalProductsByStoreId.value = {};
   modalStoreExpanded.value = {};
+  modalStoreStatusBusy.value = {};
+  modalStoreConfirmOpen.value = false;
+  modalStoreConfirmTarget.value = null;
   modalProductsLoading.value = false;
 }
 
 function onOwnerModalKeydown(e: KeyboardEvent) {
   if (e.key === "Escape") {
+    if (modalStoreConfirmOpen.value) {
+      e.preventDefault();
+      closeModalStoreConfirm();
+      return;
+    }
     if (revokeConfirmUser.value && !revokeBusy.value) {
       e.preventDefault();
       closeRevokeConfirm();
@@ -719,10 +794,7 @@ watch(
       adminProductsHistory.value,
       prod,
     );
-    adminTicketsHistory.value = recordKpiSample(
-      adminTicketsHistory.value,
-      tix,
-    );
+    adminTicketsHistory.value = recordKpiSample(adminTicketsHistory.value, tix);
     adminUsersHistory.value = recordKpiSample(adminUsersHistory.value, adm);
     persistAdminKpiHistories();
   },
@@ -961,6 +1033,13 @@ async function loadPlatformData(silent = false) {
     } else if (adminRolesListRes.error) {
       pendingConsoleUsers.value = [];
     } else {
+      const ownerIdSet = new Set<string>();
+      if (!storesRes.error) {
+        for (const row of (storesRes.data ?? []) as { owner_id?: string }[]) {
+          const ownerId = typeof row.owner_id === "string" ? row.owner_id : "";
+          if (ownerId) ownerIdSet.add(ownerId);
+        }
+      }
       const rawList = (profilesRecentRes.data ?? []) as {
         id: string;
         display_name?: string | null;
@@ -971,6 +1050,7 @@ async function loadPlatformData(silent = false) {
       for (const row of rawList) {
         const id = String(row.id);
         if (adminUserIdSet.has(id)) continue;
+        if (!ownerIdSet.has(id)) continue;
         const name = row.display_name?.trim() || "Unknown";
         pending.push({
           id,
@@ -1049,6 +1129,11 @@ async function loadPlatformData(silent = false) {
       }
     }
   } finally {
+    if (authStore.isSuperAdmin) {
+      void ui.refreshAdminPendingConsoleGrantCount();
+    } else {
+      ui.setAdminPendingConsoleGrantCount(0);
+    }
     if (!silent) loading.value = false;
   }
 }
@@ -1358,7 +1443,8 @@ async function confirmRevokeConsoleAccess() {
                 </span>
               </div>
               <p class="text-[10px] font-medium text-zinc-500">
-                Live trend (48h, this browser) · hover chart for time &amp; value
+                Live trend (48h, this browser) · hover chart for time &amp;
+                value
               </p>
               <div
                 class="h-[6.5rem] w-full shrink-0 sm:h-28 lg:h-[7.25rem]"
@@ -1545,7 +1631,12 @@ async function confirmRevokeConsoleAccess() {
                         class="flex min-w-0 max-w-[20rem] items-center gap-3"
                       >
                         <span
-                          class="relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 text-sm font-bold text-white shadow-sm ring-2 ring-white/90"
+                          class="relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full text-sm font-bold text-white shadow-sm ring-2 ring-white/90"
+                          :class="
+                            row.ownerAvatarUrl
+                              ? 'bg-white'
+                              : 'bg-gradient-to-br from-violet-500 to-indigo-600'
+                          "
                         >
                           <span
                             class="absolute inset-0 flex items-center justify-center"
@@ -1556,7 +1647,7 @@ async function confirmRevokeConsoleAccess() {
                             v-if="row.ownerAvatarUrl"
                             :src="row.ownerAvatarUrl"
                             alt=""
-                            class="relative z-10 h-full w-full object-cover"
+                            class="relative z-10 h-full w-full bg-white object-cover"
                             loading="lazy"
                             @error="
                               ($event.target as HTMLImageElement).classList.add(
@@ -1638,7 +1729,7 @@ async function confirmRevokeConsoleAccess() {
 
       <!-- Console: platform staff directory -->
       <aside
-        class="flex h-full min-h-0 w-full min-w-0 flex-col gap-4 rounded-[1.75rem] border border-indigo-200/45 bg-gradient-to-br from-white/95 via-indigo-50/35 to-violet-50/45 p-5 shadow-[0_20px_50px_-32px_rgba(79,70,229,0.12)] backdrop-blur-sm sm:rounded-3xl sm:p-6 md:min-h-[18rem]"
+        class="flex h-full min-h-0 w-full min-w-0 self-stretch flex-col gap-4 rounded-[1.75rem] border border-indigo-200/45 bg-gradient-to-br from-white/95 via-indigo-50/35 to-violet-50/45 p-5 shadow-[0_20px_50px_-32px_rgba(79,70,229,0.12)] backdrop-blur-sm sm:rounded-3xl sm:p-6"
       >
         <div class="shrink-0 min-w-0">
           <p
@@ -1649,9 +1740,7 @@ async function confirmRevokeConsoleAccess() {
           <div
             class="mt-2 flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-2"
           >
-            <h2
-              class="min-w-0 text-lg font-bold tracking-tight text-zinc-900"
-            >
+            <h2 class="min-w-0 text-lg font-bold tracking-tight text-zinc-900">
               Console users
             </h2>
             <div
@@ -1685,7 +1774,9 @@ async function confirmRevokeConsoleAccess() {
           <p class="mt-1 text-sm leading-relaxed text-zinc-600">
             Everyone with access to this admin workspace.
           </p>
-          <p class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-snug text-zinc-500">
+          <p
+            class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-snug text-zinc-500"
+          >
             <span class="inline-flex items-center gap-1.5">
               <span
                 class="h-2.5 w-2.5 shrink-0 rounded-full bg-emerald-500 ring-2 ring-white shadow-sm"
@@ -1721,7 +1812,12 @@ async function confirmRevokeConsoleAccess() {
               "
             >
               <span
-                class="relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 text-xs font-bold text-white shadow-sm ring-2 ring-white/90"
+                class="relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full text-xs font-bold text-white shadow-sm ring-2 ring-white/90"
+                :class="
+                  u.avatarUrl
+                    ? 'bg-white'
+                    : 'bg-gradient-to-br from-violet-500 to-indigo-600'
+                "
               >
                 <span
                   class="absolute inset-0 flex items-center justify-center"
@@ -1732,7 +1828,7 @@ async function confirmRevokeConsoleAccess() {
                   v-if="u.avatarUrl"
                   :src="u.avatarUrl"
                   alt=""
-                  class="relative z-10 h-full w-full object-cover"
+                  class="relative z-10 h-full w-full bg-white object-cover"
                   loading="lazy"
                   @error="
                     ($event.target as HTMLImageElement).classList.add('hidden')
@@ -1749,9 +1845,7 @@ async function confirmRevokeConsoleAccess() {
                 aria-hidden="true"
               />
             </span>
-            <div
-              class="flex min-w-0 flex-1 items-center justify-between gap-3"
-            >
+            <div class="flex min-w-0 flex-1 items-center justify-between gap-3">
               <div class="min-w-0">
                 <p class="truncate text-sm font-semibold text-zinc-900">
                   {{ u.displayName
@@ -1850,11 +1944,11 @@ async function confirmRevokeConsoleAccess() {
                 Grant access
               </h3>
               <p class="mt-1.5 text-[13px] leading-relaxed text-zinc-600">
-                Console access is never automatic for new sign-ups. Choose someone
-                from recent
+                Console access is never automatic for new sign-ups. Choose a
+                user from recent
                 <span
                   class="rounded bg-violet-100/90 px-1 py-0.5 font-mono text-[11px] font-semibold text-violet-900"
-                  >profiles</span
+                  >store owners</span
                 >
                 below, or paste a UUID to grant platform
                 <span
@@ -1865,11 +1959,13 @@ async function confirmRevokeConsoleAccess() {
             </div>
           </div>
 
-          <div class="mt-4 min-w-0 rounded-2xl bg-white/70 p-3 ring-1 ring-zinc-200/50 sm:p-4">
+          <div
+            class="mt-4 min-w-0 rounded-2xl bg-white/70 p-3 ring-1 ring-zinc-200/50 sm:p-4"
+          >
             <p
               class="text-[11px] font-bold uppercase tracking-[0.12em] text-indigo-800/70"
             >
-              Recent sign-ups · no console role
+              Store owners · no console role
             </p>
             <div
               v-if="!pendingConsoleUsers.length"
@@ -1894,7 +1990,12 @@ async function confirmRevokeConsoleAccess() {
               >
                 <div class="flex min-w-0 flex-1 items-center gap-2.5">
                   <span
-                    class="relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 text-xs font-bold text-white shadow-md ring-2 ring-white"
+                    class="relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full text-xs font-bold text-white shadow-md ring-2 ring-white"
+                    :class="
+                      p.avatarUrl
+                        ? 'bg-white'
+                        : 'bg-gradient-to-br from-violet-500 to-indigo-600'
+                    "
                     aria-hidden="true"
                   >
                     <span
@@ -1905,7 +2006,7 @@ async function confirmRevokeConsoleAccess() {
                       v-if="p.avatarUrl"
                       :src="p.avatarUrl"
                       alt=""
-                      class="relative z-10 h-full w-full object-cover"
+                      class="relative z-10 h-full w-full bg-white object-cover"
                       loading="lazy"
                       @error="
                         ($event.target as HTMLImageElement).classList.add(
@@ -1918,7 +2019,9 @@ async function confirmRevokeConsoleAccess() {
                     <p class="truncate text-sm font-semibold text-zinc-900">
                       {{ p.displayName }}
                     </p>
-                    <p class="mt-0.5 truncate font-mono text-[11px] text-zinc-500">
+                    <p
+                      class="mt-0.5 truncate font-mono text-[11px] text-zinc-500"
+                    >
                       Joined {{ p.createdLabel }}
                       <span class="text-zinc-400">·</span>
                       …{{ p.id.slice(-8) }}
@@ -2173,6 +2276,26 @@ async function confirmRevokeConsoleAccess() {
                       <div
                         class="flex shrink-0 flex-wrap items-center gap-2 sm:justify-end"
                       >
+                        <button
+                          v-if="authStore.isSuperAdmin"
+                          type="button"
+                          class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold transition disabled:opacity-50"
+                          :class="
+                            s.is_active
+                              ? 'border-zinc-300 bg-white text-zinc-700 hover:border-zinc-400 hover:bg-zinc-50'
+                              : 'border-emerald-300 bg-emerald-50 text-emerald-800 hover:border-emerald-400 hover:bg-emerald-100/70'
+                          "
+                          :disabled="isModalStoreStatusBusy(s.id)"
+                          @click="toggleModalStoreActive(s)"
+                        >
+                          {{
+                            isModalStoreStatusBusy(s.id)
+                              ? "Saving..."
+                              : s.is_active
+                                ? "Pause link"
+                                : "Activate link"
+                          }}
+                        </button>
                         <span
                           class="inline-flex rounded-full px-2.5 py-1 text-[11px] font-semibold"
                           :class="
@@ -2247,6 +2370,80 @@ async function confirmRevokeConsoleAccess() {
 
       <Transition name="admin-revoke-dialog">
         <div
+          v-if="modalStoreConfirmOpen && modalStoreConfirmTarget"
+          class="fixed inset-0 z-[269] flex items-center justify-center p-4"
+          role="presentation"
+        >
+          <div
+            class="absolute inset-0 bg-zinc-900/50 backdrop-blur-sm"
+            aria-hidden="true"
+          />
+          <div
+            class="relative z-10 w-full max-w-md overflow-hidden rounded-3xl border border-zinc-200/80 bg-white p-5 shadow-[0_24px_80px_-24px_rgba(15,23,42,0.35)] ring-1 ring-zinc-100/80 sm:p-6"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="store-link-toggle-title"
+            aria-describedby="store-link-toggle-desc"
+            @click.stop
+          >
+            <h2
+              id="store-link-toggle-title"
+              class="text-base font-bold tracking-tight text-zinc-900"
+            >
+              {{
+                modalStoreConfirmNextActive
+                  ? "Activate seller store link?"
+                  : "Pause seller store link?"
+              }}
+            </h2>
+            <p
+              id="store-link-toggle-desc"
+              class="mt-2 text-sm leading-relaxed text-zinc-600"
+            >
+              <span class="font-semibold text-zinc-800">{{
+                modalStoreConfirmTarget.name
+              }}</span>
+              {{
+                modalStoreConfirmNextActive
+                  ? " will become live. Customers can open the storefront and place new orders."
+                  : " will be paused. Customers will no longer be able to open the storefront or place new orders."
+              }}
+            </p>
+            <div class="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                class="inline-flex rounded-xl border border-zinc-200/90 bg-white px-4 py-2.5 text-sm font-semibold text-zinc-700 shadow-sm transition hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-50"
+                :disabled="isModalStoreStatusBusy(modalStoreConfirmTarget.id)"
+                @click="closeModalStoreConfirm"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="inline-flex rounded-xl px-4 py-2.5 text-sm font-semibold text-white shadow-md transition disabled:cursor-not-allowed disabled:opacity-60"
+                :class="
+                  modalStoreConfirmNextActive
+                    ? 'bg-gradient-to-r from-emerald-600 to-emerald-700 shadow-emerald-600/25 hover:from-emerald-700 hover:to-emerald-800'
+                    : 'bg-gradient-to-r from-zinc-800 to-zinc-900 shadow-zinc-900/25 hover:from-zinc-900 hover:to-black'
+                "
+                :disabled="isModalStoreStatusBusy(modalStoreConfirmTarget.id)"
+                @click="confirmModalStoreActive"
+              >
+                {{
+                  isModalStoreStatusBusy(modalStoreConfirmTarget.id)
+                    ? "Saving…"
+                    : modalStoreConfirmNextActive
+                      ? "Activate link"
+                      : "Pause link"
+                }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Transition>
+
+      <Transition name="admin-revoke-dialog">
+        <div
           v-if="revokeConfirmUser"
           class="fixed inset-0 z-[270] flex items-center justify-center p-4"
           role="presentation"
@@ -2276,9 +2473,9 @@ async function confirmRevokeConsoleAccess() {
               <span class="font-semibold text-zinc-800">{{
                 revokeConfirmUser.displayName
               }}</span>
-              will lose platform admin access. They can be granted again later if
-              needed. Users on an auto-grant email domain may regain access on
-              their next sign-in unless that domain is removed from the allow
+              will lose platform admin access. They can be granted again later
+              if needed. Users on an auto-grant email domain may regain access
+              on their next sign-in unless that domain is removed from the allow
               list.
             </p>
             <div class="mt-5 flex flex-wrap justify-end gap-2">
@@ -2313,7 +2510,9 @@ async function confirmRevokeConsoleAccess() {
 }
 .admin-revoke-dialog-enter-active > div.relative,
 .admin-revoke-dialog-leave-active > div.relative {
-  transition: transform 0.2s ease, opacity 0.2s ease;
+  transition:
+    transform 0.2s ease,
+    opacity 0.2s ease;
 }
 .admin-revoke-dialog-enter-from,
 .admin-revoke-dialog-leave-to {

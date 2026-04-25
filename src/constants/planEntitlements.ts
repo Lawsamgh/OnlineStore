@@ -6,14 +6,13 @@ const KNOWN_IDS = new Set<PlanId>(PRICING_PLANS.map((p) => p.id));
 
 /**
  * Max storefronts per seller for each tier.
- * Free explicitly lists one shop; Starter/Growth use a single storefront URL in
- * pricing — Growth is not a multi-shop tier here. Pro: no fixed cap.
+ * All plans currently allow a single storefront.
  */
 export const MAX_STORES_BY_PLAN: Record<PlanId, number | null> = {
   free: 1,
   starter: 1,
   growth: 1,
-  pro: null,
+  pro: 1,
 };
 
 export function isKnownPlanId(id: string | null | undefined): id is PlanId {
@@ -28,13 +27,13 @@ export function normalizeSignupPlanId(
   return isKnownPlanId(id) ? id : null;
 }
 
-/** Numeric cap for comparisons (`atStoreLimit`); Pro is effectively unlimited. */
+/** Numeric cap for comparisons (`atStoreLimit`). */
 export function maxStoresForPlan(planId: PlanId): number {
   const m = MAX_STORES_BY_PLAN[planId];
   return m ?? 1_000_000;
 }
 
-/** Copy for UI: `"3"` or `"unlimited"` (Pro). */
+/** Copy for UI: numeric cap or `"unlimited"` when configured. */
 export function maxStoresDisplayText(planId: PlanId): string {
   const m = MAX_STORES_BY_PLAN[planId];
   if (m == null) return "unlimited";

@@ -4,10 +4,9 @@ import { useRoute, useRouter, type RouteLocationRaw } from "vue-router";
 import LoginPlexusBackground from "../components/LoginPlexusBackground.vue";
 import {
   PRICING_PLANS,
-  formatGhsWhole,
   type PricingPlan,
 } from "../constants/pricingPlans";
-import { isSupabaseConfigured } from "../lib/supabase";
+import { getSupabaseBrowser, isSupabaseConfigured } from "../lib/supabase";
 import {
   AUTH_OAUTH_REDIRECT_PENDING_KEY,
   AUTH_PENDING_SIGNUP_FULL_NAME_KEY,
@@ -21,10 +20,21 @@ const router = useRouter();
 const auth = useAuthStore();
 const toast = useToastStore();
 
-const mode = ref<"sign-in" | "sign-up">("sign-in");
+const mode = ref<"sign-in" | "sign-up" | "reset">("sign-in");
 
 function syncModeFromRoute() {
-  const q = route.query.mode;
+  const qMode = route.query.mode;
+  const wantsReset =
+    qMode === "reset" ||
+    (Array.isArray(qMode) && qMode.includes("reset")) ||
+    route.query.type === "recovery" ||
+    (Array.isArray(route.query.type) && route.query.type.includes("recovery")) ||
+    (typeof route.hash === "string" && route.hash.includes("type=recovery"));
+  if (wantsReset) {
+    mode.value = "reset";
+    return;
+  }
+  const q = qMode;
   const wantsSignUp =
     q === "sign-up" ||
     q === "signup" ||
@@ -34,7 +44,7 @@ function syncModeFromRoute() {
 
 syncModeFromRoute();
 watch(
-  () => route.query.mode,
+  () => [route.query.mode, route.query.type, route.hash] as const,
   () => {
     syncModeFromRoute();
   },
@@ -44,7 +54,35 @@ const fullName = ref("");
 const email = ref("");
 const password = ref("");
 const passwordConfirm = ref("");
+const showPassword = ref(false);
+const showPasswordConfirm = ref(false);
 const busy = ref(false);
+const authRedirecting = ref(false);
+const showAuthTransitionOverlay = computed(
+  () =>
+    authRedirecting.value ||
+    (route.name === "login" && auth.isSignedIn && mode.value !== "reset"),
+);
+const passwordStrength = computed(() => {
+  if (mode.value !== "sign-up" && mode.value !== "reset") {
+    return { score: 0, pct: 0, label: "", tone: "" };
+  }
+  const v = password.value ?? "";
+  let score = 0;
+  if (v.length >= 8) score += 1;
+  if (/[a-z]/.test(v)) score += 1;
+  if (/[A-Z]/.test(v)) score += 1;
+  if (/[0-9]/.test(v)) score += 1;
+  if (/[^A-Za-z0-9]/.test(v)) score += 1;
+  const pct = Math.round((score / 5) * 100);
+  if (score <= 2) {
+    return { score, pct, label: "Weak", tone: "bg-rose-500" };
+  }
+  if (score <= 4) {
+    return { score, pct, label: "Medium", tone: "bg-amber-500" };
+  }
+  return { score, pct, label: "Strong", tone: "bg-emerald-500" };
+});
 
 function parsePlanFromQuery(q: unknown): PricingPlan["id"] | null {
   const raw = typeof q === "string" ? q : Array.isArray(q) ? q[0] : null;
@@ -68,7 +106,33 @@ function oauthErrorFromQuery(): string | null {
 }
 
 onMounted(() => {
+  async function ensureValidRecoverySession() {
+    if (mode.value !== "reset" || !isSupabaseConfigured()) return;
+    const { data, error } = await getSupabaseBrowser().auth.getSession();
+    if (error || !data.session) {
+      toast.error("Reset link is invalid or expired. Request a new one.");
+      await router.replace({ name: "login", query: {}, hash: "" });
+    }
+  }
+
   syncSelectedPlanFromRoute();
+  const expiredReason = route.query.reason;
+  const showExpiryNotice =
+    expiredReason === "expired" ||
+    (Array.isArray(expiredReason) && expiredReason.includes("expired"));
+  if (showExpiryNotice) {
+    toast.info("Session expired after 30 minutes of inactivity. Please sign in again.");
+    const q = { ...route.query };
+    delete q.reason;
+    void router.replace({ name: "login", query: q });
+  }
+  const verifyRequired = route.query.verify;
+  const showVerifyNotice =
+    verifyRequired === "required" ||
+    (Array.isArray(verifyRequired) && verifyRequired.includes("required"));
+  if (showVerifyNotice) {
+    toast.error("Please verify your email before continuing.");
+  }
   const oauthErr = oauthErrorFromQuery();
   if (oauthErr) {
     toast.error(oauthErr);
@@ -78,6 +142,7 @@ onMounted(() => {
     delete q.error_code;
     void router.replace({ name: "login", query: q });
   }
+  void ensureValidRecoverySession();
 });
 
 /** OAuth (and “open /login while already signed in”) → leave login using same rules as email sign-in. */
@@ -85,8 +150,24 @@ watch(
   () => [auth.isSignedIn, route.name] as const,
   async ([signedIn, name]) => {
     if (!signedIn || name !== "login" || busy.value) return;
-    const dest = await resolvePostLoginDestination();
-    await router.replace(dest);
+    if (mode.value === "reset") return;
+    if (auth.passwordUserNeedsEmailVerification) {
+      try {
+        await auth.signOut();
+      } catch {
+        /* keep user on login even if signOut RPC fails */
+      }
+      toast.error("Please verify your email before continuing.");
+      authRedirecting.value = false;
+      return;
+    }
+    authRedirecting.value = true;
+    try {
+      const dest = await resolvePostLoginDestination();
+      await router.replace(dest);
+    } finally {
+      authRedirecting.value = false;
+    }
   },
   { immediate: true },
 );
@@ -102,29 +183,11 @@ watch(mode, (m) => {
   if (m === "sign-up") syncSelectedPlanFromRoute();
 });
 
-const selectedPlan = computed(
-  () => PRICING_PLANS.find((p) => p.id === selectedPlanId.value)!,
-);
-
-function selectSignupPlan(id: PricingPlan["id"]) {
-  selectedPlanId.value = id;
-  const q: Record<string, string> = {};
-  for (const [k, v] of Object.entries(route.query)) {
-    if (k === "plan") continue;
-    if (typeof v === "string" && v !== "") q[k] = v;
-    else if (Array.isArray(v) && typeof v[0] === "string" && v[0] !== "")
-      q[k] = v[0];
-  }
-  q.plan = id;
-  if (mode.value === "sign-up") q.mode = "sign-up";
-  void router.replace({ name: "login", query: q });
-}
-
 function blockPasswordPasteIfSignUp(e: ClipboardEvent) {
-  if (mode.value === "sign-up") e.preventDefault();
+  if (mode.value === "sign-up" || mode.value === "reset") e.preventDefault();
 }
 
-function replaceQueryMode(next: "sign-in" | "sign-up") {
+function replaceQueryMode(next: "sign-in" | "sign-up" | "reset") {
   fullName.value = "";
   passwordConfirm.value = "";
   const q: Record<string, string> = {};
@@ -135,7 +198,9 @@ function replaceQueryMode(next: "sign-in" | "sign-up") {
       q[k] = v[0];
   }
   if (next === "sign-up") q.mode = "sign-up";
-  else delete q.plan;
+  else if (next === "reset") q.mode = "reset";
+  else delete q.mode;
+  if (next !== "sign-up") delete q.plan;
   void router.replace({ name: "login", query: q });
 }
 
@@ -161,9 +226,36 @@ async function submit() {
     toast.error("Add Supabase keys to .env first.");
     return;
   }
+  if (mode.value === "reset" && password.value !== passwordConfirm.value) {
+    toast.error("Passwords do not match.");
+    return;
+  }
   if (mode.value === "sign-up" && password.value !== passwordConfirm.value) {
     toast.error("Passwords do not match.");
     return;
+  }
+  if (mode.value === "sign-up" || mode.value === "reset") {
+    const v = password.value;
+    if (v.length < 8) {
+      toast.error("Password must be at least 8 characters.");
+      return;
+    }
+    if (!/[a-z]/.test(v)) {
+      toast.error("Password must include at least one lowercase letter.");
+      return;
+    }
+    if (!/[A-Z]/.test(v)) {
+      toast.error("Password must include at least one uppercase letter.");
+      return;
+    }
+    if (!/[0-9]/.test(v)) {
+      toast.error("Password must include at least one number.");
+      return;
+    }
+    if (!/[^A-Za-z0-9]/.test(v)) {
+      toast.error("Password must include at least one symbol.");
+      return;
+    }
   }
   if (mode.value === "sign-up" && fullName.value.trim().length < 2) {
     toast.error("Please enter your full name (at least 2 characters).");
@@ -171,8 +263,25 @@ async function submit() {
   }
   busy.value = true;
   try {
-    if (mode.value === "sign-in") {
+    if (mode.value === "reset") {
+      const { error } = await getSupabaseBrowser().auth.updateUser({
+        password: password.value,
+      });
+      if (error) throw error;
+      toast.success("Password updated. You can sign in now.");
+      password.value = "";
+      passwordConfirm.value = "";
+      showPassword.value = false;
+      showPasswordConfirm.value = false;
+      replaceQueryMode("sign-in");
+    } else if (mode.value === "sign-in") {
       await auth.signInWithEmail(email.value.trim(), password.value);
+      await auth.refreshSessionFromSupabase();
+      if (auth.passwordUserNeedsEmailVerification) {
+        await auth.signOut();
+        toast.error("Please verify your email before continuing.");
+        return;
+      }
       toast.success("Signed in successfully.");
     } else {
       await auth.signUpWithEmail(
@@ -184,13 +293,51 @@ async function submit() {
       toast.success(
         "Check your email to confirm the account if your project requires it.",
       );
+      fullName.value = "";
+      email.value = "";
+      password.value = "";
+      passwordConfirm.value = "";
+      showPassword.value = false;
+      showPasswordConfirm.value = false;
     }
     if (mode.value === "sign-in") {
+      authRedirecting.value = true;
       await router.replace(await resolvePostLoginDestination());
     }
   } catch (e: unknown) {
     sessionStorage.removeItem(AUTH_OAUTH_REDIRECT_PENDING_KEY);
     toast.error(e instanceof Error ? e.message : "Something went wrong");
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function sendResetPasswordEmail() {
+  if (!isSupabaseConfigured()) {
+    toast.error("Add Supabase keys to .env first.");
+    return;
+  }
+  const targetEmail = email.value.trim();
+  if (!targetEmail) {
+    toast.error("Enter your email first.");
+    return;
+  }
+  busy.value = true;
+  try {
+    const originWithBase =
+      `${window.location.origin}${import.meta.env.BASE_URL}`.replace(
+        /\/+$/,
+        "",
+      );
+    const redirectTo = `${originWithBase}/login?mode=reset`;
+    const { error } = await getSupabaseBrowser().auth.resetPasswordForEmail(
+      targetEmail,
+      { redirectTo },
+    );
+    if (error) throw error;
+    toast.success("Password reset email sent. Check your inbox.");
+  } catch (e: unknown) {
+    toast.error(e instanceof Error ? e.message : "Could not send reset email.");
   } finally {
     busy.value = false;
   }
@@ -235,6 +382,36 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
   <div
     class="relative min-h-svh overflow-hidden bg-gradient-to-br from-zinc-100 via-white to-emerald-50/35 antialiased"
   >
+    <Transition
+      enter-active-class="transition-opacity duration-200"
+      enter-from-class="opacity-0"
+      enter-to-class="opacity-100"
+      leave-active-class="transition-opacity duration-150"
+      leave-from-class="opacity-100"
+      leave-to-class="opacity-0"
+    >
+      <div
+        v-if="showAuthTransitionOverlay"
+        class="fixed inset-0 z-[10000] flex items-center justify-center bg-white/70 backdrop-blur-sm"
+        aria-live="polite"
+        aria-busy="true"
+        @click.prevent.stop
+        @mousedown.prevent.stop
+        @mouseup.prevent.stop
+        @pointerdown.prevent.stop
+        @pointerup.prevent.stop
+      >
+        <div
+          class="flex items-center gap-3 rounded-2xl border border-white/70 bg-white/90 px-4 py-3 shadow-lg ring-1 ring-zinc-200/60"
+        >
+          <span
+            class="h-5 w-5 animate-spin rounded-full border-[2.5px] border-zinc-300 border-t-zinc-900"
+            aria-hidden="true"
+          />
+          <p class="text-sm font-medium text-zinc-700">Loading your dashboard...</p>
+        </div>
+      </div>
+    </Transition>
     <div
       class="pointer-events-none absolute -right-32 top-0 h-96 w-96 rounded-full bg-lime-300/25 blur-3xl"
       aria-hidden="true"
@@ -259,6 +436,7 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
           class="w-full max-w-lg rounded-3xl border border-white/60 bg-white/75 p-8 shadow-[0_24px_80px_-24px_rgba(0,0,0,0.18)] ring-1 ring-zinc-200/60 backdrop-blur-xl sm:max-w-xl sm:p-10 md:p-11"
         >
           <div
+            v-if="mode !== 'reset'"
             class="flex rounded-full bg-zinc-100/90 p-1 ring-1 ring-zinc-200/80"
             role="tablist"
             aria-label="Account mode"
@@ -296,77 +474,19 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
               {{
                 mode === "sign-in"
                   ? "Welcome back"
-                  : "Create your seller account"
+                  : mode === "sign-up"
+                    ? "Create your seller account"
+                    : "Set a new password"
               }}
             </h1>
             <p class="mt-2 text-pretty text-sm leading-relaxed text-zinc-600">
               {{
                 mode === "sign-in"
                   ? "Sign in with email or Google. Your account is protected with industry-standard security."
-                  : "Start in minutes. If we need to verify your email, we will send you a short confirmation link."
+                  : mode === "sign-up"
+                    ? "Start in minutes. If we need to verify your email, we will send you a short confirmation link."
+                    : "Enter and confirm your new password below."
               }}
-            </p>
-          </div>
-
-          <div v-if="mode === 'sign-up'" class="mt-6">
-            <fieldset>
-              <legend
-                class="text-xs font-semibold uppercase tracking-wider text-zinc-500"
-              >
-                Starting plan
-              </legend>
-              <p
-                class="mt-1.5 text-pretty text-xs leading-relaxed text-zinc-500"
-              >
-                Choose where you want to begin. Paid tiers are selected here
-                first; you complete payment from your dashboard when you are
-                ready.
-              </p>
-              <div
-                class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2"
-                role="radiogroup"
-                aria-label="Subscription plan"
-              >
-                <button
-                  v-for="plan in PRICING_PLANS"
-                  :key="plan.id"
-                  type="button"
-                  role="radio"
-                  :aria-checked="selectedPlanId === plan.id"
-                  class="rounded-2xl border px-3 py-3 text-left text-sm transition-all outline-none focus-visible:ring-4 focus-visible:ring-zinc-900/15"
-                  :class="
-                    selectedPlanId === plan.id
-                      ? 'border-lime-400/90 bg-lime-50/90 ring-2 ring-lime-400/50'
-                      : 'border-zinc-200/90 bg-white/80 hover:border-zinc-300'
-                  "
-                  @click="selectSignupPlan(plan.id)"
-                >
-                  <span class="font-semibold text-zinc-900">{{
-                    plan.name
-                  }}</span>
-                  <span class="mt-0.5 block text-xs text-zinc-600">
-                    <template v-if="plan.monthlyGhs === 0"
-                      >Free — no card</template
-                    >
-                    <template v-else
-                      >{{ formatGhsWhole(plan.monthlyGhs) }} / month</template
-                    >
-                  </span>
-                </button>
-              </div>
-            </fieldset>
-            <p class="mt-3 text-pretty text-xs leading-relaxed text-zinc-500">
-              <span class="font-medium text-zinc-700">{{
-                selectedPlan.name
-              }}</span>
-              <span v-if="selectedPlan.monthlyGhs === 0" class="text-zinc-600">
-                — use the free limits right after sign-up; upgrade anytime from
-                your dashboard.
-              </span>
-              <span v-else class="text-zinc-600">
-                — after sign-up, continue from your dashboard to activate this
-                tier when you pay.
-              </span>
             </p>
           </div>
 
@@ -388,6 +508,7 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
           </div>
 
           <button
+            v-if="mode !== 'reset'"
             type="button"
             :disabled="busy"
             class="mt-8 flex w-full items-center justify-center gap-3 rounded-2xl border border-zinc-200 bg-white px-4 py-3.5 text-sm font-semibold text-zinc-800 shadow-sm transition-all hover:border-zinc-300 hover:bg-zinc-50 hover:shadow-md disabled:pointer-events-none disabled:opacity-50 active:scale-[0.99]"
@@ -419,6 +540,7 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
           </button>
 
           <div class="relative my-8">
+            <template v-if="mode !== 'reset'">
             <div class="absolute inset-0 flex items-center" aria-hidden="true">
               <div class="w-full border-t border-zinc-200" />
             </div>
@@ -428,6 +550,7 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
                 >Or email</span
               >
             </div>
+            </template>
           </div>
 
           <form class="space-y-5" @submit.prevent="submit">
@@ -449,7 +572,7 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
                 placeholder="e.g. Yaw Oppong"
               />
             </div>
-            <div>
+            <div v-if="mode !== 'reset'">
               <label
                 class="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-zinc-500"
                 for="email"
@@ -471,37 +594,160 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
                 for="password"
                 >Password</label
               >
-              <input
-                id="password"
-                v-model="password"
-                type="password"
-                :autocomplete="
-                  mode === 'sign-in' ? 'current-password' : 'new-password'
-                "
-                required
-                minlength="6"
-                class="w-full rounded-2xl border border-zinc-200 bg-white/90 px-4 py-3.5 text-sm text-zinc-900 shadow-inner shadow-zinc-900/5 outline-none transition-[border-color,box-shadow,ring] placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-4 focus:ring-zinc-900/10"
-                placeholder="At least 6 characters"
-                @paste="blockPasswordPasteIfSignUp"
-              />
+              <div class="relative">
+                <input
+                  id="password"
+                  v-model="password"
+                  :type="showPassword ? 'text' : 'password'"
+                  :autocomplete="mode === 'sign-in' ? 'current-password' : 'new-password'"
+                  required
+                :minlength="mode === 'sign-in' ? 6 : 8"
+                  class="w-full rounded-2xl border border-zinc-200 bg-white/90 px-4 py-3.5 pr-12 text-sm text-zinc-900 shadow-inner shadow-zinc-900/5 outline-none transition-[border-color,box-shadow,ring] placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-4 focus:ring-zinc-900/10"
+                  :placeholder="mode === 'sign-in' ? 'Enter your password' : 'Min 8 chars, upper, lower, number, symbol'"
+                  @paste="blockPasswordPasteIfSignUp"
+                />
+                <button
+                  type="button"
+                  class="absolute inset-y-0 right-0 inline-flex w-11 items-center justify-center rounded-r-2xl text-zinc-500 transition hover:text-zinc-800"
+                  :aria-label="showPassword ? 'Hide password' : 'Show password'"
+                  @click="showPassword = !showPassword"
+                >
+                  <svg
+                    v-if="!showPassword"
+                    class="h-5 w-5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="1.75"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M2.25 12s3.75-6.75 9.75-6.75S21.75 12 21.75 12 18 18.75 12 18.75 2.25 12 2.25 12z"
+                    />
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M12 14.25a2.25 2.25 0 100-4.5 2.25 2.25 0 000 4.5z"
+                    />
+                  </svg>
+                  <svg
+                    v-else
+                    class="h-5 w-5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="1.75"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M3 3l18 18M10.58 10.58A2.25 2.25 0 0013.42 13.42M9.88 5.08A9.84 9.84 0 0112 4.5c6 0 9.75 7.5 9.75 7.5a16.89 16.89 0 01-4.41 5.19M6.23 6.23C3.99 8.04 2.25 12 2.25 12s3.75 6.75 9.75 6.75a9.7 9.7 0 003.12-.5"
+                    />
+                  </svg>
+                </button>
+              </div>
+              <button
+                v-if="mode === 'sign-in'"
+                type="button"
+                class="mt-2 text-xs font-semibold text-emerald-700 underline-offset-2 transition hover:text-emerald-800 hover:underline"
+                :disabled="busy"
+                @click="sendResetPasswordEmail"
+              >
+                Forgot password?
+              </button>
+              <div v-if="mode === 'sign-up'" class="mt-2">
+                <div class="flex items-center justify-between text-[11px]">
+                  <span class="font-medium text-zinc-500">Password strength</span>
+                  <span
+                    class="font-semibold"
+                    :class="
+                      passwordStrength.label === 'Strong'
+                        ? 'text-emerald-600'
+                        : passwordStrength.label === 'Medium'
+                          ? 'text-amber-600'
+                          : 'text-rose-600'
+                    "
+                  >
+                    {{ passwordStrength.label }}
+                  </span>
+                </div>
+                <div class="mt-1.5 h-2 w-full overflow-hidden rounded-full bg-zinc-200/90">
+                  <div
+                    class="h-full rounded-full transition-all duration-200 ease-out"
+                    :class="passwordStrength.tone"
+                    :style="{ width: `${passwordStrength.pct}%` }"
+                  />
+                </div>
+              </div>
             </div>
-            <div v-if="mode === 'sign-up'">
+            <div v-if="mode === 'sign-up' || mode === 'reset'">
               <label
                 class="mb-1.5 block text-xs font-semibold uppercase tracking-wider text-zinc-500"
                 for="password-confirm"
                 >Confirm password</label
               >
-              <input
-                id="password-confirm"
-                v-model="passwordConfirm"
-                type="password"
-                autocomplete="new-password"
-                required
-                minlength="6"
-                class="w-full rounded-2xl border border-zinc-200 bg-white/90 px-4 py-3.5 text-sm text-zinc-900 shadow-inner shadow-zinc-900/5 outline-none transition-[border-color,box-shadow,ring] placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-4 focus:ring-zinc-900/10"
-                placeholder="Re-enter your password"
-                @paste="blockPasswordPasteIfSignUp"
-              />
+              <div class="relative">
+                <input
+                  id="password-confirm"
+                  v-model="passwordConfirm"
+                  :type="showPasswordConfirm ? 'text' : 'password'"
+                  autocomplete="new-password"
+                  required
+                  minlength="6"
+                  class="w-full rounded-2xl border border-zinc-200 bg-white/90 px-4 py-3.5 pr-12 text-sm text-zinc-900 shadow-inner shadow-zinc-900/5 outline-none transition-[border-color,box-shadow,ring] placeholder:text-zinc-400 focus:border-zinc-400 focus:ring-4 focus:ring-zinc-900/10"
+                  placeholder="Re-enter your password"
+                  @paste="blockPasswordPasteIfSignUp"
+                />
+                <button
+                  type="button"
+                  class="absolute inset-y-0 right-0 inline-flex w-11 items-center justify-center rounded-r-2xl text-zinc-500 transition hover:text-zinc-800"
+                  :aria-label="
+                    showPasswordConfirm
+                      ? 'Hide confirm password'
+                      : 'Show confirm password'
+                  "
+                  @click="showPasswordConfirm = !showPasswordConfirm"
+                >
+                  <svg
+                    v-if="!showPasswordConfirm"
+                    class="h-5 w-5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="1.75"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M2.25 12s3.75-6.75 9.75-6.75S21.75 12 21.75 12 18 18.75 12 18.75 2.25 12 2.25 12z"
+                    />
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M12 14.25a2.25 2.25 0 100-4.5 2.25 2.25 0 000 4.5z"
+                    />
+                  </svg>
+                  <svg
+                    v-else
+                    class="h-5 w-5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="1.75"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M3 3l18 18M10.58 10.58A2.25 2.25 0 0013.42 13.42M9.88 5.08A9.84 9.84 0 0112 4.5c6 0 9.75 7.5 9.75 7.5a16.89 16.89 0 01-4.41 5.19M6.23 6.23C3.99 8.04 2.25 12 2.25 12s3.75 6.75 9.75 6.75a9.7 9.7 0 003.12-.5"
+                    />
+                  </svg>
+                </button>
+              </div>
             </div>
 
             <button
@@ -509,11 +755,17 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
               :disabled="busy"
               class="w-full rounded-full bg-zinc-900 py-3.5 text-sm font-semibold text-white shadow-lg shadow-zinc-900/25 transition-all hover:bg-zinc-800 hover:shadow-xl disabled:pointer-events-none disabled:opacity-50 active:scale-[0.99]"
             >
-              {{ mode === "sign-in" ? "Sign in" : "Create account" }}
+              {{
+                mode === "sign-in"
+                  ? "Sign in"
+                  : mode === "sign-up"
+                    ? "Create account"
+                    : "Update password"
+              }}
             </button>
           </form>
 
-          <p class="mt-8 text-center text-sm text-zinc-600">
+          <p v-if="mode !== 'reset'" class="mt-8 text-center text-sm text-zinc-600">
             <button
               type="button"
               class="font-semibold text-emerald-700 underline-offset-4 transition-colors hover:text-emerald-800 hover:underline"
@@ -524,6 +776,15 @@ const segmentInactive = "text-zinc-600 hover:bg-white/80 hover:text-zinc-900";
                   ? "Need an account? Sign up"
                   : "Already have an account? Sign in"
               }}
+            </button>
+          </p>
+          <p v-else class="mt-8 text-center text-sm text-zinc-600">
+            <button
+              type="button"
+              class="font-semibold text-emerald-700 underline-offset-4 transition-colors hover:text-emerald-800 hover:underline"
+              @click="replaceQueryMode('sign-in')"
+            >
+              Back to sign in
             </button>
           </p>
         </div>

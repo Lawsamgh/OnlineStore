@@ -6,6 +6,7 @@ export type CartLine = {
   title: string
   quantity: number
   unitPriceCents: number
+  imageUrl?: string | null
 }
 
 export const useCartStore = defineStore('cart', () => {
