@@ -8,8 +8,59 @@
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
     />
     <title>uanditechsolution</title>
+    <style>
+      #boot-loader {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(165deg, #e8e9f2 0%, #eceef6 45%, #f1f0f8 100%);
+        z-index: 9999;
+      }
+      #boot-loader-inner {
+        display: inline-flex;
+        align-items: center;
+        gap: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.75);
+        border-radius: 9999px;
+        padding: 10px 16px 10px 10px;
+        background: rgba(255, 255, 255, 0.8);
+        backdrop-filter: blur(8px);
+        box-shadow: 0 10px 30px -16px rgba(15, 23, 42, 0.4);
+        color: #27272a;
+        font: 600 14px/1.2 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+        letter-spacing: 0.01em;
+      }
+      #boot-loader img {
+        width: 28px;
+        height: 28px;
+        border-radius: 10px;
+        object-fit: cover;
+      }
+      #boot-loader-spin {
+        width: 14px;
+        height: 14px;
+        border-radius: 9999px;
+        border: 2px solid #d4d4d8;
+        border-top-color: #18181b;
+        animation: boot-spin 0.8s linear infinite;
+      }
+      @keyframes boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
   </head>
   <body>
+    <div id="boot-loader" role="status" aria-live="polite">
+      <div id="boot-loader-inner">
+        <img src="/src/assets/logo/uanditech.png" alt="" aria-hidden="true" />
+        <span>Loading workspace...</span>
+        <span id="boot-loader-spin" aria-hidden="true"></span>
+      </div>
+    </div>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

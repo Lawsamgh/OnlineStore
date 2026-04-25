@@ -15,3 +15,4 @@ initSupabaseAuth(pinia, router)
 // App.vue reads `useRoute()` before the initial navigation + guards finish.
 await router.isReady()
 app.mount('#app')
+document.getElementById('boot-loader')?.remove()
