@@ -100,12 +100,16 @@ Deno.serve(async (req) => {
       )
     }
 
-    const requiredCronSecret = Deno.env.get('CRON_SECRET')?.trim()
-    if (requiredCronSecret) {
-      const provided = req.headers.get('x-cron-secret')?.trim()
-      if (!provided || provided !== requiredCronSecret) {
-        return Response.json({ error: 'Forbidden' }, { status: 403, headers: cors })
-      }
+    const requiredCronSecret = Deno.env.get('CRON_SECRET')?.trim() ?? ''
+    if (!requiredCronSecret) {
+      return Response.json(
+        { error: 'Missing CRON_SECRET configuration' },
+        { status: 500, headers: cors },
+      )
+    }
+    const provided = req.headers.get('x-cron-secret')?.trim()
+    if (!provided || provided !== requiredCronSecret) {
+      return Response.json({ error: 'Forbidden' }, { status: 403, headers: cors })
     }
 
     const admin = createClient(url, serviceKey)

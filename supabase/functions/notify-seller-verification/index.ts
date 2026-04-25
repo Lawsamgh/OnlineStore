@@ -42,12 +42,47 @@ async function sendArkeselSms(opts: {
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  if (req.method !== "POST") {
+    return new Response(JSON.stringify({ error: "Method not allowed" }), {
+      status: 405,
+      headers: { ...cors, "Content-Type": "application/json" },
+    });
+  }
 
   try {
     const supabaseUrl = Deno.env.get("SUPABASE_URL") ?? "";
+    const anonKey = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
     const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? "";
     const arkeselKey = Deno.env.get("ARKESEL_SMS_API_KEY")?.trim() ?? "";
     const arkeselSender = Deno.env.get("ARKESEL_SMS_SENDER_ID")?.trim() || null;
+    const authHeader = req.headers.get("Authorization") ?? "";
+    const bearer = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7).trim()
+      : "";
+
+    if (!supabaseUrl || !anonKey || !serviceKey || !bearer) {
+      return new Response(
+        JSON.stringify({ error: "Missing configuration or Authorization" }),
+        {
+          status: 401,
+          headers: { ...cors, "Content-Type": "application/json" },
+        },
+      );
+    }
+
+    const userClient = createClient(supabaseUrl, anonKey, {
+      global: { headers: { Authorization: `Bearer ${bearer}` } },
+    });
+    const {
+      data: { user },
+      error: userErr,
+    } = await userClient.auth.getUser();
+    if (userErr || !user?.id) {
+      return new Response(JSON.stringify({ error: "Invalid session" }), {
+        status: 401,
+        headers: { ...cors, "Content-Type": "application/json" },
+      });
+    }
 
     const body = (await req.json()) as Body;
     const { seller_id, status, reject_reason, store_name } = body;
@@ -63,6 +98,23 @@ Deno.serve(async (req) => {
     }
 
     const sb = createClient(supabaseUrl, serviceKey);
+    const { data: callerRole, error: roleErr } = await sb
+      .from("admin_roles")
+      .select("role")
+      .eq("user_id", user.id)
+      .maybeSingle();
+    if (
+      roleErr ||
+      (callerRole?.role !== "super_admin" && callerRole?.role !== "admin")
+    ) {
+      return new Response(
+        JSON.stringify({ error: "Only platform staff can trigger this" }),
+        {
+          status: 403,
+          headers: { ...cors, "Content-Type": "application/json" },
+        },
+      );
+    }
 
     // Fetch seller's phone from profiles (primary) and seller_verifications (fallback)
     const [{ data: profile }, { data: verifRecord }] = await Promise.all([
