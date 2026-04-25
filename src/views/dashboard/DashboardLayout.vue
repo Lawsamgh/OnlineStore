@@ -44,6 +44,18 @@ const {
 } = storeToRefs(ui);
 const toast = useToastStore();
 
+const comingSoonModalOpen = ref(false);
+
+function openComingSoonModal() {
+  comingSoonModalOpen.value = true;
+  document.body.style.overflow = "hidden";
+}
+
+function closeComingSoonModal() {
+  comingSoonModalOpen.value = false;
+  document.body.style.overflow = "";
+}
+
 /** Must be declared before any watch() that references `adminAccessBlocked` (avoid TDZ). */
 const isAdminShell = computed(() => route.path.startsWith("/admin"));
 
@@ -58,6 +70,10 @@ provide(platformConsolePresenceOnlineKey, platformConsolePresenceOnlineUserIds);
 useProfileLastSeenHeartbeat({
   enabled: () => auth.isSignedIn && auth.isPlatformStaff,
   userId: () => authSessionUserId.value,
+});
+
+onBeforeUnmount(() => {
+  document.body.style.overflow = "";
 });
 
 /** Signed-in user opened /admin, role is resolved, but account is not super-admin. */
@@ -1548,6 +1564,7 @@ watch(
                 type="button"
                 class="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-zinc-200/80 bg-zinc-50 text-zinc-500 shadow-sm transition hover:border-zinc-300 hover:bg-white hover:text-zinc-800"
                 aria-label="Chat"
+                @click="openComingSoonModal"
               >
                 <svg
                   class="h-6 w-6"
@@ -2313,6 +2330,86 @@ watch(
     </div>
 
     <Teleport to="body">
+      <Transition name="so-dim">
+        <div
+          v-if="comingSoonModalOpen"
+          class="fixed inset-0 z-[555] flex items-center justify-center bg-zinc-950/55 px-4 py-8 backdrop-blur-md"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="coming-soon-title"
+          aria-describedby="coming-soon-desc"
+        >
+          <!-- Backdrop intentionally does not dismiss (no click handler). -->
+          <div
+            class="relative w-full max-w-md overflow-hidden rounded-[1.75rem] border border-white/70 bg-white shadow-[0_32px_100px_-32px_rgba(15,23,42,0.55)] ring-1 ring-zinc-900/[0.06]"
+          >
+            <div
+              class="absolute inset-x-0 top-0 h-1.5 bg-gradient-to-r from-emerald-500 via-teal-500 to-sky-500"
+              aria-hidden="true"
+            />
+            <div
+              class="pointer-events-none absolute -right-20 -top-24 h-56 w-56 rounded-full bg-emerald-400/18 blur-3xl"
+              aria-hidden="true"
+            />
+            <div
+              class="pointer-events-none absolute -bottom-16 -left-16 h-48 w-48 rounded-full bg-sky-400/12 blur-3xl"
+              aria-hidden="true"
+            />
+
+            <div class="relative px-6 pb-5 pt-7 sm:px-8 sm:pb-6 sm:pt-8">
+              <div class="flex flex-col items-center text-center">
+                <div
+                  class="relative flex h-[3.5rem] w-[3.5rem] items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-600 to-teal-700 text-white shadow-xl shadow-emerald-900/20 ring-4 ring-white/90"
+                >
+                  <svg
+                    class="h-7 w-7 opacity-95"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    stroke-width="1.7"
+                    aria-hidden="true"
+                  >
+                    <path
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+                    />
+                  </svg>
+                </div>
+                <p
+                  class="mt-3.5 text-[11px] font-semibold uppercase tracking-[0.22em] text-emerald-600/90"
+                >
+                  Coming soon
+                </p>
+                <h2
+                  id="coming-soon-title"
+                  class="mt-1 text-2xl font-bold tracking-tight text-zinc-900"
+                >
+                  New feature in development
+                </h2>
+                <p
+                  id="coming-soon-desc"
+                  class="mt-1.5 max-w-sm text-sm leading-relaxed text-zinc-600"
+                >
+                  We’re currently building this experience. It will be available
+                  in a future update.
+                </p>
+              </div>
+
+              <div class="mt-6 flex items-center justify-center">
+                <button
+                  type="button"
+                  class="inline-flex h-11 items-center justify-center rounded-2xl bg-emerald-600 px-6 text-sm font-bold text-white shadow-[0_14px_30px_-18px_rgba(5,150,105,0.9)] transition hover:bg-emerald-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700"
+                  @click="closeComingSoonModal"
+                >
+                  Got it
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Transition>
+
       <Transition name="so-dim">
         <div
           v-if="signOutConfirmOpen"
