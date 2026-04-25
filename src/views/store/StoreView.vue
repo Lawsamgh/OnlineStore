@@ -364,6 +364,7 @@ function categoryIcon(cat: string): string {
 
     <!-- ── Store content ─────────────────────────────────────────────────── -->
     <template v-else-if="store">
+      <div class="mx-auto w-full max-w-5xl">
 
       <!-- Search bar -->
       <div class="px-4 pt-4 pb-2">
@@ -685,6 +686,7 @@ function categoryIcon(cat: string): string {
           </div>
         </li>
       </ul>
+      </div>
 
     </template>
 

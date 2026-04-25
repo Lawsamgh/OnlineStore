@@ -364,7 +364,12 @@ watch(
                 @click.stop="toggleNavProfileMenu()"
               >
                 <span
-                  class="relative flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 text-[11px] font-bold text-white shadow-inner ring-1 ring-violet-400/40"
+                  class="relative flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-full text-[11px] font-bold text-white shadow-inner ring-1 ring-violet-400/40"
+                  :class="
+                    auth.profileAvatarPublicUrl
+                      ? 'bg-white'
+                      : 'bg-gradient-to-br from-violet-500 to-indigo-600'
+                  "
                 >
                   <img
                     v-if="auth.profileAvatarPublicUrl"
@@ -409,7 +414,12 @@ watch(
                   </p>
                   <div class="mt-3 flex items-center gap-3">
                     <span
-                      class="relative flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-2xl bg-gradient-to-br from-violet-500 to-indigo-600 text-sm font-bold text-white shadow-md shadow-violet-900/25 ring-2 ring-white"
+                      class="relative flex h-11 w-11 shrink-0 items-center justify-center overflow-hidden rounded-2xl text-sm font-bold text-white shadow-md shadow-violet-900/25 ring-2 ring-white"
+                      :class="
+                        auth.profileAvatarPublicUrl
+                          ? 'bg-white'
+                          : 'bg-gradient-to-br from-violet-500 to-indigo-600'
+                      "
                     >
                       <img
                         v-if="auth.profileAvatarPublicUrl"

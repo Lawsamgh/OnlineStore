@@ -206,7 +206,8 @@ function resolveRevenuePeriodRange(period: RevenuePeriodFilter): {
 
 function bucketStartMs(ms: number, bucket: "day" | "month"): number {
   const d = new Date(ms);
-  if (bucket === "month") return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+  if (bucket === "month")
+    return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
   return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
 }
 
@@ -280,7 +281,8 @@ const revenueMetrics = computed(() => {
   for (const ord of customerOrders.value) {
     const t = new Date(ord.created_at).getTime();
     if (!Number.isFinite(t) || t < startMs || t >= endMs) continue;
-    if (!matchesRevenueStatusFilter(ord.status, revenueStatusFilter.value)) continue;
+    if (!matchesRevenueStatusFilter(ord.status, revenueStatusFilter.value))
+      continue;
     const amount = Math.max(0, ord.total_amount_cents || 0);
     amountCents += amount;
     const b = bucketStartMs(t, bucket);
@@ -482,7 +484,8 @@ const planCheckoutBusy = ref(false);
 const planCheckoutPlanId = ref<string | null>(null);
 const planCheckoutBusyPlan = computed(
   () =>
-    planPickerPlans.value.find((p) => p.id === planCheckoutPlanId.value) ?? null,
+    planPickerPlans.value.find((p) => p.id === planCheckoutPlanId.value) ??
+    null,
 );
 const planCheckoutBusyLabel = computed(() => {
   if (!planCheckoutBusy.value) return "";
@@ -1060,8 +1063,7 @@ const revenueKpiHistory = computed(() => revenueMetrics.value.chartPoints);
 const productKpiHistory = ref<KpiSample[]>([]);
 
 function kpiStorageKeys(uid: string | null) {
-  if (!uid)
-    return { products: null as string | null };
+  if (!uid) return { products: null as string | null };
   return {
     products: `uanditech:dash-kpi:v1:products:${uid}`,
   };
@@ -1411,10 +1413,16 @@ async function loadSellerDashboard(silent = false) {
             total_amount_cents: Math.max(0, orderTotalCents),
           };
         });
-        planUsage.value = { products: prRes.count ?? 0, ordersThisMonth: orRes.count ?? 0 };
+        planUsage.value = {
+          products: prRes.count ?? 0,
+          ordersThisMonth: orRes.count ?? 0,
+        };
       }
       if (recentOrdersRes.error) {
-        planUsage.value = { products: prRes.count ?? 0, ordersThisMonth: orRes.count ?? 0 };
+        planUsage.value = {
+          products: prRes.count ?? 0,
+          ordersThisMonth: orRes.count ?? 0,
+        };
       }
       if (subRes.error) {
         dashboardPaidPlanRenewalEnd.value = null;
@@ -1649,7 +1657,9 @@ onUnmounted(() => {
                 grid-stroke="rgba(91,33,182,0.12)"
               />
             </div>
-            <div class="mt-3 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-violet-200/80">
+            <div
+              class="mt-3 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-violet-200/80"
+            >
               <button
                 v-for="opt in ordersPeriodOptions"
                 :key="`orders-period-${opt.id}`"
@@ -1702,9 +1712,14 @@ onUnmounted(() => {
             <p
               class="mt-3 inline-flex w-fit rounded-full bg-white/85 px-2.5 py-1 text-[11px] font-semibold text-sky-800 shadow-sm ring-1 ring-sky-200/80"
             >
-              {{ revenuePeriodOptions.find((x) => x.id === revenuePeriodFilter)?.label }}
+              {{
+                revenuePeriodOptions.find((x) => x.id === revenuePeriodFilter)
+                  ?.label
+              }}
             </p>
-            <div class="mt-2 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-sky-200/80">
+            <div
+              class="mt-2 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-sky-200/80"
+            >
               <button
                 v-for="opt in revenueFilterOptions"
                 :key="`rev-filter-${opt.id}`"
@@ -1738,7 +1753,9 @@ onUnmounted(() => {
                 grid-stroke="rgba(3,105,161,0.12)"
               />
             </div>
-            <div class="mt-3 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-sky-200/80">
+            <div
+              class="mt-3 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-sky-200/80"
+            >
               <button
                 v-for="opt in revenuePeriodOptions"
                 :key="`rev-period-${opt.id}`"
@@ -2751,7 +2768,9 @@ onUnmounted(() => {
                   type="button"
                   class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-zinc-200/90 bg-zinc-50 text-zinc-700 shadow-sm transition hover:border-indigo-200 hover:bg-white hover:text-indigo-900 disabled:pointer-events-none disabled:opacity-30"
                   aria-label="Next plan"
-                  :disabled="planCheckoutBusy || planSlideIndex >= planSlideCount - 1"
+                  :disabled="
+                    planCheckoutBusy || planSlideIndex >= planSlideCount - 1
+                  "
                   @click="planSlideNext"
                 >
                   <svg
@@ -2811,123 +2830,129 @@ onUnmounted(() => {
                       slideIdx !== planSlideIndex ? 'pointer-events-none' : '',
                     ]"
                   >
-                    <div class="flex min-h-0 flex-1 flex-col overflow-hidden p-5 sm:p-6">
+                    <div
+                      class="flex min-h-0 flex-1 flex-col overflow-hidden p-5 sm:p-6"
+                    >
                       <div
                         class="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-y-contain pb-4"
                       >
-                      <div
-                        class="flex flex-wrap items-start justify-between gap-2"
-                      >
-                        <p
-                          class="text-[11px] font-bold uppercase tracking-wide text-zinc-500"
+                        <div
+                          class="flex flex-wrap items-start justify-between gap-2"
                         >
-                          {{ plan.name }}
-                        </p>
-                        <span
-                          v-if="plan.id === currentPlanIdForPicker"
-                          class="rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-indigo-900"
-                        >
-                          Current
-                        </span>
-                        <span
-                          v-else-if="plan.highlighted"
-                          class="rounded-full bg-lime-300/90 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-zinc-900"
-                        >
-                          Popular
-                        </span>
-                      </div>
-                      <p
-                        v-if="plan.audience"
-                        class="text-sm leading-relaxed text-zinc-600"
-                      >
-                        {{ plan.audience }}
-                      </p>
-                      <p class="flex flex-wrap items-baseline gap-1.5">
-                        <span
-                          v-if="plan.monthlyGhs === 0"
-                          class="text-3xl font-semibold tracking-tight text-zinc-950"
-                        >
-                          Free
-                        </span>
-                        <template v-else>
+                          <p
+                            class="text-[11px] font-bold uppercase tracking-wide text-zinc-500"
+                          >
+                            {{ plan.name }}
+                          </p>
                           <span
-                            class="text-3xl font-semibold tabular-nums tracking-tight text-zinc-950"
+                            v-if="plan.id === currentPlanIdForPicker"
+                            class="rounded-full bg-indigo-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-indigo-900"
                           >
-                            {{ formatGhsWhole(plan.monthlyGhs) }}
+                            Current
                           </span>
-                          <span class="text-sm font-medium text-zinc-500"
-                            >/ month</span
+                          <span
+                            v-else-if="plan.highlighted"
+                            class="rounded-full bg-lime-300/90 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-zinc-900"
                           >
-                        </template>
-                      </p>
-                      <div class="min-h-0 flex-1 border-t border-zinc-100 pt-4">
+                            Popular
+                          </span>
+                        </div>
                         <p
-                          class="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500"
+                          v-if="plan.audience"
+                          class="text-sm leading-relaxed text-zinc-600"
                         >
-                          What's included
+                          {{ plan.audience }}
+                        </p>
+                        <p class="flex flex-wrap items-baseline gap-1.5">
+                          <span
+                            v-if="plan.monthlyGhs === 0"
+                            class="text-3xl font-semibold tracking-tight text-zinc-950"
+                          >
+                            Free
+                          </span>
+                          <template v-else>
+                            <span
+                              class="text-3xl font-semibold tabular-nums tracking-tight text-zinc-950"
+                            >
+                              {{ formatGhsWhole(plan.monthlyGhs) }}
+                            </span>
+                            <span class="text-sm font-medium text-zinc-500"
+                              >/ month</span
+                            >
+                          </template>
                         </p>
                         <div
-                          class="max-h-[22rem] touch-pan-y divide-y divide-zinc-100 overflow-y-auto overscroll-y-contain rounded-xl border border-zinc-100 bg-zinc-50/80 sm:max-h-[26rem]"
+                          class="min-h-0 flex-1 border-t border-zinc-100 pt-4"
                         >
-                          <div
-                            v-for="group in plan.groups"
-                            :key="`${plan.id}-${group.title}`"
-                            class="px-3 py-2 sm:px-3.5 sm:py-2.5"
+                          <p
+                            class="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500"
                           >
-                            <template v-if="group.lines.length === 1">
-                              <div
-                                class="flex flex-col gap-0.5 sm:flex-row sm:items-start sm:justify-between sm:gap-3"
-                              >
+                            What's included
+                          </p>
+                          <div
+                            class="max-h-[22rem] touch-pan-y divide-y divide-zinc-100 overflow-y-auto overscroll-y-contain rounded-xl border border-zinc-100 bg-zinc-50/80 sm:max-h-[26rem]"
+                          >
+                            <div
+                              v-for="group in plan.groups"
+                              :key="`${plan.id}-${group.title}`"
+                              class="px-3 py-2 sm:px-3.5 sm:py-2.5"
+                            >
+                              <template v-if="group.lines.length === 1">
+                                <div
+                                  class="flex flex-col gap-0.5 sm:flex-row sm:items-start sm:justify-between sm:gap-3"
+                                >
+                                  <h4
+                                    class="shrink-0 text-[10px] font-bold uppercase tracking-wide text-zinc-800"
+                                  >
+                                    {{ group.title }}
+                                  </h4>
+                                  <p
+                                    class="min-w-0 text-xs font-medium leading-relaxed text-zinc-700 sm:text-right"
+                                  >
+                                    {{ group.lines[0] }}
+                                  </p>
+                                </div>
+                              </template>
+                              <template v-else>
                                 <h4
-                                  class="shrink-0 text-[10px] font-bold uppercase tracking-wide text-zinc-800"
+                                  class="text-[10px] font-bold uppercase tracking-wide text-zinc-800"
                                 >
                                   {{ group.title }}
                                 </h4>
-                                <p
-                                  class="min-w-0 text-xs font-medium leading-relaxed text-zinc-700 sm:text-right"
+                                <ul
+                                  class="mt-1.5 space-y-1 text-xs leading-relaxed text-zinc-700"
                                 >
-                                  {{ group.lines[0] }}
-                                </p>
-                              </div>
-                            </template>
-                            <template v-else>
-                              <h4
-                                class="text-[10px] font-bold uppercase tracking-wide text-zinc-800"
-                              >
-                                {{ group.title }}
-                              </h4>
-                              <ul
-                                class="mt-1.5 space-y-1 text-xs leading-relaxed text-zinc-700"
-                              >
-                                <li
-                                  v-for="(line, idx) in group.lines"
-                                  :key="idx"
-                                  class="flex gap-2"
-                                >
-                                  <span
-                                    class="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-emerald-600"
-                                    aria-hidden="true"
-                                  />
-                                  <span class="min-w-0">{{ line }}</span>
-                                </li>
-                              </ul>
-                            </template>
+                                  <li
+                                    v-for="(line, idx) in group.lines"
+                                    :key="idx"
+                                    class="flex gap-2"
+                                  >
+                                    <span
+                                      class="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-emerald-600"
+                                      aria-hidden="true"
+                                    />
+                                    <span class="min-w-0">{{ line }}</span>
+                                  </li>
+                                </ul>
+                              </template>
+                            </div>
                           </div>
                         </div>
-                      </div>
-                      <footer
-                        v-if="plan.monthlyGhs === 0"
-                        class="rounded-xl border border-zinc-200/80 bg-zinc-100/70 p-3.5 sm:p-4"
-                      >
-                        <p
-                          class="text-[10px] font-bold uppercase tracking-wide text-zinc-600"
+                        <footer
+                          v-if="plan.monthlyGhs === 0"
+                          class="rounded-xl border border-zinc-200/80 bg-zinc-100/70 p-3.5 sm:p-4"
                         >
-                          Billing
-                        </p>
-                        <p class="mt-0.5 text-xs leading-relaxed text-zinc-700">
-                          Always free — upgrade when you need more capacity.
-                        </p>
-                      </footer>
+                          <p
+                            class="text-[10px] font-bold uppercase tracking-wide text-zinc-600"
+                          >
+                            Billing
+                          </p>
+                          <p
+                            class="mt-0.5 text-xs leading-relaxed text-zinc-700"
+                          >
+                            Always free — upgrade when you need more capacity.
+                          </p>
+                        </footer>
                       </div>
                     </div>
                   </article>
@@ -2961,7 +2986,6 @@ onUnmounted(() => {
                 }}
               </button>
             </div>
-
           </div>
         </div>
       </div>

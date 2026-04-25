@@ -2106,7 +2106,12 @@ async function confirmRevokeConsoleAccess() {
           >
             <div class="flex min-w-0 flex-1 items-start gap-3.5">
               <span
-                class="relative flex h-12 w-12 shrink-0 overflow-hidden rounded-2xl bg-gradient-to-br from-violet-500 via-violet-600 to-indigo-700 text-sm font-bold text-white shadow-lg shadow-violet-500/25 ring-2 ring-white/90"
+                class="relative flex h-12 w-12 shrink-0 overflow-hidden rounded-2xl text-sm font-bold text-white shadow-lg shadow-violet-500/25 ring-2 ring-white/90"
+                :class="
+                  modalOwnerAvatarUrl
+                    ? 'bg-white'
+                    : 'bg-gradient-to-br from-violet-500 via-violet-600 to-indigo-700'
+                "
                 aria-hidden="true"
               >
                 <span
