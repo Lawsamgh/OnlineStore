@@ -22,6 +22,7 @@ import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefre
 import { planLabelFromSignupId } from "../../lib/planLabel";
 import { formatGhsWhole } from "../../constants/pricingPlans";
 import { formatGhs } from "../../lib/formatMoney";
+import { copyTextToClipboard } from "../../lib/copyToClipboard";
 import { usePlanPricingSettings } from "../../composables/usePlanPricingSettings";
 import {
   PLAN_FEATURE_LIMITS,
@@ -72,7 +73,9 @@ type SellerStoreRow = {
 
 type CustomerOrderRow = {
   id: string;
+  order_ref: string | null;
   store_id: string;
+  delivery_address: string | null;
   status: string;
   created_at: string;
   guest_name: string | null;
@@ -1126,6 +1129,15 @@ function storeLogoPublicUrl(
     .publicUrl;
 }
 
+async function copyStorefrontLink(slug: string) {
+  const cleanSlug = slug.trim();
+  if (!cleanSlug || typeof window === "undefined") return;
+  const url = `${window.location.origin}/${cleanSlug}`;
+  const ok = await copyTextToClipboard(url);
+  if (ok) toast.success("Storefront link copied.");
+  else toast.error("Unable to copy link. Copy it manually from the address bar.");
+}
+
 function avatarGradient(seed: number) {
   const palettes = [
     "from-violet-400 to-indigo-500",
@@ -1346,7 +1358,7 @@ async function loadSellerDashboard(silent = false) {
         supabase
           .from("orders")
           .select(
-            "id, store_id, status, created_at, guest_name, guest_phone, customer_id, order_items(quantity,unit_price_cents)",
+            "id, order_ref, store_id, delivery_address, status, created_at, guest_name, guest_phone, customer_id, order_items(quantity,unit_price_cents)",
           )
           .in("store_id", storeIds)
           .order("created_at", { ascending: false }),
@@ -1394,7 +1406,18 @@ async function loadSellerDashboard(silent = false) {
               : "pending";
           return {
             id: String(r.id),
+            order_ref:
+              typeof (r as { order_ref?: unknown }).order_ref === "string" &&
+              (r as { order_ref?: string }).order_ref?.trim()
+                ? (r as { order_ref: string }).order_ref.trim()
+                : null,
             store_id: String(r.store_id ?? ""),
+            delivery_address:
+              typeof (r as { delivery_address?: unknown }).delivery_address ===
+                "string" &&
+              (r as { delivery_address?: string }).delivery_address?.trim()
+                ? (r as { delivery_address: string }).delivery_address.trim()
+                : null,
             status: statusRaw,
             created_at: createdAtRaw,
             guest_name:
@@ -1918,7 +1941,10 @@ onUnmounted(() => {
                         class="border-b border-zinc-100 bg-zinc-50/95 text-xs font-semibold uppercase tracking-wider text-zinc-500 backdrop-blur-sm"
                       >
                         <th class="px-5 py-3.5 sm:px-6">Customer</th>
-                        <th class="hidden px-3 py-3.5 sm:table-cell">Store</th>
+                        <th class="px-3 py-3.5">Order No.</th>
+                        <th class="hidden px-3 py-3.5 sm:table-cell">
+                          Address
+                        </th>
                         <th class="px-3 py-3.5 text-right tabular-nums">Qty</th>
                         <th class="hidden px-3 py-3.5 sm:table-cell">Phone</th>
                         <th class="px-3 py-3.5">Status</th>
@@ -1939,10 +1965,18 @@ onUnmounted(() => {
                           </span>
                         </td>
                         <td
+                          class="px-3 py-5 font-mono text-xs font-semibold text-zinc-700"
+                        >
+                          {{ ord.order_ref || ord.id.slice(0, 8).toUpperCase() }}
+                        </td>
+                        <td
                           class="hidden px-3 py-5 text-zinc-700 sm:table-cell"
                         >
-                          <span class="block max-w-[13rem] truncate">
-                            {{ orderStoreLabel(ord.store_id) }}
+                          <span
+                            class="block max-w-[13rem] truncate"
+                            :title="ord.delivery_address ?? ''"
+                          >
+                            {{ ord.delivery_address || "—" }}
                           </span>
                         </td>
                         <td
@@ -2025,6 +2059,12 @@ onUnmounted(() => {
                               class="relative h-10 w-10 shrink-0 overflow-hidden rounded-xl border border-zinc-200/80 bg-zinc-100 shadow-sm"
                             >
                               <span
+                                v-if="
+                                  !(
+                                    s.logo_path?.trim() &&
+                                    storeLogoPublicUrl(s.id, s.logo_path)
+                                  )
+                                "
                                 class="absolute inset-0 z-0 flex items-center justify-center bg-gradient-to-br text-xs font-bold text-white shadow-inner ring-1 ring-white/40"
                                 :class="avatarGradient(s.name.length + idx)"
                                 >{{ storeInitial(s.name) }}</span
@@ -2385,6 +2425,12 @@ onUnmounted(() => {
                       class="relative flex h-11 w-11 shrink-0 overflow-hidden rounded-full border border-zinc-200/70 bg-zinc-100 shadow-md ring-2 ring-white"
                     >
                       <span
+                        v-if="
+                          !(
+                            s.logo_path?.trim() &&
+                            storeLogoPublicUrl(s.id, s.logo_path)
+                          )
+                        "
                         class="absolute inset-0 z-0 flex items-center justify-center bg-gradient-to-br text-sm font-bold text-white"
                         :class="avatarGradient(idx + s.name.length)"
                         >{{ storeInitial(s.name) }}</span
@@ -2420,6 +2466,32 @@ onUnmounted(() => {
                           v-if="canUseRoleGatedDashboardActions"
                           class="flex shrink-0 gap-1"
                         >
+                          <button
+                            type="button"
+                            class="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-300/80 bg-white text-zinc-500 transition hover:border-zinc-400 hover:text-zinc-800"
+                            title="Copy live shop link"
+                            @click="void copyStorefrontLink(s.slug)"
+                          >
+                            <svg
+                              class="h-4 w-4"
+                              fill="none"
+                              viewBox="0 0 24 24"
+                              stroke="currentColor"
+                              stroke-width="1.75"
+                              aria-hidden="true"
+                            >
+                              <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                d="M15.75 17.25h3A2.25 2.25 0 0021 15V6.75a2.25 2.25 0 00-2.25-2.25h-9A2.25 2.25 0 007.5 6.75v3"
+                              />
+                              <path
+                                stroke-linecap="round"
+                                stroke-linejoin="round"
+                                d="M5.25 7.5h9A2.25 2.25 0 0116.5 9.75v8.25A2.25 2.25 0 0114.25 20.25h-9A2.25 2.25 0 013 18V9.75A2.25 2.25 0 015.25 7.5z"
+                              />
+                            </svg>
+                          </button>
                           <RouterLink
                             :to="`/${s.slug}`"
                             class="flex h-9 w-9 items-center justify-center rounded-lg border border-zinc-300/80 bg-white text-zinc-500 transition hover:border-zinc-400 hover:text-zinc-800"

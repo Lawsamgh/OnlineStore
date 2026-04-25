@@ -58,6 +58,13 @@ function tabStorageKey(): string {
   return `${TAB_STORAGE_PREFIX}${sid || "default"}`;
 }
 
+function resolveManageTabFromRouteOrStorage(): ManageTab {
+  const fromQuery =
+    typeof route.query.tab === "string" ? route.query.tab : null;
+  if (fromQuery) return normalizeManageTab(fromQuery);
+  return normalizeManageTab(localStorage.getItem(tabStorageKey()));
+}
+
 const tab = ref<ManageTab>("products");
 const loading = ref(true);
 
@@ -1223,12 +1230,12 @@ async function loadAll(opts?: { silent?: boolean }) {
 }
 
 onMounted(() => {
-  tab.value = normalizeManageTab(localStorage.getItem(tabStorageKey()));
+  tab.value = resolveManageTabFromRouteOrStorage();
   document.addEventListener("keydown", onStoreManageDocKeydown);
   void loadAll();
 });
 watch(storeId, () => {
-  tab.value = normalizeManageTab(localStorage.getItem(tabStorageKey()));
+  tab.value = resolveManageTabFromRouteOrStorage();
   void loadAll();
 });
 watch(sellerPlanId, () => {
@@ -1243,6 +1250,14 @@ watch(
       behavior: "smooth",
       block: "start",
     });
+  },
+  { immediate: true },
+);
+watch(
+  () => route.query.tab,
+  (tabQuery) => {
+    if (typeof tabQuery !== "string") return;
+    tab.value = normalizeManageTab(tabQuery);
   },
   { immediate: true },
 );

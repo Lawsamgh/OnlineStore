@@ -409,8 +409,6 @@ async function onAvatarFileChange(ev: Event) {
   auth.applyProfileAvatarFromPath(path);
   toast.success("Profile photo updated.");
 }
-const { sellerDashboardSearch } = storeToRefs(ui);
-
 const accountMenuOpen = ref(false);
 const accountMenuRoot = ref<HTMLElement | null>(null);
 const accountMenuPanel = ref<HTMLElement | null>(null);
@@ -480,9 +478,35 @@ function openCartFromNotifications() {
   ui.openCart();
 }
 
-function goToSellerCustomerOrdersFromNotifications() {
+function scrollSellerCustomerOrdersIntoView() {
+  const el = document.getElementById("seller-customer-orders");
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function goToSellerCustomerOrdersFromNotifications() {
+  if (!canOpenSellerOrdersFromNotifications.value) return;
   closeNotificationsPanel();
-  void router.push({ name: "dashboard", hash: "#seller-customer-orders" });
+  const firstOwnedStoreId = [...sellerOwnedStoreIds.value][0] ?? null;
+  if (firstOwnedStoreId) {
+    await router.push({
+      name: "dashboard-store",
+      params: { storeId: firstOwnedStoreId },
+      query: { tab: "orders" },
+    });
+    return;
+  }
+  if (route.name !== "dashboard") {
+    await router.push({ name: "dashboard", hash: "#seller-customer-orders" });
+    await nextTick();
+    scrollSellerCustomerOrdersIntoView();
+    return;
+  }
+  if (route.hash !== "#seller-customer-orders") {
+    await router.push({ name: "dashboard", hash: "#seller-customer-orders" });
+  }
+  await nextTick();
+  scrollSellerCustomerOrdersIntoView();
 }
 
 function dismissSellerNewOrderBellFromNotifications() {
@@ -639,7 +663,6 @@ watch(
   () => route.name,
   (name) => {
     if (name !== "dashboard") {
-      ui.sellerDashboardSearch = "";
       ui.sellerOverviewTagline = "";
     }
   },
@@ -791,6 +814,9 @@ const adminNavItems: ShellNavItem[] = [
 ];
 
 const showCreateStoreNav = computed(() => auth.platformAdminRole !== "none");
+const canOpenSellerOrdersFromNotifications = computed(
+  () => auth.platformStaffRoleResolved && auth.platformAdminRole !== "none",
+);
 
 const shellNav = computed(() =>
   isAdminShell.value
@@ -874,8 +900,6 @@ const headerLine = computed(() => {
   }
   return "Shops, catalog, and orders — your workspace at a glance.";
 });
-
-const showOverviewSearch = computed(() => route.name === "dashboard");
 
 const platformRoleBadgeClass = computed(() =>
   auth.isSuperAdmin
@@ -1494,35 +1518,6 @@ watch(
             <div
               class="flex flex-wrap items-center gap-2 sm:gap-2.5 lg:shrink-0 lg:justify-end"
             >
-              <div
-                v-if="showOverviewSearch"
-                class="relative w-72 shrink-0 sm:w-80 md:w-96"
-              >
-                <div
-                  class="relative rounded-full border border-zinc-200/70 bg-white py-2.5 pl-10 pr-3 shadow-sm"
-                >
-                  <svg
-                    class="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-400"
-                    fill="none"
-                    viewBox="0 0 24 24"
-                    stroke="currentColor"
-                    stroke-width="1.75"
-                  >
-                    <path
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z"
-                    />
-                  </svg>
-                  <input
-                    v-model="sellerDashboardSearch"
-                    type="search"
-                    placeholder="Search"
-                    class="w-full min-w-0 border-0 bg-transparent text-sm text-zinc-900 outline-none ring-0 placeholder:text-zinc-400"
-                  />
-                </div>
-              </div>
-
               <button
                 type="button"
                 class="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-zinc-200/80 bg-zinc-50 text-zinc-500 shadow-sm transition hover:border-zinc-300 hover:bg-white hover:text-zinc-800"
@@ -1854,7 +1849,13 @@ watch(
                             <div class="min-w-0 flex-1 pt-0.5">
                               <button
                                 type="button"
-                                class="w-full cursor-pointer rounded-md text-left text-[13px] leading-snug text-zinc-500 transition hover:bg-zinc-100/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/35 sm:text-sm"
+                                :disabled="!canOpenSellerOrdersFromNotifications"
+                                class="w-full rounded-md text-left text-[13px] leading-snug text-zinc-500 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/35 sm:text-sm"
+                                :class="
+                                  canOpenSellerOrdersFromNotifications
+                                    ? 'cursor-pointer hover:bg-zinc-100/80'
+                                    : 'cursor-not-allowed opacity-70'
+                                "
                                 @click="
                                   goToSellerCustomerOrdersFromNotifications
                                 "
@@ -1872,6 +1873,12 @@ watch(
                                   Orders from Customers.
                                 </template>
                               </button>
+                              <p
+                                v-if="!canOpenSellerOrdersFromNotifications"
+                                class="mt-1 text-xs text-zinc-500"
+                              >
+                                You do not have access to open Orders from this account yet.
+                              </p>
                               <button
                                 type="button"
                                 class="mt-1.5 block w-full cursor-pointer rounded-md px-0 py-0.5 text-left text-xs font-medium text-zinc-500 underline decoration-zinc-300 underline-offset-2 transition hover:text-zinc-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400/35"

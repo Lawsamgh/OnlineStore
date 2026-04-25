@@ -53,9 +53,12 @@ const lockRootShellViewport = computed(
 );
 
 /** Which marketing home section is active (hash on `home` route). */
-const homeNavSection = computed<"home" | "features" | "pricing" | null>(() => {
+const homeNavSection = computed<
+  "home" | "about" | "features" | "pricing" | null
+>(() => {
   if (route.name !== "home") return null;
   const h = route.hash || "";
+  if (h === "#about") return "about";
   if (h === "#features") return "features";
   if (h === "#pricing") return "pricing";
   return "home";
@@ -289,6 +292,15 @@ watch(
             ]"
           >
             Home
+          </RouterLink>
+          <RouterLink
+            :to="{ name: 'home', hash: '#about' }"
+            :class="[
+              navPillBase,
+              homeNavSection === 'about' ? navPillActive : navPillInactive,
+            ]"
+          >
+            About Us
           </RouterLink>
           <RouterLink
             :to="{ name: 'home', hash: '#features' }"
@@ -558,6 +570,15 @@ watch(
             ]"
           >
             Home
+          </RouterLink>
+          <RouterLink
+            :to="{ name: 'home', hash: '#about' }"
+            :class="[
+              navMobileBase,
+              homeNavSection === 'about' ? navMobileActive : navMobileInactive,
+            ]"
+          >
+            About Us
           </RouterLink>
           <RouterLink
             :to="{ name: 'home', hash: '#features' }"

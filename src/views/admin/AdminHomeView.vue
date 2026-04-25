@@ -1904,16 +1904,18 @@ async function confirmRevokeConsoleAccess() {
               {{ overviewCurrentSlide.subtitle }}
             </p>
           </div>
-          <div class="flex items-center gap-2">
+          <div
+            class="inline-flex items-center gap-2 rounded-2xl border border-white/70 bg-white/75 p-1.5 shadow-[0_10px_28px_-16px_rgba(15,23,42,0.5)] backdrop-blur-md"
+          >
             <span
-              class="inline-flex h-10 min-w-[3.5rem] items-center justify-center rounded-full border border-white/70 bg-white/80 px-3 text-sm font-bold tabular-nums text-zinc-700 shadow-[0_8px_24px_-12px_rgba(15,23,42,0.35),inset_0_1px_0_rgba(255,255,255,0.95)] backdrop-blur-md"
+              class="inline-flex h-9 min-w-[3.75rem] items-center justify-center rounded-xl border border-zinc-200/70 bg-zinc-50/80 px-3 text-sm font-bold tabular-nums text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.95)]"
               aria-live="polite"
             >
               {{ overviewSlideIndex + 1 }}/{{ overviewSlides.length }}
             </span>
             <button
               type="button"
-              class="inline-flex h-10 w-10 items-center justify-center rounded-none border border-emerald-700 bg-emerald-600 text-3xl font-bold leading-none text-white shadow-[0_8px_20px_-10px_rgba(5,150,105,0.7)] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-800"
+              class="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-emerald-700 bg-emerald-600 text-[1.65rem] font-bold leading-none text-white shadow-[0_8px_20px_-10px_rgba(5,150,105,0.7)] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-800"
               aria-label="Previous slide"
               @mouseenter="pauseOverviewAutoplay"
               @mouseleave="resumeOverviewAutoplay"
@@ -1923,7 +1925,7 @@ async function confirmRevokeConsoleAccess() {
             </button>
             <button
               type="button"
-              class="inline-flex h-10 w-10 items-center justify-center rounded-none border border-emerald-700 bg-emerald-600 text-3xl font-bold leading-none text-white shadow-[0_8px_20px_-10px_rgba(5,150,105,0.7)] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-800"
+              class="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-emerald-700 bg-emerald-600 text-[1.65rem] font-bold leading-none text-white shadow-[0_8px_20px_-10px_rgba(5,150,105,0.7)] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-800"
               aria-label="Next slide"
               @mouseenter="pauseOverviewAutoplay"
               @mouseleave="resumeOverviewAutoplay"
@@ -2437,7 +2439,7 @@ async function confirmRevokeConsoleAccess() {
         </div>
 
         <div
-          class="flex items-center justify-center gap-2"
+          class="flex flex-wrap items-center justify-center gap-2"
           role="tablist"
           aria-label="Overview slides"
         >
@@ -2445,18 +2447,28 @@ async function confirmRevokeConsoleAccess() {
             v-for="(slide, idx) in overviewSlides"
             :key="slide.title"
             type="button"
-            class="h-2.5 w-2.5 rounded-full transition"
+            class="inline-flex h-8 items-center gap-2 rounded-xl border px-3 text-xs font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700"
             :class="
               overviewSlideIndex === idx
-                ? 'w-6 bg-emerald-600'
-                : 'bg-zinc-300 hover:bg-zinc-400'
+                ? 'border-emerald-600 bg-emerald-600 text-white shadow-[0_8px_18px_-12px_rgba(5,150,105,0.9)]'
+                : 'border-zinc-300/80 bg-white/85 text-zinc-600 hover:border-zinc-400 hover:bg-zinc-50'
             "
             :aria-pressed="overviewSlideIndex === idx"
             :aria-label="`Go to ${slide.title} slide`"
             @mouseenter="pauseOverviewAutoplay"
             @mouseleave="resumeOverviewAutoplay"
             @click="setOverviewSlide(idx)"
-          />
+          >
+            <span
+              class="inline-flex h-4 min-w-4 items-center justify-center rounded-full text-[10px] font-bold tabular-nums"
+              :class="
+                overviewSlideIndex === idx ? 'bg-white/20 text-white' : 'bg-zinc-200 text-zinc-700'
+              "
+            >
+              {{ idx + 1 }}
+            </span>
+            <span class="max-w-[9rem] truncate">{{ slide.title }}</span>
+          </button>
         </div>
       </div>
 

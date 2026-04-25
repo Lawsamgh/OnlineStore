@@ -788,6 +788,7 @@ const howItWorks = [
 
     <!-- Stats + cards: full-bleed seller photo, content overlaid -->
     <div
+      id="about"
       class="relative isolate min-h-[min(88vh,52rem)] overflow-hidden border-b border-zinc-900/20 sm:min-h-[min(90vh,56rem)] lg:min-h-[min(92vh,58rem)]"
     >
       <img
@@ -819,23 +820,56 @@ const howItWorks = [
           <p
             class="text-xs font-semibold uppercase tracking-wider text-lime-300/90"
           >
-            Orders on the go
+            About us
           </p>
           <h2
             class="mt-2 text-balance text-3xl font-semibold leading-tight tracking-tight text-white sm:text-4xl lg:text-[2.375rem] lg:leading-tight"
           >
-            Every seller tool for your city — in one platform.
+            UandITech builds advanced software products for modern businesses.
           </h2>
           <p class="mt-5 text-lg leading-relaxed text-zinc-200">
-            Run catalogue, orders, and delivery updates from the browsers your
-            team already uses.
+            UandITech is a software development company focused on delivering
+            high-quality digital solutions tailored to your goals.
           </p>
           <p class="mt-4 text-base leading-relaxed text-zinc-300/95">
-            Super admins keep the network healthy; store owners get isolated
-            dashboards per shop. Shoppers never see your back-office — only a
-            fast storefront, clear totals in GHS, and delivery states they can
-            follow without DMing you for every update.
+            We design and build advanced web applications, business websites,
+            and mobile applications with clean user experience, strong
+            performance, and scalable architecture. From discovery and product
+            planning to launch and support, our team helps you move from idea
+            to reliable production software.
           </p>
+          <p class="mt-4 text-sm leading-relaxed text-zinc-200">
+            For project enquiries, contact
+            <a
+              href="mailto:uanditech.solution@gmail.com"
+              class="font-semibold text-lime-300 underline decoration-lime-300/70 underline-offset-4 transition hover:text-lime-200"
+            >
+              uanditech.solution@gmail.com
+            </a>
+            .
+          </p>
+          <div class="mt-5">
+            <a
+              href="mailto:uanditech.solution@gmail.com?subject=Project%20Enquiry%20for%20UandITech"
+              class="inline-flex items-center gap-2 rounded-full border border-lime-300/60 bg-lime-300/15 px-4 py-2 text-sm font-semibold text-lime-200 shadow-[0_10px_24px_-16px_rgba(163,230,53,0.55)] transition hover:bg-lime-300/25 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-lime-300"
+            >
+              Contact Us
+              <svg
+                class="h-4 w-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+                stroke-width="2"
+                aria-hidden="true"
+              >
+                <path
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  d="M17.25 8.25 21 12m0 0-3.75 3.75M21 12H3"
+                />
+              </svg>
+            </a>
+          </div>
 
           <div class="mt-10 grid max-w-md grid-cols-3 gap-3 sm:mt-12 sm:gap-4">
             <div
