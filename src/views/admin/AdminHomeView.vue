@@ -494,6 +494,48 @@ function paymentChannelLabel(raw: string | null | undefined): string {
     .join(" ");
 }
 
+async function functionInvokeErrorMessage(error: unknown): Promise<string> {
+  if (!error) return "Request failed";
+  const fallback =
+    error instanceof Error && error.message ? error.message : String(error);
+  const ctx = (error as { context?: unknown }).context;
+  if (ctx instanceof Response) {
+    try {
+      const txt = await ctx.text();
+      if (!txt) return fallback;
+      try {
+        const j = JSON.parse(txt) as { error?: unknown; detail?: unknown };
+        const detailText =
+          typeof j.detail === "string" ? j.detail.trim() : "";
+        if (
+          detailText &&
+          /restricted_api_key/i.test(detailText) &&
+          /only send emails/i.test(detailText)
+        ) {
+          return "Resend key is send-only. Use a full-access Resend API key to read usage.";
+        }
+        if (typeof j.error === "string" && j.error.trim()) return j.error.trim();
+        if (detailText) return detailText;
+      } catch {
+        // plain text response
+      }
+      return txt.slice(0, 300);
+    } catch {
+      return fallback;
+    }
+  }
+  return fallback;
+}
+
+async function getFunctionAuthHeader() {
+  const {
+    data: { session },
+  } = await getSupabaseBrowser().auth.getSession();
+  const token = session?.access_token?.trim() || "";
+  if (!token) return null;
+  return { Authorization: `Bearer ${token}` };
+}
+
 async function loadSmsBalance(silent = false) {
   if (!authStore.isSuperAdmin || !isSupabaseConfigured()) {
     smsBalanceUnits.value = null;
@@ -505,14 +547,21 @@ async function loadSmsBalance(silent = false) {
   if (!silent) smsBalanceLoading.value = true;
   smsBalanceError.value = null;
   try {
+    const headers = await getFunctionAuthHeader();
+    if (!headers) {
+      smsBalanceUnits.value = null;
+      smsBalanceFetchedAt.value = null;
+      smsBalanceError.value = "Session expired. Sign out and sign in again.";
+      return;
+    }
     const { data, error } = await getSupabaseBrowser().functions.invoke(
       "get-arkesel-sms-balance",
-      { body: {} },
+      { body: {}, headers },
     );
     if (error) {
       smsBalanceUnits.value = null;
       smsBalanceFetchedAt.value = null;
-      smsBalanceError.value = error.message || "Failed to load SMS balance";
+      smsBalanceError.value = await functionInvokeErrorMessage(error);
       return;
     }
     const payload = (data ?? {}) as {

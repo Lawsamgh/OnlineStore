@@ -1,5 +1,6 @@
 import { createClient } from 'npm:@supabase/supabase-js'
 import { sendSellerPlanSubscribedEmail } from '../_shared/sendSellerPlanEmail.ts'
+import { sendSuperAdminSubscriptionAlert } from '../_shared/sendSuperAdminSubscriptionAlert.ts'
 import {
   extractPaystackPaymentFields,
   intPesewasFromUnknown,
@@ -266,6 +267,24 @@ Deno.serve(async (req) => {
       source: 'store',
       periodEndsAtIso: periodEnd.toISOString(),
       storeName,
+    })
+
+    await sendSuperAdminSubscriptionAlert({
+      admin,
+      resendApiKey: Deno.env.get('RESEND_API_KEY') ?? undefined,
+      resendFromEmail:
+        Deno.env.get('RESEND_FROM_BILLING_EMAIL') ??
+        Deno.env.get('RESEND_FROM_EMAIL') ??
+        'onboarding@resend.dev',
+      arkeselApiKey: Deno.env.get('ARKESEL_SMS_API_KEY') ?? undefined,
+      arkeselSenderId: Deno.env.get('ARKESEL_SMS_SENDER_ID') ?? undefined,
+      sellerEmail: user.email ?? null,
+      planId: feePlanId,
+      amountPesewas: payFields.paid_amount_pesewas,
+      paymentChannel: payFields.payment_channel,
+      periodEndsAtIso: periodEnd.toISOString(),
+      storeName,
+      source: 'store',
     })
 
     return Response.json(

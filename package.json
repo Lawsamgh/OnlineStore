@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "functions:login": "supabase login",
     "functions:link": "supabase link",
-    "functions:deploy": "supabase functions deploy paystack-init paystack-verify-plan paystack-verify-store-subscription sync-seller-subscription-for-store notify-order notify-order-status notify-seller-subscription-renewal notify-seller-verification notify-super-admin-new-seller notify-platform-staff-announcement track-order-safe get-arkesel-sms-balance"
+    "functions:deploy": "supabase functions deploy paystack-init paystack-verify-plan paystack-verify-store-subscription sync-seller-subscription-for-store notify-order notify-order-status notify-seller-subscription-renewal notify-seller-verification notify-super-admin-new-seller notify-platform-staff-announcement track-order-safe get-arkesel-sms-balance get-resend-usage"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.103.3",

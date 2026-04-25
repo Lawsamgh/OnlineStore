@@ -1,3 +1,4 @@
+/// <reference path="../npm-imports.d.ts" />
 import { createClient } from "npm:@supabase/supabase-js";
 
 declare const Deno: {
