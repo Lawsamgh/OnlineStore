@@ -15,6 +15,7 @@ import { getSupabaseBrowser, isSupabaseConfigured } from "../../lib/supabase";
 import { platformConsolePresenceOnlineKey } from "../../lib/consolePresenceInjection";
 import { formatGhs } from "../../lib/formatMoney";
 import { planLabelFromSignupId } from "../../lib/planLabel";
+import { refreshSessionForEdgeFunctions } from "../../lib/refreshSessionForEdgeFunctions";
 import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefresh";
 import { useToastStore } from "../../stores/toast";
 import { useAuthStore } from "../../stores/auth";
@@ -75,6 +76,11 @@ const smsBalanceLoading = ref(false);
 const smsBalanceUnits = ref<number | null>(null);
 const smsBalanceFetchedAt = ref<string | null>(null);
 const smsBalanceError = ref<string | null>(null);
+const smsHealthLoading = ref(false);
+const smsHealthSent24h = ref<number>(0);
+const smsHealthFailed24h = ref<number>(0);
+const smsHealthFetchedAt = ref<string | null>(null);
+const smsHealthError = ref<string | null>(null);
 
 function applySellerSubscriptionBilling(
   rows: unknown[] | null,
@@ -547,28 +553,78 @@ async function loadSmsBalance(silent = false) {
   if (!silent) smsBalanceLoading.value = true;
   smsBalanceError.value = null;
   try {
-    const headers = await getFunctionAuthHeader();
+    const sb = getSupabaseBrowser();
+    let headers: Record<string, string> | undefined =
+      (await getFunctionAuthHeader()) ?? undefined;
     if (!headers) {
-      smsBalanceUnits.value = null;
-      smsBalanceFetchedAt.value = null;
-      smsBalanceError.value = "Session expired. Sign out and sign in again.";
-      return;
+      const refreshed = await refreshSessionForEdgeFunctions(sb);
+      if (!refreshed.ok) {
+        smsBalanceUnits.value = null;
+        smsBalanceFetchedAt.value = null;
+        smsBalanceError.value = refreshed.message;
+        return;
+      }
+      headers = refreshed.headers ?? undefined;
     }
-    const { data, error } = await getSupabaseBrowser().functions.invoke(
-      "get-arkesel-sms-balance",
-      { body: {}, headers },
-    );
+
+    let { data, error } = await sb.functions.invoke("get-arkesel-sms-balance", {
+      body: {},
+      headers,
+    });
+    if (error) {
+      const message = await functionInvokeErrorMessage(error);
+      if (/invalid session|expired|jwt|token/i.test(message)) {
+        const refreshed = await refreshSessionForEdgeFunctions(sb);
+        if (refreshed.ok) {
+          const retry = await sb.functions.invoke("get-arkesel-sms-balance", {
+            body: {},
+            headers: refreshed.headers,
+          });
+          data = retry.data;
+          error = retry.error;
+        }
+      }
+    }
     if (error) {
       smsBalanceUnits.value = null;
       smsBalanceFetchedAt.value = null;
       smsBalanceError.value = await functionInvokeErrorMessage(error);
       return;
     }
-    const payload = (data ?? {}) as {
+
+    let payload = (data ?? {}) as {
       balance?: unknown;
       fetched_at?: unknown;
       error?: unknown;
     };
+    if (
+      typeof payload.error === "string" &&
+      /invalid session|expired|jwt|token/i.test(payload.error)
+    ) {
+      const refreshed = await refreshSessionForEdgeFunctions(sb);
+      if (!refreshed.ok) {
+        smsBalanceUnits.value = null;
+        smsBalanceFetchedAt.value = null;
+        smsBalanceError.value = refreshed.message;
+        return;
+      }
+      const retry = await sb.functions.invoke("get-arkesel-sms-balance", {
+        body: {},
+        headers: refreshed.headers,
+      });
+      if (retry.error) {
+        smsBalanceUnits.value = null;
+        smsBalanceFetchedAt.value = null;
+        smsBalanceError.value = await functionInvokeErrorMessage(retry.error);
+        return;
+      }
+      payload = (retry.data ?? {}) as {
+        balance?: unknown;
+        fetched_at?: unknown;
+        error?: unknown;
+      };
+    }
+
     if (typeof payload.error === "string" && payload.error.trim()) {
       smsBalanceUnits.value = null;
       smsBalanceFetchedAt.value = null;
@@ -593,6 +649,51 @@ async function loadSmsBalance(silent = false) {
     smsBalanceError.value = String(err);
   } finally {
     smsBalanceLoading.value = false;
+  }
+}
+
+async function loadSmsDeliveryHealth(silent = false) {
+  if (!authStore.isSuperAdmin || !isSupabaseConfigured()) {
+    smsHealthSent24h.value = 0;
+    smsHealthFailed24h.value = 0;
+    smsHealthFetchedAt.value = null;
+    smsHealthError.value = null;
+    smsHealthLoading.value = false;
+    return;
+  }
+  if (!silent) smsHealthLoading.value = true;
+  smsHealthError.value = null;
+  try {
+    const sb = getSupabaseBrowser();
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { data, error } = await sb
+      .from("sms_notification_logs")
+      .select("status")
+      .gte("created_at", since);
+    if (error) {
+      smsHealthError.value = error.message;
+      smsHealthSent24h.value = 0;
+      smsHealthFailed24h.value = 0;
+      smsHealthFetchedAt.value = null;
+      return;
+    }
+    let sent = 0;
+    let failed = 0;
+    for (const row of data ?? []) {
+      const status = (row as { status?: unknown }).status;
+      if (status === "sent") sent += 1;
+      if (status === "failed") failed += 1;
+    }
+    smsHealthSent24h.value = sent;
+    smsHealthFailed24h.value = failed;
+    smsHealthFetchedAt.value = new Date().toISOString();
+  } catch (err) {
+    smsHealthError.value = String(err);
+    smsHealthSent24h.value = 0;
+    smsHealthFailed24h.value = 0;
+    smsHealthFetchedAt.value = null;
+  } finally {
+    smsHealthLoading.value = false;
   }
 }
 
@@ -700,6 +801,55 @@ const paidSubscriptionSellerRows = computed(() =>
     return Boolean(planId && planId !== "free");
   }),
 );
+
+const duePlansFilter = ref<"all" | "today" | "overdue" | "within7">("all");
+
+function utcDayStart(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+}
+
+function daysUntilIsoDate(iso: string | null | undefined): number | null {
+  if (!iso || typeof iso !== "string") return null;
+  const target = new Date(iso);
+  if (Number.isNaN(target.getTime())) return null;
+  const nowStart = utcDayStart(new Date());
+  const targetStart = utcDayStart(target);
+  return Math.floor((targetStart.getTime() - nowStart.getTime()) / 86_400_000);
+}
+
+function dueStatusLabel(daysLeft: number | null): string {
+  if (daysLeft == null) return "Unknown";
+  if (daysLeft < 0) return `${Math.abs(daysLeft)}d overdue`;
+  if (daysLeft === 0) return "Due today";
+  return `Due in ${daysLeft}d`;
+}
+
+const dueSubscriptionSellerRows = computed(() =>
+  paidSubscriptionSellerRows.value
+    .map((row) => ({
+      ...row,
+      daysLeft: daysUntilIsoDate(row.latestExpiryAt),
+    }))
+    .filter((row) => row.daysLeft != null && row.daysLeft <= 7)
+    .sort((a, b) => (a.daysLeft ?? Number.MAX_SAFE_INTEGER) - (b.daysLeft ?? Number.MAX_SAFE_INTEGER)),
+);
+
+const visibleDueSubscriptionSellerRows = computed(() => {
+  const rows = dueSubscriptionSellerRows.value;
+  switch (duePlansFilter.value) {
+    case "today":
+      return rows.filter((row) => row.daysLeft === 0);
+    case "overdue":
+      return rows.filter((row) => (row.daysLeft ?? 0) < 0);
+    case "within7":
+      return rows.filter(
+        (row) =>
+          typeof row.daysLeft === "number" && row.daysLeft >= 0 && row.daysLeft <= 7,
+      );
+    default:
+      return rows;
+  }
+});
 
 /** Stores column: show storefront name when the owner has exactly one shop. */
 function pipelineStoresCell(row: OwnerPipelineRow): string {
@@ -1228,7 +1378,7 @@ async function loadPlatformData(silent = false) {
       subSnapRes.error,
       silent,
     );
-    await loadSmsBalance(silent);
+    await Promise.all([loadSmsBalance(silent), loadSmsDeliveryHealth(silent)]);
     stats.value = {
       stores: s.count ?? 0,
       products: pr.count ?? 0,
@@ -1570,6 +1720,7 @@ const overviewSlides = [
   { title: "Subscription cashflow", subtitle: "Paid vs fees trend" },
   { title: "Shop pipeline", subtitle: "Owners, plans and catalog" },
   { title: "Paid subscription sellers", subtitle: "Sellers on starter, growth and pro" },
+  { title: "Plans due", subtitle: "Paid sellers with due dates" },
 ] as const;
 
 const overviewSlideProgressPct = computed(() =>
@@ -1907,6 +2058,34 @@ async function confirmRevokeConsoleAccess() {
           <div
             class="inline-flex items-center gap-2 rounded-2xl border border-white/70 bg-white/75 p-1.5 shadow-[0_10px_28px_-16px_rgba(15,23,42,0.5)] backdrop-blur-md"
           >
+            <div class="hidden items-center gap-1.5 lg:inline-flex" role="tablist" aria-label="Overview slides">
+              <button
+                v-for="(slide, idx) in overviewSlides"
+                :key="slide.title"
+                type="button"
+                class="inline-flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-[11px] font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700"
+                :class="
+                  overviewSlideIndex === idx
+                    ? 'border-emerald-600 bg-emerald-600 text-white shadow-[0_8px_18px_-12px_rgba(5,150,105,0.9)]'
+                    : 'border-zinc-300/80 bg-white/85 text-zinc-600 hover:border-zinc-400 hover:bg-zinc-50'
+                "
+                :aria-pressed="overviewSlideIndex === idx"
+                :aria-label="`Go to ${slide.title} slide`"
+                @mouseenter="pauseOverviewAutoplay"
+                @mouseleave="resumeOverviewAutoplay"
+                @click="setOverviewSlide(idx)"
+              >
+                <span
+                  class="inline-flex h-4 min-w-4 items-center justify-center rounded-full text-[10px] font-bold tabular-nums"
+                  :class="
+                    overviewSlideIndex === idx ? 'bg-white/20 text-white' : 'bg-zinc-200 text-zinc-700'
+                  "
+                >
+                  {{ idx + 1 }}
+                </span>
+                <span class="max-w-[7rem] truncate">{{ slide.title }}</span>
+              </button>
+            </div>
             <span
               class="inline-flex h-9 min-w-[3.75rem] items-center justify-center rounded-xl border border-zinc-200/70 bg-zinc-50/80 px-3 text-sm font-bold tabular-nums text-zinc-700 shadow-[inset_0_1px_0_rgba(255,255,255,0.95)]"
               aria-live="polite"
@@ -1944,7 +2123,7 @@ async function confirmRevokeConsoleAccess() {
         </div>
 
         <div
-          class="relative min-w-0 flex-1 min-h-[26rem]"
+          class="relative min-w-0 flex-1 min-h-[19rem]"
           tabindex="0"
           role="region"
           aria-label="Platform overview carousel"
@@ -2116,7 +2295,7 @@ async function confirmRevokeConsoleAccess() {
             <div
               v-else-if="overviewSlideIndex === 1"
               key="pipeline-slide"
-              class="flex h-full min-h-[16rem] w-full min-w-0 flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/60 bg-white shadow-[0_28px_70px_-40px_rgba(15,23,42,0.18)] sm:min-h-[17rem] sm:rounded-3xl md:min-h-0"
+              class="flex h-full min-h-[12.5rem] w-full min-w-0 flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/60 bg-white shadow-[0_28px_70px_-40px_rgba(15,23,42,0.18)] sm:min-h-[13.5rem] sm:rounded-3xl md:min-h-0"
             >
           <div
             class="flex shrink-0 items-center justify-between gap-3 border-b border-zinc-100 px-5 py-4 sm:px-6"
@@ -2255,7 +2434,7 @@ async function confirmRevokeConsoleAccess() {
 
           <div
             v-else
-            class="flex min-h-0 flex-1 flex-col items-center justify-center px-6 py-14 text-center md:py-8"
+            class="flex min-h-0 flex-1 flex-col items-center justify-center px-6 py-8 text-center md:py-6"
           >
             <p class="text-lg font-semibold text-zinc-900">No shops yet</p>
             <p class="mt-2 text-sm text-zinc-600">
@@ -2266,9 +2445,9 @@ async function confirmRevokeConsoleAccess() {
             </div>
 
             <section
-              v-else
+              v-else-if="overviewSlideIndex === 2"
               key="paid-subscription-sellers-slide"
-              class="flex h-full min-h-[16rem] w-full min-w-0 flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-emerald-200/60 bg-gradient-to-br from-white to-emerald-50/35 shadow-[0_28px_70px_-40px_rgba(6,95,70,0.18)] sm:min-h-[17rem] sm:rounded-3xl md:min-h-0"
+              class="flex h-full min-h-[12.5rem] w-full min-w-0 flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-emerald-200/60 bg-gradient-to-br from-white to-emerald-50/35 shadow-[0_28px_70px_-40px_rgba(6,95,70,0.18)] sm:min-h-[13.5rem] sm:rounded-3xl md:min-h-0"
             >
               <div
                 class="flex shrink-0 items-center justify-between gap-3 border-b border-emerald-100/80 px-5 py-4 sm:px-6"
@@ -2425,7 +2604,7 @@ async function confirmRevokeConsoleAccess() {
 
               <div
                 v-else
-                class="flex min-h-0 flex-1 flex-col items-center justify-center px-6 py-14 text-center md:py-8"
+                class="flex min-h-0 flex-1 flex-col items-center justify-center px-6 py-8 text-center md:py-6"
               >
                 <p class="text-lg font-semibold text-zinc-900">
                   No paid subscription sellers yet
@@ -2435,46 +2614,209 @@ async function confirmRevokeConsoleAccess() {
                 </p>
               </div>
             </section>
+
+            <section
+              v-else
+              key="due-subscription-sellers-slide"
+              class="flex h-full min-h-[12.5rem] w-full min-w-0 flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-amber-200/60 bg-gradient-to-br from-white to-amber-50/35 shadow-[0_28px_70px_-40px_rgba(120,53,15,0.18)] sm:min-h-[13.5rem] sm:rounded-3xl md:min-h-0"
+            >
+              <div
+                class="flex shrink-0 items-center justify-between gap-3 border-b border-amber-100/80 px-5 py-4 sm:px-6"
+              >
+                <div class="min-w-0">
+                  <h2 class="text-lg font-bold text-zinc-900">
+                    Sellers with plans due
+                  </h2>
+                  <p class="mt-0.5 text-xs text-zinc-600">
+                    Overdue, due today, or due within 7 days
+                  </p>
+                </div>
+                <span
+                  class="inline-flex items-center rounded-full border border-amber-200/80 bg-amber-100/70 px-3 py-1 text-xs font-semibold text-amber-900"
+                >
+                  {{ visibleDueSubscriptionSellerRows.length }} sellers
+                </span>
+              </div>
+
+              <div class="border-b border-amber-100/80 px-5 py-3 sm:px-6">
+                <div class="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    class="inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700"
+                    :class="
+                      duePlansFilter === 'today'
+                        ? 'border-amber-700 bg-amber-700 text-white'
+                        : 'border-amber-200 bg-white text-amber-900 hover:bg-amber-50'
+                    "
+                    @click="duePlansFilter = 'today'"
+                  >
+                    Today
+                  </button>
+                  <button
+                    type="button"
+                    class="inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700"
+                    :class="
+                      duePlansFilter === 'overdue'
+                        ? 'border-amber-700 bg-amber-700 text-white'
+                        : 'border-amber-200 bg-white text-amber-900 hover:bg-amber-50'
+                    "
+                    @click="duePlansFilter = 'overdue'"
+                  >
+                    Overdue
+                  </button>
+                  <button
+                    type="button"
+                    class="inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700"
+                    :class="
+                      duePlansFilter === 'within7'
+                        ? 'border-amber-700 bg-amber-700 text-white'
+                        : 'border-amber-200 bg-white text-amber-900 hover:bg-amber-50'
+                    "
+                    @click="duePlansFilter = 'within7'"
+                  >
+                    Due within 7 days
+                  </button>
+                  <button
+                    type="button"
+                    class="inline-flex items-center rounded-full border px-3 py-1 text-xs font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700"
+                    :class="
+                      duePlansFilter === 'all'
+                        ? 'border-zinc-700 bg-zinc-700 text-white'
+                        : 'border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50'
+                    "
+                    @click="duePlansFilter = 'all'"
+                  >
+                    All due
+                  </button>
+                </div>
+              </div>
+
+              <template v-if="visibleDueSubscriptionSellerRows.length">
+                <div
+                  class="min-h-0 flex-1 overflow-y-auto overflow-x-auto overscroll-y-contain"
+                >
+                  <table
+                    class="min-w-full border-collapse text-left text-sm ring-1 ring-inset ring-amber-200/70"
+                  >
+                    <thead class="sticky top-0 z-[1]">
+                      <tr
+                        class="border-b border-amber-200/80 bg-amber-50/85 text-xs font-semibold uppercase tracking-wider text-amber-900/75 backdrop-blur-sm"
+                      >
+                        <th
+                          class="border-r border-amber-200/70 px-5 py-3 sm:px-6 last:border-r-0"
+                        >
+                          Seller
+                        </th>
+                        <th class="border-r border-amber-200/70 px-3 py-3">
+                          Plan
+                        </th>
+                        <th class="border-r border-amber-200/70 px-3 py-3">
+                          Expiry Date
+                        </th>
+                        <th class="border-r border-amber-200/70 px-3 py-3">
+                          Due Status
+                        </th>
+                        <th class="px-5 py-3 sm:px-6">Phone Number</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="row in visibleDueSubscriptionSellerRows"
+                        :key="`due-seller-${row.ownerId}`"
+                        class="border-b border-amber-100/70 bg-white/90 transition last:border-b-0 hover:bg-amber-50/45"
+                      >
+                        <td
+                          class="border-r border-amber-100/70 px-5 py-4 font-semibold text-zinc-900 sm:px-6 last:border-r-0"
+                        >
+                          <div
+                            class="flex min-w-0 max-w-[20rem] items-center gap-3"
+                          >
+                            <span
+                              class="relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full text-sm font-bold text-white shadow-sm ring-2 ring-white/90"
+                              :class="
+                                row.ownerAvatarUrl
+                                  ? 'bg-white'
+                                  : 'bg-gradient-to-br from-amber-500 to-orange-600'
+                              "
+                            >
+                              <span
+                                class="absolute inset-0 flex items-center justify-center"
+                                aria-hidden="true"
+                                >{{ row.ownerInitial }}</span
+                              >
+                              <img
+                                v-if="row.ownerAvatarUrl"
+                                :src="row.ownerAvatarUrl"
+                                alt=""
+                                class="relative z-10 h-full w-full bg-white object-cover"
+                                loading="lazy"
+                                @error="
+                                  ($event.target as HTMLImageElement).classList.add(
+                                    'hidden',
+                                  )
+                                "
+                              />
+                            </span>
+                            <span class="min-w-0 truncate">{{
+                              row.ownerName
+                            }}</span>
+                          </div>
+                        </td>
+                        <td
+                          class="border-r border-amber-100/70 px-3 py-4 text-sm font-medium text-zinc-800 last:border-r-0"
+                        >
+                          {{ row.subscriptionPlanLabel }}
+                        </td>
+                        <td
+                          class="border-r border-amber-100/70 px-3 py-4 text-zinc-700 last:border-r-0"
+                        >
+                          {{ formatDateLabel(row.latestExpiryAt) }}
+                        </td>
+                        <td
+                          class="border-r border-amber-100/70 px-3 py-4 text-zinc-700 last:border-r-0"
+                        >
+                          <span
+                            class="inline-flex rounded-full border px-2.5 py-1 text-xs font-semibold"
+                            :class="
+                              (row.daysLeft ?? 0) < 0
+                                ? 'border-rose-200 bg-rose-100 text-rose-800'
+                                : (row.daysLeft ?? 0) === 0
+                                  ? 'border-amber-300 bg-amber-100 text-amber-900'
+                                  : 'border-emerald-200 bg-emerald-100 text-emerald-800'
+                            "
+                          >
+                            {{ dueStatusLabel(row.daysLeft) }}
+                          </span>
+                        </td>
+                        <td class="px-5 py-4 text-zinc-700 sm:px-6">
+                          {{ row.ownerPhoneE164?.trim() || "—" }}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </template>
+
+              <div
+                v-else
+                class="flex min-h-0 flex-1 flex-col items-center justify-center px-6 py-8 text-center md:py-6"
+              >
+                <p class="text-lg font-semibold text-zinc-900">
+                  No plans due right now
+                </p>
+                <p class="mt-2 text-sm text-zinc-600">
+                  Sellers with upcoming or overdue paid plans will appear here.
+                </p>
+              </div>
+            </section>
           </Transition>
         </div>
 
-        <div
-          class="flex flex-wrap items-center justify-center gap-2"
-          role="tablist"
-          aria-label="Overview slides"
-        >
-          <button
-            v-for="(slide, idx) in overviewSlides"
-            :key="slide.title"
-            type="button"
-            class="inline-flex h-8 items-center gap-2 rounded-xl border px-3 text-xs font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700"
-            :class="
-              overviewSlideIndex === idx
-                ? 'border-emerald-600 bg-emerald-600 text-white shadow-[0_8px_18px_-12px_rgba(5,150,105,0.9)]'
-                : 'border-zinc-300/80 bg-white/85 text-zinc-600 hover:border-zinc-400 hover:bg-zinc-50'
-            "
-            :aria-pressed="overviewSlideIndex === idx"
-            :aria-label="`Go to ${slide.title} slide`"
-            @mouseenter="pauseOverviewAutoplay"
-            @mouseleave="resumeOverviewAutoplay"
-            @click="setOverviewSlide(idx)"
-          >
-            <span
-              class="inline-flex h-4 min-w-4 items-center justify-center rounded-full text-[10px] font-bold tabular-nums"
-              :class="
-                overviewSlideIndex === idx ? 'bg-white/20 text-white' : 'bg-zinc-200 text-zinc-700'
-              "
-            >
-              {{ idx + 1 }}
-            </span>
-            <span class="max-w-[9rem] truncate">{{ slide.title }}</span>
-          </button>
-        </div>
       </div>
 
       <!-- Console: platform staff directory -->
       <aside
-        class="flex h-full min-h-0 w-full min-w-0 self-stretch flex-col gap-4 rounded-[1.75rem] border border-indigo-200/45 bg-gradient-to-br from-white/95 via-indigo-50/35 to-violet-50/45 p-5 shadow-[0_20px_50px_-32px_rgba(79,70,229,0.12)] backdrop-blur-sm sm:rounded-3xl sm:p-6"
+        class="flex h-full min-h-0 w-full min-w-0 self-stretch flex-col gap-3 rounded-[1.75rem] border border-indigo-200/45 bg-gradient-to-br from-white/95 via-indigo-50/35 to-violet-50/45 p-4 shadow-[0_20px_50px_-32px_rgba(79,70,229,0.12)] backdrop-blur-sm sm:rounded-3xl sm:p-5"
       >
         <div class="shrink-0 min-w-0">
           <p
@@ -2556,6 +2898,44 @@ async function confirmRevokeConsoleAccess() {
             </p>
             <p v-if="smsBalanceError" class="mt-2 text-[11px] text-rose-700">
               {{ smsBalanceError }}
+            </p>
+          </div>
+          <div
+            v-if="authStore.isSuperAdmin"
+            class="mt-3 rounded-2xl border border-amber-200/70 bg-amber-50/60 p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]"
+          >
+            <div class="flex items-start justify-between gap-2">
+              <div>
+                <p class="text-[11px] font-semibold uppercase tracking-wider text-amber-900/80">
+                  SMS delivery health (24h)
+                </p>
+                <p class="mt-1 text-sm font-semibold tabular-nums text-amber-900">
+                  Sent: {{ smsHealthSent24h.toLocaleString() }}
+                </p>
+                <p class="mt-0.5 text-sm font-semibold tabular-nums text-amber-900">
+                  Failed: {{ smsHealthFailed24h.toLocaleString() }}
+                </p>
+                <p class="mt-0.5 text-[11px] text-amber-900/70">
+                  {{ smsHealthLoading ? "Refreshing..." : "From SMS notification logs" }}
+                </p>
+              </div>
+              <button
+                type="button"
+                class="inline-flex h-8 items-center justify-center rounded-md border border-amber-300/70 bg-white/80 px-2.5 text-xs font-semibold text-amber-800 transition hover:bg-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+                :disabled="smsHealthLoading"
+                @click="void loadSmsDeliveryHealth(false)"
+              >
+                {{ smsHealthLoading ? "..." : "Refresh" }}
+              </button>
+            </div>
+            <p
+              v-if="smsHealthFetchedAt"
+              class="mt-2 text-[11px] text-amber-900/70"
+            >
+              Last checked: {{ formatDateTimeLabel(smsHealthFetchedAt) }}
+            </p>
+            <p v-if="smsHealthError" class="mt-2 text-[11px] text-rose-700">
+              {{ smsHealthError }}
             </p>
           </div>
           <p

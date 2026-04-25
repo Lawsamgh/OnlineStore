@@ -94,6 +94,7 @@ const products = ref<
     category_name: string | null;
     price_cents: number;
     is_published: boolean;
+    availability: "in_stock" | "out_of_stock";
     image_paths: string[];
     created_at: string;
   }[]
@@ -1147,7 +1148,7 @@ async function loadAll(opts?: { silent?: boolean }) {
         supabase
           .from("products")
           .select(
-            "id, title, description, price_cents, is_published, image_paths, category_id, created_at, product_categories ( name )",
+            "id, title, description, price_cents, is_published, availability, image_paths, category_id, created_at, product_categories ( name )",
           )
           .eq("store_id", s.id)
           .order("created_at", { ascending: false }),
@@ -1191,6 +1192,8 @@ async function loadAll(opts?: { silent?: boolean }) {
         category_name: categoryName,
         price_cents: Number(r.price_cents) || 0,
         is_published: Boolean(r.is_published),
+        availability:
+          r.availability === "out_of_stock" ? "out_of_stock" : "in_stock",
         image_paths: Array.isArray(r.image_paths)
           ? (r.image_paths as string[])
           : [],
@@ -1378,6 +1381,31 @@ async function togglePublish(p: (typeof products.value)[0]) {
     // triggers the same once `products` is in `supabase_realtime` (migration).
     void loadAll({ silent: true });
   }
+}
+
+async function toggleOutOfStock(p: (typeof products.value)[0]) {
+  if (!canUseRoleGatedStoreActions.value) {
+    toast.info("Actions are unavailable until your role is set.");
+    return;
+  }
+  const supabase = getSupabaseBrowser();
+  const nextAvailability =
+    p.availability === "out_of_stock" ? "in_stock" : "out_of_stock";
+  const { error } = await supabase
+    .from("products")
+    .update({ availability: nextAvailability })
+    .eq("id", p.id);
+  if (error) {
+    toast.error(error.message || "Could not update stock state.");
+    return;
+  }
+  p.availability = nextAvailability;
+  toast.success(
+    nextAvailability === "out_of_stock"
+      ? "Marked as out of stock."
+      : "Marked as in stock.",
+  );
+  void loadAll({ silent: true });
 }
 
 async function saveProductCategoryId(
@@ -1832,7 +1860,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
               </span>
             </div>
             <div
-              class="hidden shrink-0 grid-cols-[minmax(0,0.82fr)_9.25rem_4.5rem_5rem_3.75rem_5.75rem] gap-x-4 gap-y-1 border-b border-zinc-200 bg-zinc-100/90 px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500 lg:grid"
+              class="hidden shrink-0 grid-cols-[minmax(14rem,1.55fr)_minmax(8.5rem,0.95fr)_minmax(5.5rem,0.62fr)_minmax(6rem,0.72fr)_minmax(5rem,0.58fr)_minmax(8.5rem,0.98fr)] gap-x-4 gap-y-1 border-b border-zinc-200 bg-zinc-100/90 px-4 py-3 text-[10px] font-bold uppercase tracking-wider text-zinc-500 lg:grid"
             >
               <span class="text-left">Name</span>
               <span class="text-left">Category</span>
@@ -1936,14 +1964,57 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                       <span
                         class="inline-flex rounded-full px-2.5 py-1 text-xs font-semibold"
                         :class="
-                          p.is_published
-                            ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
-                            : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
+                          p.availability === 'out_of_stock'
+                            ? 'bg-rose-50 text-rose-700 ring-1 ring-rose-200/80'
+                            : p.is_published
+                              ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
+                              : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
                         "
                       >
-                        {{ p.is_published ? "Live" : "Draft" }}
+                        {{
+                          p.availability === "out_of_stock"
+                            ? "Out of stock"
+                            : p.is_published
+                              ? "Live"
+                              : "Draft"
+                        }}
                       </span>
-                      <div class="ml-auto flex items-center gap-1.5">
+                      <div class="ml-auto flex items-center gap-2.5">
+                        <button
+                          type="button"
+                          class="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-amber-300 hover:bg-amber-50/90 hover:text-amber-800 focus-visible:ring-2 focus-visible:ring-amber-500/30"
+                          :aria-label="
+                            p.availability === 'out_of_stock'
+                              ? 'Mark product in stock'
+                              : 'Mark product out of stock'
+                          "
+                          @click="toggleOutOfStock(p)"
+                        >
+                          <svg
+                            class="h-[1.125rem] w-[1.125rem]"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="1.75"
+                            aria-hidden="true"
+                          >
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              d="M3.75 3.75h16.5v11.25H3.75V3.75z"
+                            />
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              d="M7.5 20.25h9"
+                            />
+                            <path
+                              stroke-linecap="round"
+                              stroke-linejoin="round"
+                              d="M9 9.75h6"
+                            />
+                          </svg>
+                        </button>
                         <button
                           type="button"
                           class="inline-flex h-10 w-10 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-teal-300 hover:bg-teal-50/90 hover:text-teal-800 focus-visible:ring-2 focus-visible:ring-teal-500/30"
@@ -2017,7 +2088,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
 
                   <!-- Desktop: wide table row -->
                   <div
-                    class="hidden min-w-[36rem] grid-cols-[minmax(0,0.82fr)_9.25rem_4.5rem_5rem_3.75rem_5.75rem] gap-x-4 gap-y-1 px-4 py-4 lg:grid lg:items-center"
+                    class="hidden min-w-[36rem] grid-cols-[minmax(14rem,1.55fr)_minmax(8.5rem,0.95fr)_minmax(5.5rem,0.62fr)_minmax(6rem,0.72fr)_minmax(5rem,0.58fr)_minmax(8.5rem,0.98fr)] gap-x-4 gap-y-1 px-4 py-4 lg:grid lg:items-center"
                   >
                     <div class="flex min-w-0 items-center gap-3">
                       <div
@@ -2097,15 +2168,58 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                       <span
                         class="inline-flex rounded-full px-2 py-0.5 text-[11px] font-semibold"
                         :class="
-                          p.is_published
-                            ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
-                            : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
+                          p.availability === 'out_of_stock'
+                            ? 'bg-rose-50 text-rose-700 ring-1 ring-rose-200/80'
+                            : p.is_published
+                              ? 'bg-emerald-50 text-emerald-900 ring-1 ring-emerald-200/80'
+                              : 'bg-zinc-100 text-zinc-600 ring-1 ring-zinc-200/80'
                         "
                       >
-                        {{ p.is_published ? "Live" : "Draft" }}
+                        {{
+                          p.availability === "out_of_stock"
+                            ? "Out of stock"
+                            : p.is_published
+                              ? "Live"
+                              : "Draft"
+                        }}
                       </span>
                     </div>
-                    <div class="justify-self-end flex justify-end gap-1">
+                    <div class="justify-self-end flex justify-end gap-2.5">
+                      <button
+                        type="button"
+                        class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-amber-300 hover:bg-amber-50/90 hover:text-amber-800 focus-visible:ring-2 focus-visible:ring-amber-500/30"
+                        :aria-label="
+                          p.availability === 'out_of_stock'
+                            ? 'Mark product in stock'
+                            : 'Mark product out of stock'
+                        "
+                        @click="toggleOutOfStock(p)"
+                      >
+                        <svg
+                          class="h-[1.125rem] w-[1.125rem]"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                          stroke="currentColor"
+                          stroke-width="1.75"
+                          aria-hidden="true"
+                        >
+                          <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            d="M3.75 3.75h16.5v11.25H3.75V3.75z"
+                          />
+                          <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            d="M7.5 20.25h9"
+                          />
+                          <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            d="M9 9.75h6"
+                          />
+                        </svg>
+                      </button>
                       <button
                         type="button"
                         class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-600 shadow-sm outline-none transition hover:border-teal-300 hover:bg-teal-50/90 hover:text-teal-800 focus-visible:ring-2 focus-visible:ring-teal-500/30"
@@ -2213,7 +2327,7 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                   </div>
                 </div>
                 <div
-                  class="hidden min-w-[36rem] grid-cols-[minmax(0,0.82fr)_9.25rem_4.5rem_5rem_3.75rem_5.75rem] gap-x-4 text-[11px] lg:grid lg:items-center"
+                  class="hidden min-w-[36rem] grid-cols-[minmax(14rem,1.55fr)_minmax(8.5rem,0.95fr)_minmax(5.5rem,0.62fr)_minmax(6rem,0.72fr)_minmax(5rem,0.58fr)_minmax(8.5rem,0.98fr)] gap-x-4 text-[11px] lg:grid lg:items-center"
                 >
                   <span class="font-bold uppercase tracking-wider text-zinc-500"
                     >Summary</span

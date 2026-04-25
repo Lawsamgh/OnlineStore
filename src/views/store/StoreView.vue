@@ -43,9 +43,21 @@ const products = ref<
     description: string | null
     category: string | null
     price_cents: number
+    availability: 'in_stock' | 'out_of_stock'
     image_paths: string[]
   }[]
 >([])
+type ProductReviewRow = {
+  id: string
+  product_id: string
+  rating: number
+  comment: string | null
+  reviewer_name: string | null
+  created_at: string
+}
+const reviewStatsByProductId = ref(new Map<string, { count: number; avg: number }>())
+const reviewItemsByProductId = ref(new Map<string, ProductReviewRow[]>())
+const MAX_VISIBLE_PRODUCT_REVIEWS = 20
 
 // ── Search & filter state ──────────────────────────────────────────────────
 const searchQuery = ref('')
@@ -157,7 +169,7 @@ async function load(opts?: { silent?: boolean }) {
   const { data: p, error: pe } = await supabase
     .from('products')
     .select(
-      'id, title, description, price_cents, image_paths, product_categories ( name )',
+      'id, title, description, price_cents, availability, image_paths, product_categories ( name )',
     )
     .eq('store_id', s.id)
     .eq('is_published', true)
@@ -184,13 +196,86 @@ async function load(opts?: { silent?: boolean }) {
             : null,
         category,
         price_cents: Number(r.price_cents) || 0,
+        availability:
+          r.availability === 'out_of_stock' ? 'out_of_stock' : 'in_stock',
         image_paths: Array.isArray(r.image_paths)
           ? (r.image_paths as string[])
           : [],
       }
     })
+    const productIds = products.value.map((x) => x.id)
+    reviewStatsByProductId.value = new Map()
+    reviewItemsByProductId.value = new Map()
+    if (productIds.length > 0) {
+      const { data: reviewsData, error: reviewsError } = await supabase
+        .from('product_reviews')
+        .select('id, product_id, rating, comment, reviewer_name, created_at')
+        .eq('store_id', s.id)
+        .eq('is_visible', true)
+        .in('product_id', productIds)
+        .order('created_at', { ascending: false })
+      if (reviewsError) {
+        if (!silent) toast.error(reviewsError.message)
+      } else {
+        const stats = new Map<string, { count: number; sum: number }>()
+        const items = new Map<string, ProductReviewRow[]>()
+        for (const raw of reviewsData ?? []) {
+          const r = raw as Record<string, unknown>
+          const pid = typeof r.product_id === 'string' ? r.product_id : ''
+          const rating = Number(r.rating)
+          if (!pid || !Number.isFinite(rating) || rating < 1 || rating > 5) continue
+          const st = stats.get(pid) ?? { count: 0, sum: 0 }
+          st.count += 1
+          st.sum += rating
+          stats.set(pid, st)
+          const list = items.get(pid) ?? []
+          if (list.length < MAX_VISIBLE_PRODUCT_REVIEWS) {
+            list.push({
+              id: String(r.id ?? `${pid}-${list.length}`),
+              product_id: pid,
+              rating,
+              comment:
+                typeof r.comment === 'string' && r.comment.trim() ? r.comment.trim() : null,
+              reviewer_name:
+                typeof r.reviewer_name === 'string' && r.reviewer_name.trim()
+                  ? r.reviewer_name.trim()
+                  : null,
+              created_at: String(r.created_at ?? ''),
+            })
+            items.set(pid, list)
+          }
+        }
+        const mapped = new Map<string, { count: number; avg: number }>()
+        for (const [pid, st] of stats.entries()) {
+          mapped.set(pid, { count: st.count, avg: st.sum / st.count })
+        }
+        reviewStatsByProductId.value = mapped
+        reviewItemsByProductId.value = items
+      }
+    }
   }
   if (!silent) loading.value = false
+}
+
+function reviewStatForProduct(productId: string): { count: number; avg: number } | null {
+  return reviewStatsByProductId.value.get(productId) ?? null
+}
+
+function reviewStars(avg: number): string {
+  const rounded = Math.max(1, Math.min(5, Math.round(avg)))
+  return '★'.repeat(rounded) + '☆'.repeat(5 - rounded)
+}
+
+function formatReviewDate(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return 'Recently'
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+function reviewerInitial(name: string | null | undefined): string {
+  const t = (name ?? '').trim()
+  if (!t) return 'V'
+  return t[0]!.toUpperCase()
 }
 
 onMounted(() => {
@@ -220,6 +305,10 @@ useRealtimeTableRefresh({
 
 // ── Cart ───────────────────────────────────────────────────────────────────
 function addToCart(p: (typeof products.value)[0]) {
+  if (p.availability === 'out_of_stock') {
+    toast.info('This product is currently out of stock.')
+    return
+  }
   cart.addLine({
     productId: p.id,
     title: p.title,
@@ -562,6 +651,7 @@ function categoryIcon(cat: string): string {
           v-for="p in filteredProducts"
           :key="p.id"
           class="group flex flex-col overflow-hidden rounded-2xl border shadow-sm cursor-pointer"
+          :class="p.availability === 'out_of_stock' ? 'ring-2 ring-rose-300/70' : ''"
           :style="{
             borderColor: storefrontTheme.border,
             backgroundColor: storefrontTheme.surface,
@@ -578,6 +668,7 @@ function categoryIcon(cat: string): string {
               :src="productImageUrl(p.image_paths[0])!"
               :alt="p.title"
               class="h-full w-full object-cover transition-transform duration-300 group-hover:scale-105"
+              :class="p.availability === 'out_of_stock' ? 'opacity-60 grayscale-[35%]' : ''"
             />
             <!-- Placeholder when no image -->
             <div
@@ -610,6 +701,12 @@ function categoryIcon(cat: string): string {
             >
               {{ p.category }}
             </span>
+            <span
+              v-if="p.availability === 'out_of_stock'"
+              class="absolute right-2 top-2 rounded-full border border-rose-200 bg-rose-600 px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-white shadow-sm"
+            >
+              Out of stock
+            </span>
           </div>
 
           <!-- Card body -->
@@ -620,6 +717,16 @@ function categoryIcon(cat: string): string {
             >
               {{ p.title }}
             </h3>
+            <p
+              v-if="reviewStatForProduct(p.id)"
+              class="text-[11px] font-semibold"
+              :style="{ color: storefrontTheme.muted }"
+            >
+              {{ reviewStars(reviewStatForProduct(p.id)!.avg) }}
+              <span class="ml-1">
+                {{ reviewStatForProduct(p.id)!.avg.toFixed(1) }} ({{ reviewStatForProduct(p.id)!.count }})
+              </span>
+            </p>
 
             <p
               v-if="p.description"
@@ -643,10 +750,21 @@ function categoryIcon(cat: string): string {
                 type="button"
                 class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full shadow-sm transition-transform active:scale-90"
                 :style="{
-                  backgroundColor: storefrontTheme.primary,
-                  color: storefrontTheme.primaryText,
+                  backgroundColor:
+                    p.availability === 'out_of_stock'
+                      ? storefrontTheme.border
+                      : storefrontTheme.primary,
+                  color:
+                    p.availability === 'out_of_stock'
+                      ? storefrontTheme.muted
+                      : storefrontTheme.primaryText,
                 }"
-                :aria-label="`Add ${p.title} to cart`"
+                :aria-label="
+                  p.availability === 'out_of_stock'
+                    ? `${p.title} is out of stock`
+                    : `Add ${p.title} to cart`
+                "
+                :disabled="p.availability === 'out_of_stock'"
                 @click.stop="addToCart(p)"
               >
                 <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
@@ -655,6 +773,12 @@ function categoryIcon(cat: string): string {
                 </svg>
               </button>
             </div>
+            <p
+              v-if="p.availability === 'out_of_stock'"
+              class="mt-1 rounded-md bg-rose-50 px-2 py-1 text-[11px] font-bold uppercase tracking-wide text-rose-700"
+            >
+              Out of stock
+            </p>
 
             <!-- WhatsApp link (full row, below price) -->
             <a
@@ -829,6 +953,19 @@ function categoryIcon(cat: string): string {
               >
                 {{ formatGhs(selectedProduct.price_cents) }}
               </p>
+              <p
+                v-if="reviewStatForProduct(selectedProduct.id)"
+                class="mt-1 text-xs font-semibold"
+                :style="{ color: storefrontTheme.muted }"
+              >
+                {{ reviewStars(reviewStatForProduct(selectedProduct.id)!.avg) }}
+                <span class="ml-1">
+                  {{ reviewStatForProduct(selectedProduct.id)!.avg.toFixed(1) }}
+                  from {{ reviewStatForProduct(selectedProduct.id)!.count }} review{{
+                    reviewStatForProduct(selectedProduct.id)!.count === 1 ? '' : 's'
+                  }}
+                </span>
+              </p>
 
               <p
                 v-if="selectedProduct.description"
@@ -837,6 +974,7 @@ function categoryIcon(cat: string): string {
               >
                 {{ selectedProduct.description }}
               </p>
+
             </div>
 
             <!-- Action buttons -->
@@ -845,16 +983,27 @@ function categoryIcon(cat: string): string {
                 type="button"
                 class="flex w-full items-center justify-center gap-2 rounded-2xl py-3.5 text-sm font-bold shadow-md transition-transform active:scale-[0.98]"
                 :style="{
-                  backgroundColor: storefrontTheme.primary,
-                  color: storefrontTheme.primaryText,
+                  backgroundColor:
+                    selectedProduct.availability === 'out_of_stock'
+                      ? storefrontTheme.border
+                      : storefrontTheme.primary,
+                  color:
+                    selectedProduct.availability === 'out_of_stock'
+                      ? storefrontTheme.muted
+                      : storefrontTheme.primaryText,
                 }"
+                :disabled="selectedProduct.availability === 'out_of_stock'"
                 @click="addToCart(selectedProduct); closeProduct()"
               >
                 <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
                   <line x1="12" y1="5" x2="12" y2="19" />
                   <line x1="5" y1="12" x2="19" y2="12" />
                 </svg>
-                Add to cart
+                {{
+                  selectedProduct.availability === 'out_of_stock'
+                    ? 'Out of stock'
+                    : 'Add to cart'
+                }}
               </button>
 
               <a
@@ -874,6 +1023,60 @@ function categoryIcon(cat: string): string {
                 </svg>
                 Ask on WhatsApp
               </a>
+
+              <div class="mt-2 space-y-2">
+                <h3 class="text-xs font-extrabold uppercase tracking-wide" :style="{ color: storefrontTheme.text }">
+                  Customer reviews
+                </h3>
+                <div
+                  v-if="(reviewItemsByProductId.get(selectedProduct.id) ?? []).length"
+                  class="max-h-56 space-y-2 overflow-y-auto rounded-2xl border p-2.5"
+                  :style="{ borderColor: storefrontTheme.border, backgroundColor: `${storefrontTheme.bg}cc` }"
+                >
+                  <div
+                    v-for="rv in reviewItemsByProductId.get(selectedProduct.id) ?? []"
+                    :key="rv.id"
+                    class="rounded-xl border px-3 py-2.5"
+                    :style="{ borderColor: storefrontTheme.border, backgroundColor: storefrontTheme.surface }"
+                  >
+                    <div class="flex items-start gap-2.5">
+                      <span
+                        class="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[11px] font-bold"
+                        :style="{
+                          backgroundColor: `${storefrontTheme.primary}22`,
+                          color: storefrontTheme.primary,
+                        }"
+                        aria-hidden="true"
+                      >
+                        {{ reviewerInitial(rv.reviewer_name) }}
+                      </span>
+                      <div class="min-w-0 flex-1">
+                        <p class="text-[11px] font-semibold" :style="{ color: storefrontTheme.text }">
+                          {{ reviewStars(rv.rating) }}
+                          <span class="ml-1">{{ rv.reviewer_name || 'Verified buyer' }}</span>
+                          <span class="ml-2 text-[10px]" :style="{ color: storefrontTheme.muted }">
+                            {{ formatReviewDate(rv.created_at) }}
+                          </span>
+                        </p>
+                        <p
+                          v-if="rv.comment"
+                          class="mt-1 text-xs leading-relaxed"
+                          :style="{ color: storefrontTheme.muted }"
+                        >
+                          {{ rv.comment }}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <p
+                  v-else
+                  class="rounded-xl border px-3 py-2 text-xs"
+                  :style="{ borderColor: storefrontTheme.border, color: storefrontTheme.muted, backgroundColor: storefrontTheme.bg }"
+                >
+                  No reviews yet for this product.
+                </p>
+              </div>
             </div>
           </div>
         </div>

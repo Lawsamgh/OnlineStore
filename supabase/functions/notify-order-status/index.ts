@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js'
+import { logSmsNotification } from '../_shared/logSmsNotification.ts'
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -336,11 +337,23 @@ Deno.serve(async (req) => {
     const arkeselKey = Deno.env.get('ARKESEL_SMS_API_KEY')?.trim() ?? ''
     const arkeselSender = Deno.env.get('ARKESEL_SMS_SENDER_ID')?.trim() ?? null
     const buyerPhone = normalizePhoneRecipient(order.guest_phone ?? null)
+    const statusOrderRef =
+      typeof order.order_ref === 'string' && order.order_ref.trim()
+        ? order.order_ref.trim()
+        : toOrderReference(order.id)
     const planRaw = store.profiles?.signup_plan
     const storePlanId =
       typeof planRaw === 'string' && planRaw.trim() ? planRaw.trim().toLowerCase() : 'free'
     if (ledgerBefore.sms_state === 'sent') {
       warnings.push('Buyer SMS status skipped (already sent).')
+      await logSmsNotification(admin, {
+        function_name: 'notify-order-status',
+        event_type: 'buyer_order_status_notification',
+        status: 'skipped',
+        recipient_phone_e164: buyerPhone,
+        detail: 'already sent',
+        metadata: { order_id: order.id, order_ref: statusOrderRef, status: nextStatus, store_id: store.id },
+      })
     } else if (!smsEnabled) {
       await admin
         .from('order_status_notification_deliveries')
@@ -348,6 +361,14 @@ Deno.serve(async (req) => {
         .eq('order_id', order.id)
         .eq('status', nextStatus)
       warnings.push('Buyer SMS status skipped (ARKESEL_SMS_ENABLED=false).')
+      await logSmsNotification(admin, {
+        function_name: 'notify-order-status',
+        event_type: 'buyer_order_status_notification',
+        status: 'skipped',
+        recipient_phone_e164: buyerPhone,
+        detail: 'ARKESEL_SMS_ENABLED=false',
+        metadata: { order_id: order.id, order_ref: statusOrderRef, status: nextStatus, store_id: store.id },
+      })
     } else if (!AUTO_SMS_PLAN_IDS.has(storePlanId)) {
       await admin
         .from('order_status_notification_deliveries')
@@ -355,6 +376,14 @@ Deno.serve(async (req) => {
         .eq('order_id', order.id)
         .eq('status', nextStatus)
       warnings.push('Buyer SMS status skipped (free tier is manual SMS only).')
+      await logSmsNotification(admin, {
+        function_name: 'notify-order-status',
+        event_type: 'buyer_order_status_notification',
+        status: 'skipped',
+        recipient_phone_e164: buyerPhone,
+        detail: 'plan not eligible',
+        metadata: { order_id: order.id, order_ref: statusOrderRef, status: nextStatus, store_id: store.id },
+      })
     } else if (!arkeselKey) {
       await admin
         .from('order_status_notification_deliveries')
@@ -362,6 +391,14 @@ Deno.serve(async (req) => {
         .eq('order_id', order.id)
         .eq('status', nextStatus)
       warnings.push('Buyer SMS status skipped (ARKESEL_SMS_API_KEY missing).')
+      await logSmsNotification(admin, {
+        function_name: 'notify-order-status',
+        event_type: 'buyer_order_status_notification',
+        status: 'skipped',
+        recipient_phone_e164: buyerPhone,
+        detail: 'ARKESEL_SMS_API_KEY missing',
+        metadata: { order_id: order.id, order_ref: statusOrderRef, status: nextStatus, store_id: store.id },
+      })
     } else if (!buyerPhone) {
       await admin
         .from('order_status_notification_deliveries')
@@ -369,17 +406,29 @@ Deno.serve(async (req) => {
         .eq('order_id', order.id)
         .eq('status', nextStatus)
       warnings.push('Buyer SMS status skipped (missing recipient phone).')
+      await logSmsNotification(admin, {
+        function_name: 'notify-order-status',
+        event_type: 'buyer_order_status_notification',
+        status: 'skipped',
+        recipient_phone_e164: null,
+        detail: 'missing recipient phone',
+        metadata: { order_id: order.id, order_ref: statusOrderRef, status: nextStatus, store_id: store.id },
+      })
     } else {
       const claimed = await claimChannelIfNeeded(admin, order.id, nextStatus, 'sms')
       if (!claimed) {
         warnings.push('Buyer SMS status skipped (already in-flight or sent).')
+        await logSmsNotification(admin, {
+          function_name: 'notify-order-status',
+          event_type: 'buyer_order_status_notification',
+          status: 'skipped',
+          recipient_phone_e164: buyerPhone,
+          detail: 'already in-flight or sent',
+          metadata: { order_id: order.id, order_ref: statusOrderRef, status: nextStatus, store_id: store.id },
+        })
       } else {
         const statusLabel = STATUS_LABEL[nextStatus] ?? nextStatus
-        const orderRef =
-          typeof order.order_ref === 'string' && order.order_ref.trim()
-            ? order.order_ref.trim()
-            : toOrderReference(order.id)
-        const text = `Order update: ${store.name}. Ref ${orderRef}. Status: ${statusLabel}.`
+        const text = `Order update: ${store.name}. Ref ${statusOrderRef}. Status: ${statusLabel}.`
         const smsRes = await sendArkeselSms({
           apiKey: arkeselKey,
           senderId: arkeselSender,
@@ -389,8 +438,24 @@ Deno.serve(async (req) => {
         await markChannelResult(admin, order.id, nextStatus, 'sms', smsRes)
         if (!smsRes.ok) {
           warnings.push(`Buyer SMS status failed: ${smsRes.detail}`)
+          await logSmsNotification(admin, {
+            function_name: 'notify-order-status',
+            event_type: 'buyer_order_status_notification',
+            status: 'failed',
+            recipient_phone_e164: buyerPhone,
+            detail: smsRes.detail,
+            metadata: { order_id: order.id, order_ref: statusOrderRef, status: nextStatus, store_id: store.id },
+          })
         } else {
           anyChannelSent = true
+          await logSmsNotification(admin, {
+            function_name: 'notify-order-status',
+            event_type: 'buyer_order_status_notification',
+            status: 'sent',
+            recipient_phone_e164: buyerPhone,
+            detail: 'sent',
+            metadata: { order_id: order.id, order_ref: statusOrderRef, status: nextStatus, store_id: store.id },
+          })
         }
       }
     }

@@ -11,6 +11,15 @@ export type BuyerOrderTrackingRow = {
   delivery_updated_at: string | null;
 };
 
+export type BuyerReviewableOrderItem = {
+  product_id: string;
+  product_title: string;
+  already_reviewed: boolean;
+  existing_rating: number | null;
+  existing_comment: string | null;
+  existing_reviewer_name: string | null;
+};
+
 export async function lookupBuyerOrderStatus(input: {
   storeSlug: string;
   orderRef: string;
@@ -70,5 +79,87 @@ export async function lookupBuyerOrderStatus(input: {
           : String(raw.delivery_updated_at),
     },
     error: null,
+  };
+}
+
+export async function lookupBuyerReviewableItems(input: {
+  storeSlug: string;
+  orderRef: string;
+  verify: string;
+}): Promise<{ items: BuyerReviewableOrderItem[]; error: string | null }> {
+  if (!isSupabaseConfigured()) {
+    return { items: [], error: "Tracking is unavailable." };
+  }
+  const supabase = getSupabaseBrowser();
+  const { data, error } = await supabase.rpc("buyer_order_reviewable_items", {
+    p_store_slug: input.storeSlug.trim(),
+    p_order_ref: input.orderRef.trim(),
+    p_verify: input.verify.trim(),
+  });
+  if (error) {
+    return { items: [], error: error.message };
+  }
+  const rows = Array.isArray(data) ? data : [];
+  return {
+    items: rows
+      .map((r) => r as Record<string, unknown>)
+      .filter((r) => typeof r.product_id === "string")
+      .map((r) => ({
+        product_id: String(r.product_id),
+        product_title: String(r.product_title ?? "Product"),
+        already_reviewed: Boolean(r.already_reviewed),
+        existing_rating:
+          typeof r.existing_rating === "number" && Number.isFinite(r.existing_rating)
+            ? r.existing_rating
+            : null,
+        existing_comment:
+          typeof r.existing_comment === "string" && r.existing_comment.trim()
+            ? r.existing_comment.trim()
+            : null,
+        existing_reviewer_name:
+          typeof r.existing_reviewer_name === "string" &&
+          r.existing_reviewer_name.trim()
+            ? r.existing_reviewer_name.trim()
+            : null,
+      })),
+    error: null,
+  };
+}
+
+export async function submitBuyerProductReview(input: {
+  storeSlug: string;
+  orderRef: string;
+  verify: string;
+  productId: string;
+  rating: number;
+  comment?: string;
+  reviewerName?: string;
+}): Promise<{ ok: boolean; message: string }> {
+  if (!isSupabaseConfigured()) {
+    return { ok: false, message: "Tracking is unavailable." };
+  }
+  const supabase = getSupabaseBrowser();
+  const { data, error } = await supabase.rpc("submit_buyer_product_review", {
+    p_store_slug: input.storeSlug.trim(),
+    p_order_ref: input.orderRef.trim(),
+    p_verify: input.verify.trim(),
+    p_product_id: input.productId.trim(),
+    p_rating: Math.trunc(input.rating),
+    p_comment: input.comment?.trim() || null,
+    p_reviewer_name: input.reviewerName?.trim() || null,
+  });
+  if (error) {
+    return { ok: false, message: error.message };
+  }
+  const rows = Array.isArray(data) ? data : data ? [data] : [];
+  const row = (rows[0] ?? {}) as { ok?: unknown; message?: unknown };
+  return {
+    ok: row.ok === true,
+    message:
+      typeof row.message === "string" && row.message.trim()
+        ? row.message
+        : row.ok === true
+          ? "Review saved"
+          : "Could not save review",
   };
 }

@@ -1,4 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js";
+import { logSmsNotification } from "../_shared/logSmsNotification.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -156,9 +157,23 @@ Deno.serve(async (req) => {
     const warnings: string[] = [];
     if (!smsEnabled) {
       warnings.push("SMS disabled (ARKESEL_SMS_ENABLED).");
+      await logSmsNotification(admin, {
+        function_name: "notify-platform-staff-announcement",
+        event_type: "platform_announcement",
+        status: "skipped",
+        detail: "ARKESEL_SMS_ENABLED is false",
+        metadata: { announcement_id: announcementId },
+      });
     }
     if (!arkeselKey) {
       warnings.push("ARKESEL_SMS_API_KEY not set; SMS skipped.");
+      await logSmsNotification(admin, {
+        function_name: "notify-platform-staff-announcement",
+        event_type: "platform_announcement",
+        status: "skipped",
+        detail: "ARKESEL_SMS_API_KEY not set",
+        metadata: { announcement_id: announcementId },
+      });
     }
 
     if (!smsEnabled || !arkeselKey) {
@@ -246,6 +261,14 @@ Deno.serve(async (req) => {
       });
       if (r.ok) sent += 1;
       else warnings.push(`SMS failed (${to.slice(-4)}): ${r.detail}`);
+      await logSmsNotification(admin, {
+        function_name: "notify-platform-staff-announcement",
+        event_type: "platform_announcement",
+        status: r.ok ? "sent" : "failed",
+        recipient_phone_e164: to,
+        detail: r.ok ? "sent" : r.detail,
+        metadata: { announcement_id: announcementId },
+      });
     }
 
     if (unique.length === 0) {

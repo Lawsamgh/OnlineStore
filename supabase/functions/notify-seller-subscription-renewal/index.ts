@@ -1,5 +1,6 @@
 import { createClient } from 'npm:@supabase/supabase-js'
 import { sendSellerPlanRenewalReminderEmail } from '../_shared/sendSellerPlanEmail.ts'
+import { logSmsNotification } from '../_shared/logSmsNotification.ts'
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -214,6 +215,13 @@ Deno.serve(async (req) => {
       if (!AUTO_SMS_PLAN_IDS.has(planId)) continue
       if (!arkeselKey) {
         warnings.push('ARKESEL_SMS_API_KEY missing; renewal reminder SMS skipped.')
+        await logSmsNotification(admin, {
+          function_name: 'notify-seller-subscription-renewal',
+          event_type: 'seller_plan_renewal_reminder',
+          status: 'skipped',
+          detail: 'ARKESEL_SMS_API_KEY missing',
+          metadata: { store_id: store.id, subscription_id: row.id },
+        })
         continue
       }
 
@@ -232,6 +240,13 @@ Deno.serve(async (req) => {
         normalizePhoneRecipient(store.whatsapp_phone_e164 ?? null)
       if (!targetPhone) {
         skippedNoSmsPhone += 1
+        await logSmsNotification(admin, {
+          function_name: 'notify-seller-subscription-renewal',
+          event_type: 'seller_plan_renewal_reminder',
+          status: 'skipped',
+          detail: 'No eligible phone number found',
+          metadata: { store_id: store.id, subscription_id: row.id },
+        })
         continue
       }
 
@@ -247,8 +262,24 @@ Deno.serve(async (req) => {
       })
       if (!smsRes.ok) {
         warnings.push(`Renewal reminder SMS failed for store ${store.id}: ${smsRes.detail}`)
+        await logSmsNotification(admin, {
+          function_name: 'notify-seller-subscription-renewal',
+          event_type: 'seller_plan_renewal_reminder',
+          status: 'failed',
+          recipient_phone_e164: targetPhone,
+          detail: smsRes.detail,
+          metadata: { store_id: store.id, subscription_id: row.id },
+        })
       } else {
         sms_sent += 1
+        await logSmsNotification(admin, {
+          function_name: 'notify-seller-subscription-renewal',
+          event_type: 'seller_plan_renewal_reminder',
+          status: 'sent',
+          recipient_phone_e164: targetPhone,
+          detail: 'sent',
+          metadata: { store_id: store.id, subscription_id: row.id },
+        })
       }
     }
 

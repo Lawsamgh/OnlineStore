@@ -1,4 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js";
+import { logSmsNotification } from "../_shared/logSmsNotification.ts";
 
 const cors = {
   "Access-Control-Allow-Origin": "*",
@@ -124,6 +125,13 @@ Deno.serve(async (req) => {
       (user.email?.split("@")[0] ?? "New seller");
 
     if (!arkeselKey) {
+      await logSmsNotification(admin, {
+        function_name: "notify-super-admin-new-seller",
+        event_type: "super_admin_new_seller_alert",
+        status: "skipped",
+        detail: "ARKESEL_SMS_API_KEY not set",
+        metadata: { seller_name: displayName },
+      });
       return new Response(
         JSON.stringify({
           ok: true,
@@ -183,6 +191,15 @@ Deno.serve(async (req) => {
     }
 
     const unique = [...new Set(recipients)];
+    if (unique.length === 0) {
+      await logSmsNotification(admin, {
+        function_name: "notify-super-admin-new-seller",
+        event_type: "super_admin_new_seller_alert",
+        status: "skipped",
+        detail: "No SMS destination for super admin",
+        metadata: { seller_name: displayName },
+      });
+    }
     const baseMsg =
       `New seller: ${displayName} joined. Check Admin > Seller verifications. - UandITech`;
     const text = baseMsg.slice(0, 160);
@@ -198,6 +215,14 @@ Deno.serve(async (req) => {
       });
       if (r.ok) sent += 1;
       else warnings.push(`SMS to super admin failed: ${r.detail}`);
+      await logSmsNotification(admin, {
+        function_name: "notify-super-admin-new-seller",
+        event_type: "super_admin_new_seller_alert",
+        status: r.ok ? "sent" : "failed",
+        recipient_phone_e164: to,
+        detail: r.ok ? "sent" : r.detail,
+        metadata: { seller_name: displayName },
+      });
     }
 
     if (unique.length === 0) {

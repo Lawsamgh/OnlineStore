@@ -1,3 +1,5 @@
+import { logSmsNotification } from "./logSmsNotification.ts";
+
 function planDisplayName(planId: string | null | undefined): string {
   const id = (planId ?? "").trim().toLowerCase();
   if (!id) return "Paid";
@@ -132,7 +134,16 @@ ${opts.source === "store" ? `<p>Store: <strong>${storeLabel}</strong></p>` : ""}
     }
 
     const smsKey = opts.arkeselApiKey?.trim();
-    if (!smsKey) return;
+    if (!smsKey) {
+      await logSmsNotification(opts.admin, {
+        function_name: "sendSuperAdminSubscriptionAlert",
+        event_type: "super_admin_subscription_alert",
+        status: "skipped",
+        detail: "ARKESEL_SMS_API_KEY not set",
+        metadata: { source: opts.source, store_name: opts.storeName ?? null },
+      });
+      return;
+    }
     const { data: phoneSetting } = await opts.admin
       .from("platform_settings")
       .select("value")
@@ -153,6 +164,15 @@ ${opts.source === "store" ? `<p>Store: <strong>${storeLabel}</strong></p>` : ""}
       }
     }
     const uniqueSms = [...new Set(recipients)];
+    if (uniqueSms.length === 0) {
+      await logSmsNotification(opts.admin, {
+        function_name: "sendSuperAdminSubscriptionAlert",
+        event_type: "super_admin_subscription_alert",
+        status: "skipped",
+        detail: "No super-admin SMS recipient phone found",
+        metadata: { source: opts.source, store_name: opts.storeName ?? null },
+      });
+    }
     const smsText = `${planLabel} subscription success. ${opts.source === "store" ? `Store: ${storeLabel}. ` : ""}Amount: ${amountLabel}. Expiry: ${periodLabel}.`;
     for (const to of uniqueSms) {
       const res = await sendArkeselSms({
@@ -164,6 +184,14 @@ ${opts.source === "store" ? `<p>Store: <strong>${storeLabel}</strong></p>` : ""}
       if (!res.ok) {
         console.error("[sendSuperAdminSubscriptionAlert] sms", to, res.detail);
       }
+      await logSmsNotification(opts.admin, {
+        function_name: "sendSuperAdminSubscriptionAlert",
+        event_type: "super_admin_subscription_alert",
+        status: res.ok ? "sent" : "failed",
+        recipient_phone_e164: to,
+        detail: res.ok ? "sent" : res.detail,
+        metadata: { source: opts.source, store_name: opts.storeName ?? null },
+      });
     }
   } catch (e) {
     console.error("[sendSuperAdminSubscriptionAlert]", e);

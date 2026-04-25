@@ -1,5 +1,6 @@
 /// <reference path="../npm-imports.d.ts" />
 import { createClient } from "npm:@supabase/supabase-js";
+import { logSmsNotification } from "../_shared/logSmsNotification.ts";
 
 declare const Deno: {
   serve: (handler: (req: Request) => Response | Promise<Response>) => void;
@@ -143,8 +144,24 @@ Deno.serve(async (req) => {
 
     if (!arkeselKey) {
       warnings.push("ARKESEL_SMS_API_KEY not set; SMS skipped.");
+      await logSmsNotification(sb as any, {
+        function_name: "notify-seller-verification",
+        event_type: "seller_verification_update",
+        status: "skipped",
+        recipient_phone_e164: phone,
+        detail: "ARKESEL_SMS_API_KEY not set",
+        metadata: { status, seller_id },
+      });
     } else if (!phone) {
       warnings.push("Seller has no phone on file; SMS skipped.");
+      await logSmsNotification(sb as any, {
+        function_name: "notify-seller-verification",
+        event_type: "seller_verification_update",
+        status: "skipped",
+        recipient_phone_e164: null,
+        detail: "Seller has no phone on file",
+        metadata: { status, seller_id },
+      });
     } else {
       let message = "";
       if (status === "approved") {
@@ -166,6 +183,14 @@ Deno.serve(async (req) => {
       });
       smsSent = smsResult.ok;
       if (!smsResult.ok) warnings.push(`SMS failed: ${smsResult.detail}`);
+      await logSmsNotification(sb as any, {
+        function_name: "notify-seller-verification",
+        event_type: "seller_verification_update",
+        status: smsResult.ok ? "sent" : "failed",
+        recipient_phone_e164: phone,
+        detail: smsResult.ok ? "sent" : smsResult.detail,
+        metadata: { status, seller_id },
+      });
     }
 
     return new Response(

@@ -7,17 +7,21 @@ import {
   ref,
   watch,
 } from "vue";
-import { RouterLink, useRoute } from "vue-router";
+import { RouterLink, useRoute, useRouter } from "vue-router";
 import { getSupabaseBrowser, isSupabaseConfigured } from "../../lib/supabase";
 import { resolveStoreThemeTokens } from "../../constants/storeThemes";
 import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefresh";
 import {
   lookupBuyerOrderStatus,
+  lookupBuyerReviewableItems,
+  submitBuyerProductReview,
+  type BuyerReviewableOrderItem,
   type BuyerOrderTrackingRow,
 } from "../../composables/useBuyerOrderTracking";
 import { useToastStore } from "../../stores/toast";
 
 const route = useRoute();
+const router = useRouter();
 const toast = useToastStore();
 
 const slug = computed(() => String(route.params.storeSlug ?? ""));
@@ -27,6 +31,11 @@ const verifyInput = ref("");
 const loading = ref(false);
 const result = ref<BuyerOrderTrackingRow | null>(null);
 const lastLookup = ref<{ orderRef: string; verify: string } | null>(null);
+const reviewableItems = ref<BuyerReviewableOrderItem[]>([]);
+const reviewBusyByProductId = ref<Record<string, boolean>>({});
+const reviewRatingByProductId = ref<Record<string, number>>({});
+const reviewCommentByProductId = ref<Record<string, string>>({});
+const reviewNameByProductId = ref<Record<string, string>>({});
 
 const trackingSectionRef = ref<HTMLElement | null>(null);
 
@@ -81,6 +90,15 @@ const deliveryIdx = computed(() =>
 );
 
 const isCanceled = computed(() => result.value?.status === "canceled");
+const canReviewOrder = computed(() => result.value?.status === "delivered");
+const reviewTotalCount = computed(() => reviewableItems.value.length);
+const reviewedCount = computed(
+  () => reviewableItems.value.filter((i) => i.already_reviewed).length,
+);
+const reviewCompletionPct = computed(() => {
+  if (reviewTotalCount.value <= 0) return 0;
+  return Math.round((reviewedCount.value / reviewTotalCount.value) * 100);
+});
 
 const fulfillmentProgressPct = computed(() => {
   const max = ORDER_STEPS.length - 1;
@@ -98,6 +116,14 @@ function formatWhen(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+function reviewRatingLabel(n: number): string {
+  if (n <= 1) return "Poor";
+  if (n === 2) return "Fair";
+  if (n === 3) return "Good";
+  if (n === 4) return "Very good";
+  return "Excellent";
 }
 
 async function loadStore(opts?: { silent?: boolean }) {
@@ -192,8 +218,75 @@ async function runLookup(silent: boolean) {
     }
     result.value = row;
     lastLookup.value = { orderRef: ref, verify };
+    await loadReviewableItemsForCurrentOrder();
   } finally {
     if (!silent) loading.value = false;
+  }
+}
+
+async function loadReviewableItemsForCurrentOrder() {
+  if (!canReviewOrder.value || !lastLookup.value || !slug.value) {
+    reviewableItems.value = [];
+    return;
+  }
+  const { items, error } = await lookupBuyerReviewableItems({
+    storeSlug: slug.value,
+    orderRef: lastLookup.value.orderRef,
+    verify: lastLookup.value.verify,
+  });
+  if (error) {
+    reviewableItems.value = [];
+    toast.error(error);
+    return;
+  }
+  reviewableItems.value = items;
+  const nextRating: Record<string, number> = {};
+  const nextComment: Record<string, string> = {};
+  const nextName: Record<string, string> = {};
+  for (const item of items) {
+    nextRating[item.product_id] = item.existing_rating ?? 5;
+    nextComment[item.product_id] = item.existing_comment ?? "";
+    nextName[item.product_id] = item.existing_reviewer_name ?? "";
+  }
+  reviewRatingByProductId.value = nextRating;
+  reviewCommentByProductId.value = nextComment;
+  reviewNameByProductId.value = nextName;
+}
+
+async function submitReviewForProduct(productId: string) {
+  if (!lastLookup.value || !slug.value) return;
+  if ((reviewBusyByProductId.value[productId] ?? false) === true) return;
+  const rating = reviewRatingByProductId.value[productId] ?? 0;
+  if (rating < 1 || rating > 5) {
+    toast.error("Pick a rating between 1 and 5 stars.");
+    return;
+  }
+  reviewBusyByProductId.value = {
+    ...reviewBusyByProductId.value,
+    [productId]: true,
+  };
+  try {
+    const res = await submitBuyerProductReview({
+      storeSlug: slug.value,
+      orderRef: lastLookup.value.orderRef,
+      verify: lastLookup.value.verify,
+      productId,
+      rating,
+      comment: reviewCommentByProductId.value[productId] ?? "",
+      reviewerName: reviewNameByProductId.value[productId] ?? "",
+    });
+    if (!res.ok) {
+      toast.error(res.message);
+      return;
+    }
+    toast.success("Review saved.");
+    await nextTick();
+    await router.push({ path: `/${slug.value}` });
+  } finally {
+    reviewBusyByProductId.value = {
+      ...reviewBusyByProductId.value,
+      [productId]: false,
+    };
   }
 }
 
@@ -247,6 +340,7 @@ watch(slug, () => {
   void loadStore();
   result.value = null;
   lastLookup.value = null;
+  reviewableItems.value = [];
 });
 
 useRealtimeTableRefresh({
@@ -673,6 +767,182 @@ onBeforeUnmount(() => {
               </dd>
             </div>
           </dl>
+
+          <div
+            v-if="canReviewOrder"
+            class="mt-8 rounded-3xl border p-5 shadow-sm sm:p-6"
+            :style="{
+              borderColor: storefrontTheme.border,
+              backgroundColor: `${storefrontTheme.surface}e6`,
+            }"
+          >
+            <div class="flex items-center justify-between gap-3">
+              <div>
+                <h3
+                  class="text-sm font-extrabold uppercase tracking-wide"
+                  :style="{ color: storefrontTheme.text }"
+                >
+                  Rate purchased products
+                </h3>
+                <p class="mt-1 text-xs" :style="{ color: storefrontTheme.muted }">
+                  Share a quick rating and comment for items in this delivered order.
+                </p>
+                <p
+                  v-if="reviewTotalCount > 0"
+                  class="mt-1 text-[11px] font-semibold"
+                  :style="{ color: storefrontTheme.muted }"
+                >
+                  {{ reviewedCount }}/{{ reviewTotalCount }} reviewed
+                </p>
+              </div>
+              <RouterLink
+                :to="`/${slug}`"
+                class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border px-3.5 py-1.5 text-xs font-bold transition hover:opacity-80"
+                :style="{
+                  color: storefrontTheme.primary,
+                  borderColor: storefrontTheme.border,
+                  backgroundColor: storefrontTheme.bg,
+                }"
+              >
+                <svg
+                  class="h-3.5 w-3.5"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.25"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M8 7h10m0 0v10m0-10L6 19" />
+                </svg>
+                Continue shopping
+              </RouterLink>
+            </div>
+
+            <div
+              v-if="reviewTotalCount > 0"
+              class="mt-3 h-2 w-full overflow-hidden rounded-full"
+              :style="{ backgroundColor: storefrontTheme.border }"
+              aria-label="Review completion"
+            >
+              <div
+                class="h-full rounded-full transition-[width] duration-300"
+                :style="{
+                  width: `${reviewCompletionPct}%`,
+                  backgroundColor: storefrontTheme.primary,
+                }"
+              />
+            </div>
+
+            <div v-if="reviewableItems.length" class="mt-4 space-y-3">
+              <div
+                v-for="item in reviewableItems"
+                :key="item.product_id"
+                class="rounded-2xl border p-4 sm:p-5"
+                :style="{
+                  borderColor: storefrontTheme.border,
+                  backgroundColor: storefrontTheme.bg,
+                }"
+              >
+                <div class="flex items-start justify-between gap-3">
+                  <p class="text-sm font-semibold" :style="{ color: storefrontTheme.text }">
+                    {{ item.product_title }}
+                  </p>
+                  <span
+                    v-if="item.already_reviewed"
+                    class="rounded-full px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide"
+                    :style="{
+                      backgroundColor: `${storefrontTheme.primary}22`,
+                      color: storefrontTheme.primary,
+                    }"
+                  >
+                    Reviewed
+                  </span>
+                </div>
+
+                <div class="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    v-for="star in 5"
+                    :key="`${item.product_id}-star-${star}`"
+                    type="button"
+                    class="inline-flex h-9 w-9 items-center justify-center rounded-xl text-lg font-bold transition duration-150"
+                    :style="
+                      (reviewRatingByProductId[item.product_id] ?? 0) >= star
+                        ? {
+                            backgroundColor: storefrontTheme.primary,
+                            color: storefrontTheme.primaryText,
+                          }
+                        : {
+                            backgroundColor: storefrontTheme.bg,
+                            color: storefrontTheme.muted,
+                            border: `1px solid ${storefrontTheme.border}`,
+                          }
+                    "
+                    :aria-label="`Rate ${star} star${star > 1 ? 's' : ''}`"
+                    @click="reviewRatingByProductId[item.product_id] = star"
+                  >
+                    ★
+                  </button>
+                  <span class="ml-1 text-xs font-semibold" :style="{ color: storefrontTheme.muted }">
+                    {{ reviewRatingByProductId[item.product_id] ?? 0 }}/5 ·
+                    {{ reviewRatingLabel(reviewRatingByProductId[item.product_id] ?? 0) }}
+                  </span>
+                </div>
+
+                <div class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  <input
+                    v-model="reviewNameByProductId[item.product_id]"
+                    type="text"
+                    maxlength="60"
+                    placeholder="Your name (optional)"
+                    class="w-full rounded-xl border px-3 py-2 text-xs outline-none focus:ring-2"
+                    :style="{
+                      borderColor: storefrontTheme.border,
+                      backgroundColor: storefrontTheme.surface,
+                      color: storefrontTheme.text,
+                      '--tw-ring-color': `${storefrontTheme.primary}55`,
+                    }"
+                  />
+                  <textarea
+                    v-model="reviewCommentByProductId[item.product_id]"
+                    maxlength="220"
+                    placeholder="Comment (optional)"
+                    rows="2"
+                    class="w-full rounded-xl border px-3 py-2 text-xs outline-none focus:ring-2 sm:col-span-1"
+                    :style="{
+                      borderColor: storefrontTheme.border,
+                      backgroundColor: storefrontTheme.surface,
+                      color: storefrontTheme.text,
+                      '--tw-ring-color': `${storefrontTheme.primary}55`,
+                    }"
+                  />
+                </div>
+
+                <button
+                  type="button"
+                  class="mt-4 inline-flex min-w-[9rem] items-center justify-center rounded-xl px-4 py-2.5 text-xs font-bold shadow-sm transition hover:opacity-90 disabled:opacity-60"
+                  :style="{
+                    backgroundColor: storefrontTheme.primary,
+                    color: storefrontTheme.primaryText,
+                  }"
+                  :disabled="reviewBusyByProductId[item.product_id] === true"
+                  @click="void submitReviewForProduct(item.product_id)"
+                >
+                  {{
+                    reviewBusyByProductId[item.product_id] === true
+                      ? "Saving..."
+                      : item.already_reviewed
+                        ? "Update review"
+                        : "Submit review"
+                  }}
+                </button>
+              </div>
+            </div>
+            <p v-else class="mt-3 text-xs" :style="{ color: storefrontTheme.muted }">
+              No reviewable products found for this order.
+            </p>
+          </div>
         </div>
       </div>
 

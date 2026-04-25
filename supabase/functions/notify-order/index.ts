@@ -1,4 +1,5 @@
 import { createClient } from 'npm:@supabase/supabase-js'
+import { logSmsNotification } from '../_shared/logSmsNotification.ts'
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -482,9 +483,25 @@ Guest: ${order.guest_name ?? '—'} / ${order.guest_email ?? '—'} / ${order.gu
           channelResults.seller_sms = 'failed'
           smsAccepted = false
           warnings.push(`Seller SMS failed (Arkesel): ${smsRes.detail}`)
+          await logSmsNotification(admin, {
+            function_name: 'notify-order',
+            event_type: 'seller_order_notification',
+            status: 'failed',
+            recipient_phone_e164: sellerSms,
+            detail: smsRes.detail,
+            metadata: { order_id: orderId, order_ref: orderRef, store_id: store.id },
+          })
         } else {
           channelResults.seller_sms = 'sent'
           smsAccepted = true
+          await logSmsNotification(admin, {
+            function_name: 'notify-order',
+            event_type: 'seller_order_notification',
+            status: 'sent',
+            recipient_phone_e164: sellerSms,
+            detail: 'sent',
+            metadata: { order_id: orderId, order_ref: orderRef, store_id: store.id },
+          })
         }
       }
     }
@@ -527,8 +544,24 @@ Guest: ${order.guest_name ?? '—'} / ${order.guest_email ?? '—'} / ${order.gu
         if (!buyerSmsRes.ok) {
           channelResults.buyer_sms = 'failed'
           warnings.push(`Buyer order SMS failed: ${buyerSmsRes.detail}`)
+          await logSmsNotification(admin, {
+            function_name: 'notify-order',
+            event_type: 'buyer_order_notification',
+            status: 'failed',
+            recipient_phone_e164: buyerSms,
+            detail: buyerSmsRes.detail,
+            metadata: { order_id: orderId, order_ref: orderRef, store_id: store.id },
+          })
         } else {
           channelResults.buyer_sms = 'sent'
+          await logSmsNotification(admin, {
+            function_name: 'notify-order',
+            event_type: 'buyer_order_notification',
+            status: 'sent',
+            recipient_phone_e164: buyerSms,
+            detail: 'sent',
+            metadata: { order_id: orderId, order_ref: orderRef, store_id: store.id },
+          })
         }
       }
     }

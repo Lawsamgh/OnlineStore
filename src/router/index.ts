@@ -16,6 +16,7 @@ import AdminHomeView from "../views/admin/AdminHomeView.vue";
 import PlatformSettingsView from "../views/admin/PlatformSettingsView.vue";
 import SupportTicketsView from "../views/admin/SupportTicketsView.vue";
 import SellerVerificationsView from "../views/admin/SellerVerificationsView.vue";
+import SmsNotificationLogsView from "../views/admin/SmsNotificationLogsView.vue";
 import HomeView from "../views/HomeView.vue";
 import LoginView from "../views/LoginView.vue";
 import ConsoleAccessPendingView from "../views/ConsoleAccessPendingView.vue";
@@ -102,6 +103,11 @@ const router = createRouter({
           path: "verifications",
           name: "admin-verifications",
           component: SellerVerificationsView,
+        },
+        {
+          path: "sms-logs",
+          name: "admin-sms-logs",
+          component: SmsNotificationLogsView,
         },
       ],
     },

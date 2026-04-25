@@ -730,7 +730,8 @@ type ShellNavIcon =
   | "cog"
   | "megaphone"
   | "ticket"
-  | "shield";
+  | "shield"
+  | "message";
 
 type ShellNavItem = {
   to: string;
@@ -780,14 +781,6 @@ const adminNavItems: ShellNavItem[] = [
     icon: "grid",
   },
   {
-    to: "/admin/settings",
-    key: "admin-settings",
-    routeName: "admin-settings",
-    label: "Settings",
-    short: "Settings",
-    icon: "cog",
-  },
-  {
     to: "/admin/announcements",
     key: "admin-announcements",
     routeName: "admin-announcements",
@@ -810,6 +803,22 @@ const adminNavItems: ShellNavItem[] = [
     label: "Verifications",
     short: "KYC",
     icon: "shield",
+  },
+  {
+    to: "/admin/sms-logs",
+    key: "admin-sms-logs",
+    routeName: "admin-sms-logs",
+    label: "SMS logs",
+    short: "SMS",
+    icon: "message",
+  },
+  {
+    to: "/admin/settings",
+    key: "admin-settings",
+    routeName: "admin-settings",
+    label: "Settings",
+    short: "Settings",
+    icon: "cog",
   },
 ];
 
@@ -880,6 +889,9 @@ const headerLine = computed(() => {
     }
     if (route.name === "admin-verifications") {
       return "Mandatory seller identity verification approvals.";
+    }
+    if (route.name === "admin-sms-logs") {
+      return "SMS delivery records, outcomes, and function-level events.";
     }
     return "Platform administration.";
   }
@@ -1344,6 +1356,20 @@ watch(
                 d="M12 3 4.5 6v6c0 5.2 3.4 8.8 7.5 10 4.1-1.2 7.5-4.8 7.5-10V6L12 3z"
               />
               <path d="m9.5 12 1.8 1.8L14.8 10.3" />
+            </svg>
+            <svg
+              v-else-if="item.icon === 'message'"
+              class="h-6 w-6"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="M4 6h16a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H8l-4 3v-3H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1z" />
+              <path d="M8 10h8" />
+              <path d="M8 13h5" />
             </svg>
           </RouterLink>
         </template>
