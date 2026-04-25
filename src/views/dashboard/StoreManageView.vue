@@ -647,55 +647,6 @@ const canUseRoleGatedStoreActions = computed(() =>
   Boolean(store.value && sessionUserId.value),
 );
 
-/** Show store Paystack CTA when free tier, no/lapsed sub, past_due, or renewal window. */
-const STORE_PLATFORM_PAY_WARNING_DAYS = 7;
-
-const signupPlanIdResolved = computed(() =>
-  normalizeSignupPlanId(
-    typeof user.value?.user_metadata?.signup_plan === "string"
-      ? user.value.user_metadata.signup_plan
-      : undefined,
-  ),
-);
-
-const isAccountOnFreePlan = computed(
-  () => signupPlanIdResolved.value === "free",
-);
-
-function subscriptionPeriodEndsWithinDays(
-  iso: string | null,
-  days: number,
-): boolean {
-  if (!iso) return false;
-  const end = new Date(iso).getTime();
-  if (Number.isNaN(end)) return false;
-  const cutoff = Date.now() + days * 86_400_000;
-  return end <= cutoff;
-}
-
-const showStorePlatformPayCta = computed(() => {
-  if (!isStoreOwner.value) return false;
-  if (isAccountOnFreePlan.value) return true;
-
-  const sub = sellerSubscription.value;
-  if (!sub) return true;
-
-  const st = sub.status;
-  if (st === "past_due" || st === "inactive" || st === "canceled") {
-    return true;
-  }
-
-  if (st === "active" || st === "trialing") {
-    if (!sub.current_period_end) return true;
-    return subscriptionPeriodEndsWithinDays(
-      sub.current_period_end,
-      STORE_PLATFORM_PAY_WARNING_DAYS,
-    );
-  }
-
-  return true;
-});
-
 /** Owners need a chosen plan (or super admin) before changing the shop logo. */
 const canUploadStoreLogo = computed(
   () => isStoreOwner.value && (hasSelectedPlan.value || isSuperAdmin.value),
@@ -1589,22 +1540,6 @@ async function submitSupportTicket() {
   }
 }
 
-function openStoreFeePlanModal() {
-  if (!canUseRoleGatedStoreActions.value) {
-    toast.info("Actions are unavailable until your role is set.");
-    return;
-  }
-  if (!store.value || payBusy.value) return;
-  const normalized = normalizeSignupPlanId(
-    user.value?.user_metadata?.signup_plan,
-  );
-  selectedStoreFeePlan.value =
-    normalized === "starter" || normalized === "growth" || normalized === "pro"
-      ? normalized
-      : "starter";
-  storeFeePlanModalOpen.value = true;
-}
-
 function closeStoreFeePlanModal() {
   if (payBusy.value) return;
   storeFeePlanModalOpen.value = false;
@@ -1766,25 +1701,6 @@ async function startPaystackWithPlan(planId: PaidStoreFeePlanId) {
                     : "Activate store link"
               }}
             </button>
-            <template
-              v-if="showStorePlatformPayCta && canUseRoleGatedStoreActions"
-            >
-              <button
-                type="button"
-                class="rounded-full border border-amber-200/80 bg-gradient-to-r from-amber-50 to-orange-50 px-5 py-2.5 text-sm font-semibold text-amber-950 shadow-sm ring-1 ring-amber-200/50 transition hover:from-amber-100 hover:to-orange-100 disabled:opacity-50"
-                :disabled="payBusy"
-                @click="openStoreFeePlanModal"
-              >
-                Pay store platform fee
-              </button>
-              <p
-                class="max-w-[15rem] text-right text-[10px] leading-snug text-zinc-500"
-              >
-                Choose Starter, Growth, or Pro, then pay the matching monthly
-                platform fee for this store. Your account plan is updated to the
-                same tier after a successful payment.
-              </p>
-            </template>
             <p
               v-if="
                 sellerSubscription?.status === 'active' &&

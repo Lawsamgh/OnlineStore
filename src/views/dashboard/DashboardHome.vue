@@ -21,6 +21,7 @@ import { useToastStore } from "../../stores/toast";
 import { useRealtimeTableRefresh } from "../../composables/useRealtimeTableRefresh";
 import { planLabelFromSignupId } from "../../lib/planLabel";
 import { formatGhsWhole } from "../../constants/pricingPlans";
+import { formatGhs } from "../../lib/formatMoney";
 import { usePlanPricingSettings } from "../../composables/usePlanPricingSettings";
 import {
   PLAN_FEATURE_LIMITS,
@@ -79,7 +80,21 @@ type CustomerOrderRow = {
   customer_id: string | null;
   /** Sum of line item quantities for this order. */
   total_quantity: number;
+  /** Sum of order item prices in cents at time of checkout. */
+  total_amount_cents: number;
 };
+
+type RevenueStatusFilter =
+  | "all"
+  | "delivered"
+  | "confirmed"
+  | "out_for_delivery";
+type RevenuePeriodFilter =
+  | "this_month"
+  | "last_month"
+  | "this_year"
+  | "last_12_months";
+type OrdersPeriodFilter = RevenuePeriodFilter;
 
 const stores = ref<SellerStoreRow[]>([]);
 const customerOrders = ref<CustomerOrderRow[]>([]);
@@ -90,6 +105,9 @@ const sellerVerificationStatus = ref<
   "not_submitted" | "pending" | "approved" | "rejected"
 >("not_submitted");
 const sellerVerificationRejectReason = ref<string | null>(null);
+const revenueStatusFilter = ref<RevenueStatusFilter>("delivered");
+const revenuePeriodFilter = ref<RevenuePeriodFilter>("this_month");
+const ordersPeriodFilter = ref<OrdersPeriodFilter>("this_month");
 
 const stats = computed(() => ({
   total: stores.value.length,
@@ -112,6 +130,210 @@ const showCreateStoreCta = computed(
     canUseRoleGatedDashboardActions.value &&
     stores.value.some((s) => s.is_owner),
 );
+
+const revenueFilterOptions: { id: RevenueStatusFilter; label: string }[] = [
+  { id: "all", label: "All" },
+  { id: "delivered", label: "Delivered" },
+  { id: "confirmed", label: "Confirmed" },
+  { id: "out_for_delivery", label: "Out for delivery" },
+];
+const revenuePeriodOptions: { id: RevenuePeriodFilter; label: string }[] = [
+  { id: "this_month", label: "This month" },
+  { id: "last_month", label: "Last month" },
+  { id: "this_year", label: "This year" },
+  { id: "last_12_months", label: "Last 12 months" },
+];
+const ordersPeriodOptions: { id: OrdersPeriodFilter; label: string }[] = [
+  { id: "this_month", label: "This month" },
+  { id: "last_month", label: "Last month" },
+  { id: "this_year", label: "This year" },
+  { id: "last_12_months", label: "Last 12 months" },
+];
+
+function startOfMonthMs(d: Date): number {
+  return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+}
+
+function startOfYearMs(d: Date): number {
+  return new Date(d.getFullYear(), 0, 1).getTime();
+}
+
+function matchesRevenueStatusFilter(
+  status: string,
+  filter: RevenueStatusFilter,
+): boolean {
+  const st = status.toLowerCase();
+  if (filter === "all") return st !== "canceled";
+  return st === filter;
+}
+
+function resolveRevenuePeriodRange(period: RevenuePeriodFilter): {
+  startMs: number;
+  endMs: number;
+  bucket: "day" | "month";
+} {
+  const now = new Date();
+  if (period === "last_month") {
+    const thisMonthStart = startOfMonthMs(now);
+    const lastMonthStart = new Date(
+      new Date(thisMonthStart).getFullYear(),
+      new Date(thisMonthStart).getMonth() - 1,
+      1,
+    ).getTime();
+    return { startMs: lastMonthStart, endMs: thisMonthStart, bucket: "day" };
+  }
+  if (period === "this_year") {
+    const start = startOfYearMs(now);
+    return { startMs: start, endMs: Date.now() + 1, bucket: "month" };
+  }
+  if (period === "last_12_months") {
+    const thisMonthStart = startOfMonthMs(now);
+    const start = new Date(
+      new Date(thisMonthStart).getFullYear(),
+      new Date(thisMonthStart).getMonth() - 11,
+      1,
+    ).getTime();
+    const end = new Date(
+      new Date(thisMonthStart).getFullYear(),
+      new Date(thisMonthStart).getMonth() + 1,
+      1,
+    ).getTime();
+    return { startMs: start, endMs: end, bucket: "month" };
+  }
+  const thisMonthStart = startOfMonthMs(now);
+  return { startMs: thisMonthStart, endMs: Date.now() + 1, bucket: "day" };
+}
+
+function bucketStartMs(ms: number, bucket: "day" | "month"): number {
+  const d = new Date(ms);
+  if (bucket === "month") return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+const ordersMetrics = computed(() => {
+  const now = new Date();
+  let startMs = startOfMonthMs(now);
+  let endMs = Date.now() + 1;
+  let bucket: "day" | "month" = "day";
+  if (ordersPeriodFilter.value === "last_month") {
+    const thisMonthStart = startOfMonthMs(now);
+    startMs = new Date(
+      new Date(thisMonthStart).getFullYear(),
+      new Date(thisMonthStart).getMonth() - 1,
+      1,
+    ).getTime();
+    endMs = thisMonthStart;
+  } else if (ordersPeriodFilter.value === "this_year") {
+    startMs = startOfYearMs(now);
+    bucket = "month";
+  } else if (ordersPeriodFilter.value === "last_12_months") {
+    const thisMonthStart = startOfMonthMs(now);
+    startMs = new Date(
+      new Date(thisMonthStart).getFullYear(),
+      new Date(thisMonthStart).getMonth() - 11,
+      1,
+    ).getTime();
+    endMs = new Date(
+      new Date(thisMonthStart).getFullYear(),
+      new Date(thisMonthStart).getMonth() + 1,
+      1,
+    ).getTime();
+    bucket = "month";
+  }
+  const byBucket = new Map<number, number>();
+  let count = 0;
+  for (const ord of customerOrders.value) {
+    const t = new Date(ord.created_at).getTime();
+    if (!Number.isFinite(t) || t < startMs || t >= endMs) continue;
+    if (ord.status.toLowerCase() === "canceled") continue;
+    count += 1;
+    const b = bucketStartMs(t, bucket);
+    byBucket.set(b, (byBucket.get(b) ?? 0) + 1);
+  }
+  const chartPoints = [...byBucket.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([t, v]) => ({ t, v }));
+  if (chartPoints.length === 0) {
+    return {
+      count,
+      chartPoints: [
+        { t: startMs, v: 0 },
+        { t: Math.max(startMs + 60_000, endMs - 1), v: 0 },
+      ] as KpiSample[],
+    };
+  }
+  if (chartPoints.length === 1) {
+    chartPoints.push({
+      t: Math.max(chartPoints[0]!.t + 60_000, endMs - 1),
+      v: chartPoints[0]!.v,
+    });
+  }
+  return { count, chartPoints };
+});
+
+const revenueMetrics = computed(() => {
+  const { startMs, endMs, bucket } = resolveRevenuePeriodRange(
+    revenuePeriodFilter.value,
+  );
+  const byBucket = new Map<number, number>();
+  let amountCents = 0;
+  for (const ord of customerOrders.value) {
+    const t = new Date(ord.created_at).getTime();
+    if (!Number.isFinite(t) || t < startMs || t >= endMs) continue;
+    if (!matchesRevenueStatusFilter(ord.status, revenueStatusFilter.value)) continue;
+    const amount = Math.max(0, ord.total_amount_cents || 0);
+    amountCents += amount;
+    const b = bucketStartMs(t, bucket);
+    byBucket.set(b, (byBucket.get(b) ?? 0) + amount);
+  }
+  const chartPoints = [...byBucket.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([t, cents]) => ({ t, v: centsToGhsChartValue(cents) }));
+  if (chartPoints.length === 0) {
+    return {
+      amountCents,
+      chartPoints: [
+        { t: startMs, v: 0 },
+        { t: Math.max(startMs + 60_000, endMs - 1), v: 0 },
+      ] as KpiSample[],
+    };
+  }
+  if (chartPoints.length === 1) {
+    chartPoints.push({
+      t: Math.max(chartPoints[0]!.t + 60_000, endMs - 1),
+      v: chartPoints[0]!.v,
+    });
+  }
+  return { amountCents, chartPoints };
+});
+
+const selectedRevenueCents = computed(() => revenueMetrics.value.amountCents);
+
+const revenueFilterHelpText = computed(() =>
+  revenueStatusFilter.value === "delivered"
+    ? "Revenue from delivered orders only"
+    : revenueStatusFilter.value === "confirmed"
+      ? "Revenue from confirmed orders only"
+      : revenueStatusFilter.value === "out_for_delivery"
+        ? "Revenue from out-for-delivery orders only"
+        : "Revenue from non-canceled orders",
+);
+const revenueChartBucketLabel = computed(() =>
+  revenuePeriodFilter.value === "this_year" ||
+  revenuePeriodFilter.value === "last_12_months"
+    ? "Monthly points"
+    : "Daily points",
+);
+const ordersChartBucketLabel = computed(() =>
+  ordersPeriodFilter.value === "this_year" ||
+  ordersPeriodFilter.value === "last_12_months"
+    ? "Monthly points"
+    : "Daily points",
+);
+
+function centsToGhsChartValue(cents: number): number {
+  return Math.max(0, cents) / 100;
+}
 
 const accountPlanLabel = computed(() => {
   const raw = auth.user?.user_metadata?.signup_plan;
@@ -773,7 +995,10 @@ async function removeDashboardStoreAdmin(userId: string) {
 }
 
 /** Totals across the signed-in seller's stores (filled in `loadSellerDashboard`). */
-const planUsage = ref({ products: 0, ordersThisMonth: 0 });
+const planUsage = ref({
+  products: 0,
+  ordersThisMonth: 0,
+});
 
 const planFeatureUsageRows = computed(() => {
   const planId = resolvePricingPlanId(auth.user?.user_metadata?.signup_plan);
@@ -831,16 +1056,13 @@ const planFeatureUsageRows = computed(() => {
 });
 
 /** Wall-clock KPI samples (persisted ~48h per user in localStorage). */
-const ordersKpiHistory = ref<KpiSample[]>([]);
-const liveKpiHistory = ref<KpiSample[]>([]);
+const revenueKpiHistory = computed(() => revenueMetrics.value.chartPoints);
 const productKpiHistory = ref<KpiSample[]>([]);
 
 function kpiStorageKeys(uid: string | null) {
   if (!uid)
-    return { orders: null as string | null, live: null, products: null };
+    return { products: null as string | null };
   return {
-    orders: `uanditech:dash-kpi:v1:orders:${uid}`,
-    live: `uanditech:dash-kpi:v1:live:${uid}`,
     products: `uanditech:dash-kpi:v1:products:${uid}`,
   };
 }
@@ -848,22 +1070,16 @@ function kpiStorageKeys(uid: string | null) {
 function hydrateKpiHistories() {
   const uid = sessionUserId.value;
   const k = kpiStorageKeys(uid);
-  ordersKpiHistory.value = loadKpiHistory(k.orders);
-  liveKpiHistory.value = loadKpiHistory(k.live);
   productKpiHistory.value = loadKpiHistory(k.products);
 }
 
 function persistKpiHistories() {
   const k = kpiStorageKeys(sessionUserId.value);
-  saveKpiHistory(k.orders, ordersKpiHistory.value);
-  saveKpiHistory(k.live, liveKpiHistory.value);
   saveKpiHistory(k.products, productKpiHistory.value);
 }
 
 watch(sessionUserId, (uid) => {
   if (!uid) {
-    ordersKpiHistory.value = [];
-    liveKpiHistory.value = [];
     productKpiHistory.value = [];
     return;
   }
@@ -876,17 +1092,10 @@ watch(
       loading.value,
       sessionUserId.value,
       stats.value.total,
-      stats.value.active,
       planUsage.value.products,
-      planUsage.value.ordersThisMonth,
     ] as const,
-  ([ld, uid, _total, active, products, ordersThisMonth]) => {
+  ([ld, uid, _total, products]) => {
     if (ld || !uid) return;
-    ordersKpiHistory.value = recordKpiSample(
-      ordersKpiHistory.value,
-      ordersThisMonth,
-    );
-    liveKpiHistory.value = recordKpiSample(liveKpiHistory.value, active);
     productKpiHistory.value = recordKpiSample(
       productKpiHistory.value,
       products,
@@ -1135,7 +1344,7 @@ async function loadSellerDashboard(silent = false) {
         supabase
           .from("orders")
           .select(
-            "id, store_id, status, created_at, guest_name, guest_phone, customer_id, order_items(quantity)",
+            "id, store_id, status, created_at, guest_name, guest_phone, customer_id, order_items(quantity,unit_price_cents)",
           )
           .in("store_id", storeIds)
           .order("created_at", { ascending: false }),
@@ -1152,6 +1361,7 @@ async function loadSellerDashboard(silent = false) {
               ? [rawItems]
               : [];
           let totalQty = 0;
+          let orderTotalCents = 0;
           for (const row of itemRows) {
             const q =
               row &&
@@ -1161,18 +1371,30 @@ async function loadSellerDashboard(silent = false) {
                 ? (row as { quantity: number }).quantity
                 : 0;
             totalQty += Number.isFinite(q) ? q : 0;
+            const unitPrice =
+              row &&
+              typeof row === "object" &&
+              "unit_price_cents" in row &&
+              typeof (row as { unit_price_cents: unknown }).unit_price_cents ===
+                "number"
+                ? (row as { unit_price_cents: number }).unit_price_cents
+                : 0;
+            const safeUnitPrice = Number.isFinite(unitPrice) ? unitPrice : 0;
+            orderTotalCents += safeUnitPrice * (Number.isFinite(q) ? q : 0);
           }
+          const createdAtRaw =
+            typeof r.created_at === "string" && r.created_at.trim()
+              ? r.created_at.trim()
+              : "";
+          const statusRaw =
+            typeof r.status === "string" && r.status.trim()
+              ? r.status.trim()
+              : "pending";
           return {
             id: String(r.id),
             store_id: String(r.store_id ?? ""),
-            status:
-              typeof r.status === "string" && r.status.trim()
-                ? r.status.trim()
-                : "pending",
-            created_at:
-              typeof r.created_at === "string" && r.created_at.trim()
-                ? r.created_at.trim()
-                : "",
+            status: statusRaw,
+            created_at: createdAtRaw,
             guest_name:
               typeof r.guest_name === "string" && r.guest_name.trim()
                 ? r.guest_name.trim()
@@ -1186,13 +1408,14 @@ async function loadSellerDashboard(silent = false) {
                 ? r.customer_id.trim()
                 : null,
             total_quantity: totalQty,
+            total_amount_cents: Math.max(0, orderTotalCents),
           };
         });
+        planUsage.value = { products: prRes.count ?? 0, ordersThisMonth: orRes.count ?? 0 };
       }
-      planUsage.value = {
-        products: prRes.count ?? 0,
-        ordersThisMonth: orRes.count ?? 0,
-      };
+      if (recentOrdersRes.error) {
+        planUsage.value = { products: prRes.count ?? 0, ordersThisMonth: orRes.count ?? 0 };
+      }
       if (subRes.error) {
         dashboardPaidPlanRenewalEnd.value = null;
         stores.value = stores.value.map((s) => ({
@@ -1296,16 +1519,6 @@ onMounted(() => {
   void loadSellerDashboard(false);
   kpiSampleTimer = window.setInterval(() => {
     if (loading.value || !sessionUserId.value) return;
-    ordersKpiHistory.value = recordKpiSample(
-      ordersKpiHistory.value,
-      planUsage.value.ordersThisMonth,
-      { force: true },
-    );
-    liveKpiHistory.value = recordKpiSample(
-      liveKpiHistory.value,
-      stats.value.active,
-      { force: true },
-    );
     productKpiHistory.value = recordKpiSample(
       productKpiHistory.value,
       planUsage.value.products,
@@ -1408,26 +1621,49 @@ onUnmounted(() => {
             <p
               class="mt-2 text-3xl font-bold tabular-nums tracking-tight text-zinc-900 sm:text-[2rem]"
             >
-              +{{ planUsage.ordersThisMonth }}
+              +{{ ordersMetrics.count }}
             </p>
             <p
               class="mt-3 inline-flex w-fit rounded-full bg-white/85 px-2.5 py-1 text-[11px] font-semibold text-violet-800 shadow-sm ring-1 ring-violet-200/80"
             >
-              This month
+              {{
+                ordersPeriodOptions.find((x) => x.id === ordersPeriodFilter)
+                  ?.label
+              }}
             </p>
             <p class="mt-2 text-xs font-medium text-violet-900/65">
-              Orders placed across your storefronts
+              Non-canceled orders across your storefronts
+            </p>
+            <p class="mt-1 text-[11px] font-medium text-violet-700/75">
+              {{ ordersChartBucketLabel }}
             </p>
             <div
               class="relative mt-auto h-36 w-full shrink-0 pt-6 sm:h-40 sm:pt-7 lg:h-44"
             >
               <DashboardKpiTimeChart
-                :points="ordersKpiHistory"
+                :key="`orders-chart-${ordersPeriodFilter}`"
+                :points="ordersMetrics.chartPoints"
                 stroke="#5b21b6"
                 fill="rgba(91,33,182,0.2)"
                 axis-stroke="rgba(91,33,182,0.45)"
                 grid-stroke="rgba(91,33,182,0.12)"
               />
+            </div>
+            <div class="mt-3 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-violet-200/80">
+              <button
+                v-for="opt in ordersPeriodOptions"
+                :key="`orders-period-${opt.id}`"
+                type="button"
+                class="rounded-full px-2.5 py-1 text-[11px] font-semibold transition"
+                :class="
+                  ordersPeriodFilter === opt.id
+                    ? 'bg-violet-600 text-white shadow-sm'
+                    : 'text-violet-900/75 hover:bg-white/80'
+                "
+                @click="ordersPeriodFilter = opt.id"
+              >
+                {{ opt.label }}
+              </button>
             </div>
           </div>
           <div
@@ -1437,7 +1673,7 @@ onUnmounted(() => {
               <p
                 class="text-xs font-semibold uppercase tracking-wider text-sky-900/75"
               >
-                Live shops
+                Revenue trend
               </p>
               <span
                 class="inline-flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-white/90 text-sky-700 ring-1 ring-sky-200/80 shadow-sm"
@@ -1453,7 +1689,7 @@ onUnmounted(() => {
                   <path
                     stroke-linecap="round"
                     stroke-linejoin="round"
-                    d="M3.75 21h16.5M5.25 21V9.75A2.25 2.25 0 0 1 7.5 7.5h2.25A2.25 2.25 0 0 1 12 9.75V21m0-6h6V8.25A2.25 2.25 0 0 0 15.75 6h-1.5M8.25 12h.008v.008H8.25V12zm0 3h.008v.008H8.25V15z"
+                    d="M12 6v12m0 0-3-3m3 3 3-3M4.5 20.25h15"
                   />
                 </svg>
               </span>
@@ -1461,26 +1697,62 @@ onUnmounted(() => {
             <p
               class="mt-2 text-3xl font-bold tabular-nums tracking-tight text-zinc-900 sm:text-[2rem]"
             >
-              +{{ stats.active }}
+              {{ formatGhs(selectedRevenueCents) }}
             </p>
             <p
               class="mt-3 inline-flex w-fit rounded-full bg-white/85 px-2.5 py-1 text-[11px] font-semibold text-sky-800 shadow-sm ring-1 ring-sky-200/80"
             >
-              Live · 48h · saved locally
+              {{ revenuePeriodOptions.find((x) => x.id === revenuePeriodFilter)?.label }}
             </p>
+            <div class="mt-2 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-sky-200/80">
+              <button
+                v-for="opt in revenueFilterOptions"
+                :key="`rev-filter-${opt.id}`"
+                type="button"
+                class="rounded-full px-2.5 py-1 text-[11px] font-semibold transition"
+                :class="
+                  revenueStatusFilter === opt.id
+                    ? 'bg-sky-600 text-white shadow-sm'
+                    : 'text-sky-900/75 hover:bg-white/80'
+                "
+                @click="revenueStatusFilter = opt.id"
+              >
+                {{ opt.label }}
+              </button>
+            </div>
             <p class="mt-2 text-xs font-medium text-sky-900/65">
-              Published &amp; accepting orders
+              {{ revenueFilterHelpText }}
+            </p>
+            <p class="mt-1 text-[11px] font-medium text-sky-700/75">
+              {{ revenueChartBucketLabel }}
             </p>
             <div
               class="relative mt-auto h-36 w-full shrink-0 pt-6 sm:h-40 sm:pt-7 lg:h-44"
             >
               <DashboardKpiTimeChart
-                :points="liveKpiHistory"
+                :key="`revenue-chart-${revenueStatusFilter}-${revenuePeriodFilter}`"
+                :points="revenueKpiHistory"
                 stroke="#0369a1"
                 fill="rgba(3,105,161,0.18)"
                 axis-stroke="rgba(3,105,161,0.45)"
                 grid-stroke="rgba(3,105,161,0.12)"
               />
+            </div>
+            <div class="mt-3 inline-flex w-fit rounded-full bg-white/70 p-1 ring-1 ring-sky-200/80">
+              <button
+                v-for="opt in revenuePeriodOptions"
+                :key="`rev-period-${opt.id}`"
+                type="button"
+                class="rounded-full px-2.5 py-1 text-[11px] font-semibold transition"
+                :class="
+                  revenuePeriodFilter === opt.id
+                    ? 'bg-sky-600 text-white shadow-sm'
+                    : 'text-sky-900/75 hover:bg-white/80'
+                "
+                @click="revenuePeriodFilter = opt.id"
+              >
+                {{ opt.label }}
+              </button>
             </div>
           </div>
           <div
