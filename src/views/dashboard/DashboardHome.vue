@@ -1180,12 +1180,6 @@ function orderBuyerLabel(row: CustomerOrderRow): string {
   return "Guest checkout";
 }
 
-function orderStoreLabel(storeId: string): string {
-  const s = stores.value.find((x) => x.id === storeId);
-  if (!s) return "Store";
-  return s.name;
-}
-
 function formatOrderDate(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
