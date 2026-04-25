@@ -1,4 +1,4 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient } from "npm:@supabase/supabase-js";
 
 declare const Deno: {
   serve: (handler: (req: Request) => Response | Promise<Response>) => void;

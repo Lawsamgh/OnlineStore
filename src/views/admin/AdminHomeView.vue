@@ -39,6 +39,12 @@ const ui = useUiStore();
 const route = useRoute();
 
 const loading = ref(true);
+const overviewSlideIndex = ref(0);
+const OVERVIEW_AUTOPLAY_MS = 6500;
+const overviewAutoplayPaused = ref(false);
+const overviewAutoplayElapsedMs = ref(0);
+const overviewTouchStartX = ref<number | null>(null);
+let overviewAutoplayTimer: number | null = null;
 let adminKpiSampleTimer: number | null = null;
 const stats = ref({
   stores: 0,
@@ -53,14 +59,22 @@ const stats = ref({
 const subscriptionNetTotalPesewas = ref(0);
 /** Raw rows for monthly paid vs fee aggregation (cashflow chart). */
 type SubscriptionSnapRow = {
+  store_id: string | null;
   paid_amount_pesewas: number | null;
+  payment_channel: string | null;
   paystack_fee_pesewas: number | null;
+  current_period_end: string | null;
   updated_at: string;
 };
 const subscriptionSnapRows = ref<SubscriptionSnapRow[]>([]);
 
-/** `year` = Jan–Dec calendar year; `6m` = trailing six months. */
-const subscriptionCashflowPeriod = ref<"year" | "6m">("year");
+/** `year` = selected Jan–Dec year; `6m|12m|24m` = trailing windows. */
+const subscriptionCashflowPeriod = ref<"year" | "6m" | "12m" | "24m">("year");
+const subscriptionCashflowYear = ref(new Date().getFullYear());
+const smsBalanceLoading = ref(false);
+const smsBalanceUnits = ref<number | null>(null);
+const smsBalanceFetchedAt = ref<string | null>(null);
+const smsBalanceError = ref<string | null>(null);
 
 function applySellerSubscriptionBilling(
   rows: unknown[] | null,
@@ -74,8 +88,11 @@ function applySellerSubscriptionBilling(
     return;
   }
   type Snap = {
+    store_id?: string | null;
     paid_amount_pesewas?: number | null;
+    payment_channel?: string | null;
     paystack_fee_pesewas?: number | null;
+    current_period_end?: string | null;
     updated_at?: string;
   };
   const list = (rows ?? []) as Snap[];
@@ -86,15 +103,27 @@ function applySellerSubscriptionBilling(
         !Number.isNaN(new Date(r.updated_at).getTime()),
     )
     .map((r) => ({
+      store_id:
+        typeof r.store_id === "string" && r.store_id.trim()
+          ? r.store_id.trim()
+          : null,
       paid_amount_pesewas:
         typeof r.paid_amount_pesewas === "number" &&
         Number.isFinite(r.paid_amount_pesewas)
           ? r.paid_amount_pesewas
           : null,
+      payment_channel:
+        typeof r.payment_channel === "string" && r.payment_channel.trim()
+          ? r.payment_channel.trim()
+          : null,
       paystack_fee_pesewas:
         typeof r.paystack_fee_pesewas === "number" &&
         Number.isFinite(r.paystack_fee_pesewas)
           ? r.paystack_fee_pesewas
+          : null,
+      current_period_end:
+        typeof r.current_period_end === "string" && r.current_period_end.trim()
+          ? r.current_period_end.trim()
           : null,
       updated_at: r.updated_at as string,
     }));
@@ -128,9 +157,24 @@ const subscriptionCashflowMonths = computed((): SubscriptionCashflowMonth[] => {
   const period = subscriptionCashflowPeriod.value;
   const monthLabel = (d: Date) =>
     d.toLocaleDateString(undefined, { month: "short" });
+  const monthYearLabel = (d: Date) =>
+    d.toLocaleDateString(undefined, { month: "short", year: "2-digit" });
+
+  const knownYears = new Set<number>();
+  for (const r of rows) {
+    const d = new Date(r.updated_at);
+    if (!Number.isNaN(d.getTime())) knownYears.add(d.getFullYear());
+  }
+  if (
+    knownYears.size > 0 &&
+    !knownYears.has(subscriptionCashflowYear.value) &&
+    period === "year"
+  ) {
+    subscriptionCashflowYear.value = Math.max(...knownYears);
+  }
 
   if (period === "year") {
-    const y = new Date().getFullYear();
+    const y = subscriptionCashflowYear.value;
     const labels = [
       "Jan",
       "Feb",
@@ -174,9 +218,10 @@ const subscriptionCashflowMonths = computed((): SubscriptionCashflowMonth[] => {
     }));
   }
 
+  const trailingCount = period === "6m" ? 6 : period === "12m" ? 12 : 24;
   const out: SubscriptionCashflowMonth[] = [];
   const now = new Date();
-  for (let k = 5; k >= 0; k--) {
+  for (let k = trailingCount - 1; k >= 0; k--) {
     const d = new Date(now.getFullYear(), now.getMonth() - k, 1);
     const y = d.getFullYear();
     const mi = d.getMonth();
@@ -205,12 +250,41 @@ const subscriptionCashflowMonths = computed((): SubscriptionCashflowMonth[] => {
     }
     out.push({
       key: `${y}-${mi}`,
-      label: monthLabel(d),
+      label: trailingCount > 6 ? monthYearLabel(d) : monthLabel(d),
       incomeGhs,
       feeGhs,
     });
   }
   return out;
+});
+
+const subscriptionCashflowYearOptions = computed(() => {
+  const years = new Set<number>([new Date().getFullYear()]);
+  for (const r of subscriptionSnapRows.value) {
+    const d = new Date(r.updated_at);
+    if (!Number.isNaN(d.getTime())) years.add(d.getFullYear());
+  }
+  return [...years].sort((a, b) => b - a);
+});
+
+const subscriptionFeeTotalPesewas = computed(() => {
+  let total = 0;
+  for (const r of subscriptionSnapRows.value) {
+    if (
+      typeof r.paid_amount_pesewas !== "number" ||
+      r.paid_amount_pesewas <= 0
+    ) {
+      continue;
+    }
+    if (
+      typeof r.paystack_fee_pesewas === "number" &&
+      Number.isFinite(r.paystack_fee_pesewas) &&
+      r.paystack_fee_pesewas > 0
+    ) {
+      total += r.paystack_fee_pesewas;
+    }
+  }
+  return total;
 });
 
 type OwnerStore = {
@@ -226,6 +300,8 @@ type StoreFlatRow = OwnerStore & {
   owner_id: string;
   ownerName: string | null;
   ownerAvatarPath: string | null;
+  storeWhatsappPhoneE164: string | null;
+  ownerPhoneE164: string | null;
   /** `profiles.signup_plan`, mirrored from auth metadata. */
   ownerSignupPlan: string | null;
 };
@@ -343,8 +419,14 @@ type OwnerPipelineRow = {
   ownerName: string;
   ownerAvatarUrl: string | null;
   ownerInitial: string;
+  subscriptionPlanId: string | null;
   /** Display label for seller subscription tier. */
   subscriptionPlanLabel: string;
+  ownerPhoneE164: string | null;
+  latestPaidAmountPesewas: number | null;
+  latestPaidAt: string | null;
+  latestPaymentChannel: string | null;
+  latestExpiryAt: string | null;
   storeCount: number;
   stores: OwnerStore[];
   /** Sum of `products` rows across this owner’s storefronts. */
@@ -377,6 +459,94 @@ function formatProfileCreatedLabel(iso: string | null | undefined): string {
   });
 }
 
+function formatDateLabel(iso: string | null | undefined): string {
+  if (!iso || typeof iso !== "string") return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+function formatDateTimeLabel(iso: string | null | undefined): string {
+  if (!iso || typeof iso !== "string") return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function paymentChannelLabel(raw: string | null | undefined): string {
+  const t = raw?.trim();
+  if (!t) return "—";
+  return t
+    .replace(/_/g, " ")
+    .split(" ")
+    .filter(Boolean)
+    .map((x) => x[0]!.toUpperCase() + x.slice(1).toLowerCase())
+    .join(" ");
+}
+
+async function loadSmsBalance(silent = false) {
+  if (!authStore.isSuperAdmin || !isSupabaseConfigured()) {
+    smsBalanceUnits.value = null;
+    smsBalanceFetchedAt.value = null;
+    smsBalanceError.value = null;
+    smsBalanceLoading.value = false;
+    return;
+  }
+  if (!silent) smsBalanceLoading.value = true;
+  smsBalanceError.value = null;
+  try {
+    const { data, error } = await getSupabaseBrowser().functions.invoke(
+      "get-arkesel-sms-balance",
+      { body: {} },
+    );
+    if (error) {
+      smsBalanceUnits.value = null;
+      smsBalanceFetchedAt.value = null;
+      smsBalanceError.value = error.message || "Failed to load SMS balance";
+      return;
+    }
+    const payload = (data ?? {}) as {
+      balance?: unknown;
+      fetched_at?: unknown;
+      error?: unknown;
+    };
+    if (typeof payload.error === "string" && payload.error.trim()) {
+      smsBalanceUnits.value = null;
+      smsBalanceFetchedAt.value = null;
+      smsBalanceError.value = payload.error.trim();
+      return;
+    }
+    const parsedBalance =
+      typeof payload.balance === "number" && Number.isFinite(payload.balance)
+        ? payload.balance
+        : typeof payload.balance === "string" && payload.balance.trim()
+          ? Number(payload.balance)
+          : null;
+    smsBalanceUnits.value =
+      parsedBalance != null && Number.isFinite(parsedBalance)
+        ? parsedBalance
+        : null;
+    smsBalanceFetchedAt.value =
+      typeof payload.fetched_at === "string" ? payload.fetched_at : null;
+  } catch (err) {
+    smsBalanceUnits.value = null;
+    smsBalanceFetchedAt.value = null;
+    smsBalanceError.value = String(err);
+  } finally {
+    smsBalanceLoading.value = false;
+  }
+}
+
 function storeInitialFromName(name: string): string {
   const t = name.trim();
   if (!t) return "?";
@@ -397,6 +567,11 @@ function storeLogoPublicUrl(
 
 const ownerPipelineRows = computed((): OwnerPipelineRow[] => {
   const counts = productCountByStoreId.value;
+  const subByStoreId = new Map(
+    subscriptionSnapRows.value
+      .filter((r) => typeof r.store_id === "string" && r.store_id.length > 0)
+      .map((r) => [r.store_id as string, r]),
+  );
   const byOwner = new Map<string, Omit<OwnerPipelineRow, "productTotal">>();
   for (const s of storesFlat.value) {
     const label = s.ownerName?.trim() || "Unknown seller";
@@ -407,11 +582,44 @@ const ownerPipelineRows = computed((): OwnerPipelineRow[] => {
         ownerName: label,
         ownerAvatarUrl: profileAvatarPublicUrl(s.ownerAvatarPath),
         ownerInitial: ownerInitialFromName(label),
+        subscriptionPlanId: s.ownerSignupPlan?.trim().toLowerCase() || null,
         subscriptionPlanLabel: planLabelFromSignupId(s.ownerSignupPlan),
+        ownerPhoneE164: s.ownerPhoneE164,
+        latestPaidAmountPesewas: null,
+        latestPaidAt: null,
+        latestPaymentChannel: null,
+        latestExpiryAt: null,
         storeCount: 0,
         stores: [],
       };
       byOwner.set(s.owner_id, row);
+    }
+    if (!row.subscriptionPlanId && s.ownerSignupPlan?.trim()) {
+      row.subscriptionPlanId = s.ownerSignupPlan.trim().toLowerCase();
+      row.subscriptionPlanLabel = planLabelFromSignupId(s.ownerSignupPlan);
+    }
+    if (!row.ownerPhoneE164 && s.ownerPhoneE164?.trim()) {
+      row.ownerPhoneE164 = s.ownerPhoneE164.trim();
+    }
+    if (!row.ownerPhoneE164 && s.storeWhatsappPhoneE164?.trim()) {
+      row.ownerPhoneE164 = s.storeWhatsappPhoneE164.trim();
+    }
+    const sub = subByStoreId.get(s.id);
+    if (sub) {
+      const candidatePaidAt = sub.updated_at;
+      const prevPaidAt = row.latestPaidAt;
+      const candidateTs = new Date(candidatePaidAt).getTime();
+      const prevTs = prevPaidAt ? new Date(prevPaidAt).getTime() : -Infinity;
+      if (Number.isFinite(candidateTs) && candidateTs >= prevTs) {
+        row.latestPaidAt = candidatePaidAt;
+        row.latestPaidAmountPesewas =
+          typeof sub.paid_amount_pesewas === "number" &&
+          Number.isFinite(sub.paid_amount_pesewas)
+            ? sub.paid_amount_pesewas
+            : null;
+        row.latestPaymentChannel = sub.payment_channel?.trim() || null;
+        row.latestExpiryAt = sub.current_period_end?.trim() || null;
+      }
     }
     row.storeCount += 1;
     row.stores.push({
@@ -436,6 +644,13 @@ const ownerPipelineRows = computed((): OwnerPipelineRow[] => {
       }),
     );
 });
+
+const paidSubscriptionSellerRows = computed(() =>
+  ownerPipelineRows.value.filter((row) => {
+    const planId = row.subscriptionPlanId?.trim().toLowerCase();
+    return Boolean(planId && planId !== "free");
+  }),
+);
 
 /** Stores column: show storefront name when the owner has exactly one shop. */
 function pipelineStoresCell(row: OwnerPipelineRow): string {
@@ -659,7 +874,9 @@ watch([modalOpen, revokeConfirmUser], ([storesOpen, revokeOpen]) => {
 
 onBeforeUnmount(() => {
   document.removeEventListener("keydown", onOwnerModalKeydown);
+  document.removeEventListener("visibilitychange", onOverviewVisibilityChange);
   document.body.style.overflow = "";
+  stopOverviewAutoplay();
   if (adminKpiSampleTimer != null) {
     clearInterval(adminKpiSampleTimer);
     adminKpiSampleTimer = null;
@@ -709,10 +926,14 @@ function shareOfCombinedPct(value: number): number {
   return Math.min(100, Math.round((value / t) * 100));
 }
 
-type AdminStatCardKey = "stores" | "products" | "ticketsOpen" | "adminUsers";
+type AdminStatCardKey =
+  | "stores"
+  | "subscriptionNet"
+  | "ticketsOpen"
+  | "adminUsers";
 
 const adminStoresHistory = ref<KpiSample[]>([]);
-const adminProductsHistory = ref<KpiSample[]>([]);
+const adminSubscriptionNetHistory = ref<KpiSample[]>([]);
 const adminTicketsHistory = ref<KpiSample[]>([]);
 const adminUsersHistory = ref<KpiSample[]>([]);
 
@@ -720,14 +941,14 @@ function adminKpiStorageKeys(uid: string | null) {
   if (!uid) {
     return {
       stores: null as string | null,
-      products: null,
+      subscriptionNet: null,
       ticketsOpen: null,
       adminUsers: null,
     };
   }
   return {
     stores: `uanditech:admin-kpi:v1:stores:${uid}`,
-    products: `uanditech:admin-kpi:v1:products:${uid}`,
+    subscriptionNet: `uanditech:admin-kpi:v1:subscription-net:${uid}`,
     ticketsOpen: `uanditech:admin-kpi:v1:tickets:${uid}`,
     adminUsers: `uanditech:admin-kpi:v1:admins:${uid}`,
   };
@@ -736,7 +957,7 @@ function adminKpiStorageKeys(uid: string | null) {
 function hydrateAdminKpiHistories() {
   const k = adminKpiStorageKeys(sessionUserId.value);
   adminStoresHistory.value = loadKpiHistory(k.stores);
-  adminProductsHistory.value = loadKpiHistory(k.products);
+  adminSubscriptionNetHistory.value = loadKpiHistory(k.subscriptionNet);
   adminTicketsHistory.value = loadKpiHistory(k.ticketsOpen);
   adminUsersHistory.value = loadKpiHistory(k.adminUsers);
 }
@@ -744,7 +965,7 @@ function hydrateAdminKpiHistories() {
 function persistAdminKpiHistories() {
   const k = adminKpiStorageKeys(sessionUserId.value);
   saveKpiHistory(k.stores, adminStoresHistory.value);
-  saveKpiHistory(k.products, adminProductsHistory.value);
+  saveKpiHistory(k.subscriptionNet, adminSubscriptionNetHistory.value);
   saveKpiHistory(k.ticketsOpen, adminTicketsHistory.value);
   saveKpiHistory(k.adminUsers, adminUsersHistory.value);
 }
@@ -753,8 +974,8 @@ function kpiPointsFor(key: AdminStatCardKey): KpiSample[] {
   switch (key) {
     case "stores":
       return adminStoresHistory.value;
-    case "products":
-      return adminProductsHistory.value;
+    case "subscriptionNet":
+      return adminSubscriptionNetHistory.value;
     case "ticketsOpen":
       return adminTicketsHistory.value;
     case "adminUsers":
@@ -769,7 +990,7 @@ function kpiPointsFor(key: AdminStatCardKey): KpiSample[] {
 watch(sessionUserId, (uid) => {
   if (!uid) {
     adminStoresHistory.value = [];
-    adminProductsHistory.value = [];
+    adminSubscriptionNetHistory.value = [];
     adminTicketsHistory.value = [];
     adminUsersHistory.value = [];
     return;
@@ -783,16 +1004,16 @@ watch(
       loading.value,
       sessionUserId.value,
       stats.value.stores,
-      stats.value.products,
+      subscriptionNetTotalPesewas.value,
       stats.value.ticketsOpen,
       stats.value.adminUsers,
     ] as const,
-  ([ld, uid, st, prod, tix, adm]) => {
+  ([ld, uid, st, netPesewas, tix, adm]) => {
     if (ld || !uid) return;
     adminStoresHistory.value = recordKpiSample(adminStoresHistory.value, st);
-    adminProductsHistory.value = recordKpiSample(
-      adminProductsHistory.value,
-      prod,
+    adminSubscriptionNetHistory.value = recordKpiSample(
+      adminSubscriptionNetHistory.value,
+      netPesewas / 100,
     );
     adminTicketsHistory.value = recordKpiSample(adminTicketsHistory.value, tix);
     adminUsersHistory.value = recordKpiSample(adminUsersHistory.value, adm);
@@ -817,7 +1038,10 @@ const statCards = computed(() => {
       key: "stores" as const,
       label: "Stores",
       subtitle: "Marketplace storefronts",
-      value: s.stores,
+      valueDisplay: String(s.stores),
+      valueSecondary: null as string | null,
+      shareValue: s.stores,
+      showShare: true,
       pill: "Platform-wide",
       pillClass:
         "border-emerald-200/70 bg-white/85 text-emerald-700 shadow-sm ring-1 ring-emerald-200/70",
@@ -834,11 +1058,14 @@ const statCards = computed(() => {
       },
     },
     {
-      key: "products" as const,
-      label: "Total products",
-      subtitle: "SKUs across every storefront",
-      value: s.products,
-      pill: "Catalog-wide",
+      key: "subscriptionNet" as const,
+      label: "Subscription net",
+      subtitle: "Paid subscriptions minus fees",
+      valueDisplay: formatGhs(subscriptionNetTotalPesewas.value),
+      valueSecondary: `Fees: ${formatGhs(subscriptionFeeTotalPesewas.value)}`,
+      shareValue: 0,
+      showShare: false,
+      pill: "Net balance",
       pillClass:
         "border-sky-200/70 bg-white/85 text-sky-800 shadow-sm ring-1 ring-sky-200/70",
       border: "border-sky-200/50",
@@ -857,7 +1084,10 @@ const statCards = computed(() => {
       key: "ticketsOpen" as const,
       label: "Open tickets",
       subtitle: "Support queue awaiting reply",
-      value: s.ticketsOpen,
+      valueDisplay: String(s.ticketsOpen),
+      valueSecondary: null as string | null,
+      shareValue: s.ticketsOpen,
+      showShare: true,
       pill: ticketPill.text,
       pillClass: ticketPill.cls,
       border: "border-amber-200/55",
@@ -876,7 +1106,10 @@ const statCards = computed(() => {
       key: "adminUsers" as const,
       label: "Users",
       subtitle: "Platform console accounts",
-      value: s.adminUsers,
+      valueDisplay: String(s.adminUsers),
+      valueSecondary: null as string | null,
+      shareValue: s.adminUsers,
+      showShare: true,
       pill: "Admin roles",
       pillClass:
         "border-emerald-200/70 bg-white/85 text-emerald-800 shadow-sm ring-1 ring-emerald-200/70",
@@ -926,7 +1159,7 @@ async function loadPlatformData(silent = false) {
       sb
         .from("stores")
         .select(
-          "id, slug, name, is_active, logo_path, owner_id, profiles!stores_owner_id_fkey(display_name, avatar_path, signup_plan)",
+          "id, slug, name, is_active, whatsapp_phone_e164, logo_path, owner_id, profiles!stores_owner_id_fkey(display_name, avatar_path, signup_plan, phone_e164)",
         )
         .order("created_at", { ascending: false }),
       sb
@@ -936,7 +1169,9 @@ async function loadPlatformData(silent = false) {
         .limit(80),
       sb
         .from("seller_subscriptions")
-        .select("paid_amount_pesewas, paystack_fee_pesewas, updated_at")
+        .select(
+          "store_id, paid_amount_pesewas, payment_channel, paystack_fee_pesewas, current_period_end, updated_at",
+        )
         .order("updated_at", { ascending: true }),
     ]);
     applySellerSubscriptionBilling(
@@ -944,6 +1179,7 @@ async function loadPlatformData(silent = false) {
       subSnapRes.error,
       silent,
     );
+    await loadSmsBalance(silent);
     stats.value = {
       stores: s.count ?? 0,
       products: pr.count ?? 0,
@@ -1075,6 +1311,7 @@ async function loadPlatformData(silent = false) {
             display_name?: string | null;
             avatar_path?: string | null;
             signup_plan?: string | null;
+            phone_e164?: string | null;
           } | null;
           const logoRaw = raw.logo_path;
           const logoPath =
@@ -1090,6 +1327,12 @@ async function loadPlatformData(silent = false) {
             owner_id: String(raw.owner_id),
             ownerName: prof?.display_name?.trim() || null,
             ownerAvatarPath: prof?.avatar_path?.trim() || null,
+            storeWhatsappPhoneE164:
+              typeof raw.whatsapp_phone_e164 === "string" &&
+              raw.whatsapp_phone_e164.trim()
+                ? raw.whatsapp_phone_e164.trim()
+                : null,
+            ownerPhoneE164: prof?.phone_e164?.trim() || null,
             ownerSignupPlan: prof?.signup_plan?.trim() || null,
           };
         },
@@ -1140,8 +1383,10 @@ async function loadPlatformData(silent = false) {
 
 onMounted(() => {
   document.addEventListener("keydown", onOwnerModalKeydown);
+  document.addEventListener("visibilitychange", onOverviewVisibilityChange);
   hydrateAdminKpiHistories();
   void loadPlatformData(false);
+  startOverviewAutoplay();
   adminKpiSampleTimer = window.setInterval(() => {
     if (loading.value || !sessionUserId.value) return;
     const s = stats.value;
@@ -1150,9 +1395,9 @@ onMounted(() => {
       s.stores,
       { force: true },
     );
-    adminProductsHistory.value = recordKpiSample(
-      adminProductsHistory.value,
-      s.products,
+    adminSubscriptionNetHistory.value = recordKpiSample(
+      adminSubscriptionNetHistory.value,
+      subscriptionNetTotalPesewas.value / 100,
       { force: true },
     );
     adminTicketsHistory.value = recordKpiSample(
@@ -1272,6 +1517,104 @@ function closeRevokeConfirm() {
   revokeConfirmUser.value = null;
 }
 
+const overviewSlides = [
+  { title: "Subscription cashflow", subtitle: "Paid vs fees trend" },
+  { title: "Shop pipeline", subtitle: "Owners, plans and catalog" },
+  { title: "Paid subscription sellers", subtitle: "Sellers on starter, growth and pro" },
+] as const;
+
+const overviewSlideProgressPct = computed(() =>
+  Math.max(0, Math.min(100, (overviewAutoplayElapsedMs.value / OVERVIEW_AUTOPLAY_MS) * 100)),
+);
+
+const overviewCurrentSlide = computed(
+  () => overviewSlides[overviewSlideIndex.value] ?? overviewSlides[0],
+);
+
+function resetOverviewAutoplayProgress() {
+  overviewAutoplayElapsedMs.value = 0;
+}
+
+function setOverviewSlide(idx: number) {
+  const count = overviewSlides.length;
+  const normalized = ((idx % count) + count) % count;
+  overviewSlideIndex.value = normalized;
+  resetOverviewAutoplayProgress();
+}
+
+function nextOverviewSlide() {
+  setOverviewSlide(overviewSlideIndex.value + 1);
+}
+
+function prevOverviewSlide() {
+  setOverviewSlide(overviewSlideIndex.value - 1);
+}
+
+function startOverviewAutoplay() {
+  if (overviewAutoplayTimer != null) return;
+  overviewAutoplayTimer = window.setInterval(() => {
+    if (overviewAutoplayPaused.value) return;
+    overviewAutoplayElapsedMs.value += 100;
+    if (overviewAutoplayElapsedMs.value >= OVERVIEW_AUTOPLAY_MS) {
+      nextOverviewSlide();
+    }
+  }, 100);
+}
+
+function stopOverviewAutoplay() {
+  if (overviewAutoplayTimer != null) {
+    clearInterval(overviewAutoplayTimer);
+    overviewAutoplayTimer = null;
+  }
+}
+
+function pauseOverviewAutoplay() {
+  overviewAutoplayPaused.value = true;
+}
+
+function resumeOverviewAutoplay() {
+  overviewAutoplayPaused.value = false;
+}
+
+function onOverviewVisibilityChange() {
+  if (document.hidden) {
+    pauseOverviewAutoplay();
+    return;
+  }
+  resumeOverviewAutoplay();
+}
+
+function onOverviewKeydown(e: KeyboardEvent) {
+  if (e.key === "ArrowRight") {
+    e.preventDefault();
+    nextOverviewSlide();
+  } else if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    prevOverviewSlide();
+  }
+}
+
+function onOverviewTouchStart(e: TouchEvent) {
+  overviewTouchStartX.value = e.changedTouches[0]?.clientX ?? null;
+  pauseOverviewAutoplay();
+}
+
+function onOverviewTouchEnd(e: TouchEvent) {
+  const start = overviewTouchStartX.value;
+  overviewTouchStartX.value = null;
+  const end = e.changedTouches[0]?.clientX ?? null;
+  if (start == null || end == null) {
+    resumeOverviewAutoplay();
+    return;
+  }
+  const dx = end - start;
+  if (Math.abs(dx) >= 40) {
+    if (dx < 0) nextOverviewSlide();
+    else prevOverviewSlide();
+  }
+  resumeOverviewAutoplay();
+}
+
 async function confirmRevokeConsoleAccess() {
   const u = revokeConfirmUser.value;
   if (!u || revokeBusy.value || !isSupabaseConfigured()) return;
@@ -1333,7 +1676,7 @@ async function confirmRevokeConsoleAccess() {
               <p
                 class="min-w-0 flex-1 text-3xl font-bold tabular-nums leading-[0.95] tracking-tight text-zinc-900 sm:text-4xl sm:leading-[0.92] lg:text-[2.35rem] lg:leading-[0.92]"
               >
-                {{ card.value }}
+                {{ card.valueDisplay }}
               </p>
               <div
                 class="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl bg-white/85 shadow-md shadow-zinc-900/10 ring-1 ring-white/95 sm:h-14 sm:w-14 sm:rounded-[1.1rem]"
@@ -1354,7 +1697,7 @@ async function confirmRevokeConsoleAccess() {
                   />
                 </svg>
                 <svg
-                  v-else-if="card.key === 'products'"
+                  v-else-if="card.key === 'subscriptionNet'"
                   class="h-7 w-7 text-sky-700 sm:h-8 sm:w-8"
                   fill="none"
                   viewBox="0 0 24 24"
@@ -1364,7 +1707,7 @@ async function confirmRevokeConsoleAccess() {
                   <path
                     stroke-linecap="round"
                     stroke-linejoin="round"
-                    d="M20.25 7.5l-.625 10.5a2.25 2.25 0 01-2.247 2.118H6.622a2.25 2.25 0 01-2.247-2.118L3.75 7.5M10 11.25h4M3.375 7.5h17.25c.621 0 1.125-.504 1.125-1.125v-1.5c0-.621-.504-1.125-1.125-1.125H3.375c-.621 0-1.125.504-1.125 1.125v1.5c0 .621.504 1.125 1.125 1.125z"
+                    d="M2.25 12a9.75 9.75 0 0019.5 0 9.75 9.75 0 00-19.5 0zM14.25 9.75a2.25 2.25 0 00-4.5 0c0 .88.505 1.64 1.24 2.01.734.37 1.24 1.13 1.24 2.01v.48m0 0h.008v.008h-.008v-.008z"
                   />
                 </svg>
                 <svg
@@ -1412,6 +1755,12 @@ async function confirmRevokeConsoleAccess() {
               </div>
             </div>
             <p
+              v-if="card.valueSecondary"
+              class="mt-1 text-[11px] font-medium tabular-nums text-zinc-600/90"
+            >
+              {{ card.valueSecondary }}
+            </p>
+            <p
               class="mt-2 inline-flex w-fit rounded-full px-2.5 py-1 text-[11px] font-semibold sm:mt-2.5"
               :class="card.pillClass"
             >
@@ -1426,14 +1775,15 @@ async function confirmRevokeConsoleAccess() {
 
             <div class="mt-auto space-y-1.5 pt-3 sm:pt-4">
               <div
+                v-if="card.showShare"
                 class="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
               >
                 <span>Share of row total</span>
                 <span class="tabular-nums text-zinc-700">
-                  {{ shareOfCombinedPct(card.value) }}% ·
+                  {{ shareOfCombinedPct(card.shareValue) }}% ·
                   <span
                     class="font-mono normal-case font-semibold text-zinc-600"
-                    >{{ card.value }}</span
+                    >{{ card.shareValue }}</span
                   >
                   <span class="normal-case font-medium">/</span>
                   <span
@@ -1442,13 +1792,25 @@ async function confirmRevokeConsoleAccess() {
                   >
                 </span>
               </div>
+              <div
+                v-else
+                class="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500"
+              >
+                <span>Current position</span>
+                <span class="tabular-nums text-zinc-700">
+                  Net of all paid subscriptions after fees
+                </span>
+              </div>
               <p class="text-[10px] font-medium text-zinc-500">
-                Live trend (48h, this browser) · hover chart for time &amp;
-                value
+                {{
+                  card.key === "subscriptionNet"
+                    ? "Live trend (48h, this browser) in GHS"
+                    : "Live trend (48h, this browser) · hover chart for time & value"
+                }}
               </p>
               <div
                 class="h-[6.5rem] w-full shrink-0 sm:h-28 lg:h-[7.25rem]"
-                :aria-label="`${card.label} count over time`"
+                :aria-label="`${card.label} trend over time`"
               >
                 <DashboardKpiTimeChart
                   :points="kpiPointsFor(card.key)"
@@ -1459,7 +1821,7 @@ async function confirmRevokeConsoleAccess() {
                 />
               </div>
               <p
-                v-if="rowTotal > 0"
+                v-if="card.showShare && rowTotal > 0"
                 class="text-[10px] leading-snug text-zinc-500"
               >
                 Row total =
@@ -1469,18 +1831,88 @@ async function confirmRevokeConsoleAccess() {
                 (stores + products + open tickets + console users). Share is
                 this metric’s fraction of that sum.
               </p>
-              <p v-else class="text-[10px] leading-snug text-zinc-500">
+              <p
+                v-else-if="card.showShare"
+                class="text-[10px] leading-snug text-zinc-500"
+              >
                 All headline counts are zero — combined total is 0.
               </p>
             </div>
           </li>
         </ul>
 
-        <section
-          class="relative isolate w-full min-w-0 shrink-0 overflow-hidden rounded-2xl border border-white/55 bg-gradient-to-br from-white/50 via-emerald-50/[0.22] to-lime-100/[0.28] p-4 shadow-[0_24px_48px_-18px_rgba(6,95,70,0.14),inset_0_1px_0_rgba(255,255,255,0.72)] ring-1 ring-white/35 backdrop-blur-2xl sm:rounded-3xl sm:p-5"
-          aria-label="Seller subscription cashflow"
-          :title="`Net after fees: ${formatGhs(subscriptionNetTotalPesewas)}`"
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <p
+              class="text-xs font-semibold uppercase tracking-[0.14em] text-zinc-500"
+            >
+              Overview slides
+            </p>
+            <p class="mt-1 text-sm font-semibold text-zinc-900">
+              {{ overviewCurrentSlide.title }}
+            </p>
+            <p class="text-xs text-zinc-600">
+              {{ overviewCurrentSlide.subtitle }}
+            </p>
+          </div>
+          <div class="flex items-center gap-2">
+            <span
+              class="inline-flex h-10 min-w-[3.5rem] items-center justify-center rounded-full border border-white/70 bg-white/80 px-3 text-sm font-bold tabular-nums text-zinc-700 shadow-[0_8px_24px_-12px_rgba(15,23,42,0.35),inset_0_1px_0_rgba(255,255,255,0.95)] backdrop-blur-md"
+              aria-live="polite"
+            >
+              {{ overviewSlideIndex + 1 }}/{{ overviewSlides.length }}
+            </span>
+            <button
+              type="button"
+              class="inline-flex h-10 w-10 items-center justify-center rounded-none border border-emerald-700 bg-emerald-600 text-3xl font-bold leading-none text-white shadow-[0_8px_20px_-10px_rgba(5,150,105,0.7)] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-800"
+              aria-label="Previous slide"
+              @mouseenter="pauseOverviewAutoplay"
+              @mouseleave="resumeOverviewAutoplay"
+              @click="prevOverviewSlide"
+            >
+              <span aria-hidden="true">‹</span>
+            </button>
+            <button
+              type="button"
+              class="inline-flex h-10 w-10 items-center justify-center rounded-none border border-emerald-700 bg-emerald-600 text-3xl font-bold leading-none text-white shadow-[0_8px_20px_-10px_rgba(5,150,105,0.7)] transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-800"
+              aria-label="Next slide"
+              @mouseenter="pauseOverviewAutoplay"
+              @mouseleave="resumeOverviewAutoplay"
+              @click="nextOverviewSlide"
+            >
+              <span aria-hidden="true">›</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="h-1.5 w-full overflow-hidden rounded-full bg-zinc-200/70">
+          <div
+            class="h-full rounded-full bg-gradient-to-r from-emerald-500 to-teal-500 transition-[width] duration-100"
+            :style="{ width: `${overviewSlideProgressPct}%` }"
+          />
+        </div>
+
+        <div
+          class="relative min-w-0 flex-1 min-h-[26rem]"
+          tabindex="0"
+          role="region"
+          aria-label="Platform overview carousel"
+          @keydown="onOverviewKeydown"
+          @mouseenter="pauseOverviewAutoplay"
+          @mouseleave="resumeOverviewAutoplay"
+          @focusin="pauseOverviewAutoplay"
+          @focusout="resumeOverviewAutoplay"
+          @touchstart.passive="onOverviewTouchStart"
+          @touchend.passive="onOverviewTouchEnd"
         >
+          <Transition name="overview-slide" mode="out-in">
+            <section
+              v-if="overviewSlideIndex === 0"
+              key="cashflow-slide"
+              class="relative isolate h-full w-full min-w-0 shrink-0 overflow-hidden rounded-2xl border border-white/55 bg-gradient-to-br from-white/50 via-emerald-50/[0.22] to-lime-100/[0.28] p-4 shadow-[0_24px_48px_-18px_rgba(6,95,70,0.14),inset_0_1px_0_rgba(255,255,255,0.72)] ring-1 ring-white/35 backdrop-blur-2xl sm:rounded-3xl sm:p-5"
+              aria-label="Seller subscription cashflow"
+              :title="`Net after fees: ${formatGhs(subscriptionNetTotalPesewas)}`"
+            >
           <div
             class="pointer-events-none absolute -right-20 -top-28 h-56 w-56 rounded-full bg-lime-300/[0.22] blur-3xl"
             aria-hidden="true"
@@ -1494,7 +1926,7 @@ async function confirmRevokeConsoleAccess() {
             aria-hidden="true"
           />
 
-          <div class="relative z-10">
+          <div class="relative z-10 flex h-full min-h-0 flex-col">
             <div
               class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between"
             >
@@ -1504,29 +1936,82 @@ async function confirmRevokeConsoleAccess() {
                 >
                   Subscription cashflow
                 </h2>
-                <p class="mt-1 text-xs font-medium text-zinc-600/85">
-                  Net balance
-                </p>
-                <p
-                  class="mt-1 bg-gradient-to-br from-zinc-900 via-zinc-800 to-emerald-900/90 bg-clip-text text-2xl font-bold tabular-nums tracking-tight text-transparent sm:text-3xl"
-                >
-                  {{ formatGhs(subscriptionNetTotalPesewas) }}
-                </p>
               </div>
               <div
                 class="flex shrink-0 flex-col items-stretch gap-3 sm:items-end"
               >
                 <div class="flex flex-wrap items-center justify-end gap-2">
-                  <label class="sr-only" for="subscription-cashflow-period"
-                    >Period</label
+                  <div
+                    class="inline-flex items-center rounded-full border border-white/60 bg-white/35 p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.85)] backdrop-blur-md"
+                    role="group"
+                    aria-label="Subscription cashflow period"
                   >
+                    <button
+                      type="button"
+                      class="rounded-full px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/45"
+                      :class="
+                        subscriptionCashflowPeriod === 'year'
+                          ? 'bg-white text-zinc-900 shadow-sm'
+                          : 'text-zinc-700 hover:bg-white/55'
+                      "
+                      :aria-pressed="subscriptionCashflowPeriod === 'year'"
+                      @click="subscriptionCashflowPeriod = 'year'"
+                    >
+                      This year
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded-full px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/45"
+                      :class="
+                        subscriptionCashflowPeriod === '6m'
+                          ? 'bg-white text-zinc-900 shadow-sm'
+                          : 'text-zinc-700 hover:bg-white/55'
+                      "
+                      :aria-pressed="subscriptionCashflowPeriod === '6m'"
+                      @click="subscriptionCashflowPeriod = '6m'"
+                    >
+                      Last 6 months
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded-full px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/45"
+                      :class="
+                        subscriptionCashflowPeriod === '12m'
+                          ? 'bg-white text-zinc-900 shadow-sm'
+                          : 'text-zinc-700 hover:bg-white/55'
+                      "
+                      :aria-pressed="subscriptionCashflowPeriod === '12m'"
+                      @click="subscriptionCashflowPeriod = '12m'"
+                    >
+                      Last 12 months
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded-full px-3 py-1.5 text-xs font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400/45"
+                      :class="
+                        subscriptionCashflowPeriod === '24m'
+                          ? 'bg-white text-zinc-900 shadow-sm'
+                          : 'text-zinc-700 hover:bg-white/55'
+                      "
+                      :aria-pressed="subscriptionCashflowPeriod === '24m'"
+                      @click="subscriptionCashflowPeriod = '24m'"
+                    >
+                      Last 24 months
+                    </button>
+                  </div>
                   <select
-                    id="subscription-cashflow-period"
-                    v-model="subscriptionCashflowPeriod"
-                    class="rounded-full border border-white/60 bg-white/35 px-3 py-2 text-xs font-semibold text-zinc-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.85)] outline-none ring-emerald-400/0 backdrop-blur-md transition hover:bg-white/50 focus:ring-2 focus:ring-emerald-400/35"
+                    v-if="subscriptionCashflowPeriod === 'year'"
+                    v-model.number="subscriptionCashflowYear"
+                    class="rounded-full border border-white/60 bg-white/70 px-3 py-1.5 text-xs font-semibold text-zinc-800 shadow-[inset_0_1px_0_rgba(255,255,255,0.85)] outline-none ring-emerald-400/0 backdrop-blur-md transition hover:bg-white focus:ring-2 focus:ring-emerald-400/35"
+                    aria-label="Select subscription cashflow year"
                   >
-                    <option value="year">This year</option>
-                    <option value="6m">Last 6 months</option>
+                    <option
+                      v-for="y in subscriptionCashflowYearOptions"
+                      :key="`cashflow-year-${y}`"
+                      :value="y"
+                    >
+                      {{ y }}
+                    </option>
                   </select>
                   <span
                     class="inline-flex items-center gap-1.5 rounded-full border border-emerald-300/45 bg-emerald-500/[0.14] px-2.5 py-1 text-[10px] font-bold uppercase tracking-wide text-emerald-950 shadow-[inset_0_1px_0_rgba(255,255,255,0.45)] backdrop-blur-md"
@@ -1568,17 +2053,20 @@ async function confirmRevokeConsoleAccess() {
                 </div>
               </div>
             </div>
-            <div class="mt-5">
+            <div class="mt-5 min-h-0 flex-1">
               <AdminSubscriptionCashflowChart
                 :months="subscriptionCashflowMonths"
+                class="h-full"
               />
             </div>
           </div>
-        </section>
+            </section>
 
-        <div
-          class="flex min-h-[16rem] flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/60 bg-white shadow-[0_28px_70px_-40px_rgba(15,23,42,0.18)] sm:min-h-[17rem] sm:rounded-3xl md:min-h-0"
-        >
+            <div
+              v-else-if="overviewSlideIndex === 1"
+              key="pipeline-slide"
+              class="flex h-full min-h-[16rem] w-full min-w-0 flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-zinc-200/60 bg-white shadow-[0_28px_70px_-40px_rgba(15,23,42,0.18)] sm:min-h-[17rem] sm:rounded-3xl md:min-h-0"
+            >
           <div
             class="flex shrink-0 items-center justify-between gap-3 border-b border-zinc-100 px-5 py-4 sm:px-6"
           >
@@ -1724,6 +2212,202 @@ async function confirmRevokeConsoleAccess() {
               platform.
             </p>
           </div>
+            </div>
+
+            <section
+              v-else
+              key="paid-subscription-sellers-slide"
+              class="flex h-full min-h-[16rem] w-full min-w-0 flex-1 flex-col overflow-hidden rounded-[1.75rem] border border-emerald-200/60 bg-gradient-to-br from-white to-emerald-50/35 shadow-[0_28px_70px_-40px_rgba(6,95,70,0.18)] sm:min-h-[17rem] sm:rounded-3xl md:min-h-0"
+            >
+              <div
+                class="flex shrink-0 items-center justify-between gap-3 border-b border-emerald-100/80 px-5 py-4 sm:px-6"
+              >
+                <div class="min-w-0">
+                  <h2 class="text-lg font-bold text-zinc-900">
+                    Paid subscription sellers
+                  </h2>
+                  <p class="mt-0.5 text-xs text-zinc-600">
+                    Starter, Growth and Pro accounts
+                  </p>
+                </div>
+                <span
+                  class="inline-flex items-center rounded-full border border-emerald-200/80 bg-emerald-100/70 px-3 py-1 text-xs font-semibold text-emerald-800"
+                >
+                  {{ paidSubscriptionSellerRows.length }} sellers
+                </span>
+              </div>
+
+              <template v-if="paidSubscriptionSellerRows.length">
+                <div
+                  class="min-h-0 flex-1 overflow-y-auto overflow-x-auto overscroll-y-contain"
+                >
+                  <table
+                    class="min-w-full border-collapse text-left text-sm ring-1 ring-inset ring-emerald-200/70"
+                  >
+                    <thead class="sticky top-0 z-[1]">
+                      <tr
+                        class="border-b border-emerald-200/80 bg-emerald-50/85 text-xs font-semibold uppercase tracking-wider text-emerald-900/75 backdrop-blur-sm"
+                      >
+                        <th
+                          class="border-r border-emerald-200/70 px-5 py-3 sm:px-6 last:border-r-0"
+                        >
+                          Seller
+                        </th>
+                        <th class="border-r border-emerald-200/70 px-3 py-3">
+                          Plan
+                        </th>
+                        <th class="border-r border-emerald-200/70 px-3 py-3">
+                          Stores
+                        </th>
+                        <th class="border-r border-emerald-200/70 px-3 py-3">
+                          Amount Paid
+                        </th>
+                        <th class="border-r border-emerald-200/70 px-3 py-3">
+                          Date Paid
+                        </th>
+                        <th class="border-r border-emerald-200/70 px-3 py-3">
+                          Channel Used
+                        </th>
+                        <th class="border-r border-emerald-200/70 px-3 py-3">
+                          Expiry Date
+                        </th>
+                        <th class="px-5 py-3 sm:px-6">Phone Number</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr
+                        v-for="row in paidSubscriptionSellerRows"
+                        :key="`paid-seller-${row.ownerId}`"
+                        class="border-b border-emerald-100/70 bg-white/90 transition last:border-b-0 hover:bg-emerald-50/50"
+                      >
+                        <td
+                          class="border-r border-emerald-100/70 px-5 py-4 font-semibold text-zinc-900 sm:px-6 last:border-r-0"
+                        >
+                          <div
+                            class="flex min-w-0 max-w-[20rem] items-center gap-3"
+                          >
+                            <span
+                              class="relative flex h-10 w-10 shrink-0 overflow-hidden rounded-full text-sm font-bold text-white shadow-sm ring-2 ring-white/90"
+                              :class="
+                                row.ownerAvatarUrl
+                                  ? 'bg-white'
+                                  : 'bg-gradient-to-br from-emerald-500 to-teal-600'
+                              "
+                            >
+                              <span
+                                class="absolute inset-0 flex items-center justify-center"
+                                aria-hidden="true"
+                                >{{ row.ownerInitial }}</span
+                              >
+                              <img
+                                v-if="row.ownerAvatarUrl"
+                                :src="row.ownerAvatarUrl"
+                                alt=""
+                                class="relative z-10 h-full w-full bg-white object-cover"
+                                loading="lazy"
+                                @error="
+                                  ($event.target as HTMLImageElement).classList.add(
+                                    'hidden',
+                                  )
+                                "
+                              />
+                            </span>
+                            <span class="min-w-0 truncate">{{
+                              row.ownerName
+                            }}</span>
+                          </div>
+                        </td>
+                        <td
+                          class="border-r border-emerald-100/70 px-3 py-4 text-sm font-medium text-zinc-800 last:border-r-0"
+                        >
+                          <span
+                            class="inline-flex rounded-full border border-emerald-200/80 bg-emerald-100/70 px-2.5 py-1 text-xs font-semibold text-emerald-800"
+                          >
+                            {{ row.subscriptionPlanLabel }}
+                          </span>
+                        </td>
+                        <td
+                          class="border-r border-emerald-100/70 px-3 py-4 text-zinc-800 last:border-r-0"
+                        >
+                          <span
+                            v-if="row.storeCount === 1"
+                            class="block max-w-[14rem] truncate font-medium text-zinc-900"
+                            :title="pipelineStoresCell(row)"
+                            >{{ pipelineStoresCell(row) }}</span
+                          >
+                          <span v-else class="tabular-nums text-zinc-700">{{
+                            row.storeCount
+                          }}</span>
+                        </td>
+                        <td
+                          class="border-r border-emerald-100/70 px-3 py-4 tabular-nums text-zinc-700 last:border-r-0"
+                        >
+                          {{
+                            row.latestPaidAmountPesewas != null
+                              ? formatGhs(row.latestPaidAmountPesewas)
+                              : "—"
+                          }}
+                        </td>
+                        <td
+                          class="border-r border-emerald-100/70 px-3 py-4 text-zinc-700 last:border-r-0"
+                        >
+                          {{ formatDateLabel(row.latestPaidAt) }}
+                        </td>
+                        <td
+                          class="border-r border-emerald-100/70 px-3 py-4 text-zinc-700 last:border-r-0"
+                        >
+                          {{ paymentChannelLabel(row.latestPaymentChannel) }}
+                        </td>
+                        <td
+                          class="border-r border-emerald-100/70 px-3 py-4 text-zinc-700 last:border-r-0"
+                        >
+                          {{ formatDateLabel(row.latestExpiryAt) }}
+                        </td>
+                        <td class="px-5 py-4 text-zinc-700 sm:px-6">
+                          {{ row.ownerPhoneE164?.trim() || "—" }}
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </template>
+
+              <div
+                v-else
+                class="flex min-h-0 flex-1 flex-col items-center justify-center px-6 py-14 text-center md:py-8"
+              >
+                <p class="text-lg font-semibold text-zinc-900">
+                  No paid subscription sellers yet
+                </p>
+                <p class="mt-2 text-sm text-zinc-600">
+                  Sellers on Starter, Growth, or Pro will appear here.
+                </p>
+              </div>
+            </section>
+          </Transition>
+        </div>
+
+        <div
+          class="flex items-center justify-center gap-2"
+          role="tablist"
+          aria-label="Overview slides"
+        >
+          <button
+            v-for="(slide, idx) in overviewSlides"
+            :key="slide.title"
+            type="button"
+            class="h-2.5 w-2.5 rounded-full transition"
+            :class="
+              overviewSlideIndex === idx
+                ? 'w-6 bg-emerald-600'
+                : 'bg-zinc-300 hover:bg-zinc-400'
+            "
+            :aria-pressed="overviewSlideIndex === idx"
+            :aria-label="`Go to ${slide.title} slide`"
+            @mouseenter="pauseOverviewAutoplay"
+            @mouseleave="resumeOverviewAutoplay"
+            @click="setOverviewSlide(idx)"
+          />
         </div>
       </div>
 
@@ -1774,6 +2458,45 @@ async function confirmRevokeConsoleAccess() {
           <p class="mt-1 text-sm leading-relaxed text-zinc-600">
             Everyone with access to this admin workspace.
           </p>
+          <div
+            v-if="authStore.isSuperAdmin"
+            class="mt-3 rounded-2xl border border-emerald-200/70 bg-emerald-50/65 p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.7)]"
+          >
+            <div class="flex items-start justify-between gap-2">
+              <div>
+                <p class="text-[11px] font-semibold uppercase tracking-wider text-emerald-900/80">
+                  Arkesel SMS balance
+                </p>
+                <p class="mt-1 text-xl font-bold tabular-nums text-emerald-900">
+                  {{
+                    smsBalanceUnits != null
+                      ? smsBalanceUnits.toLocaleString()
+                      : "—"
+                  }}
+                </p>
+                <p class="mt-0.5 text-[11px] text-emerald-900/70">
+                  {{ smsBalanceLoading ? "Refreshing..." : "Units remaining" }}
+                </p>
+              </div>
+              <button
+                type="button"
+                class="inline-flex h-8 items-center justify-center rounded-md border border-emerald-300/70 bg-white/80 px-2.5 text-xs font-semibold text-emerald-800 transition hover:bg-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                :disabled="smsBalanceLoading"
+                @click="void loadSmsBalance(false)"
+              >
+                {{ smsBalanceLoading ? "..." : "Refresh" }}
+              </button>
+            </div>
+            <p
+              v-if="smsBalanceFetchedAt"
+              class="mt-2 text-[11px] text-emerald-900/70"
+            >
+              Last checked: {{ formatDateTimeLabel(smsBalanceFetchedAt) }}
+            </p>
+            <p v-if="smsBalanceError" class="mt-2 text-[11px] text-rose-700">
+              {{ smsBalanceError }}
+            </p>
+          </div>
           <p
             class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-snug text-zinc-500"
           >
@@ -2545,6 +3268,23 @@ async function confirmRevokeConsoleAccess() {
 .admin-owner-stores-drawer-enter-from,
 .admin-owner-stores-drawer-leave-to {
   transform: translateX(100%);
+}
+
+.overview-slide-enter-active,
+.overview-slide-leave-active {
+  transition:
+    opacity 0.22s ease,
+    transform 0.22s ease;
+}
+
+.overview-slide-enter-from {
+  opacity: 0;
+  transform: translateX(16px);
+}
+
+.overview-slide-leave-to {
+  opacity: 0;
+  transform: translateX(-16px);
 }
 
 .owner-stores-scroll {

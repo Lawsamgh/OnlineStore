@@ -1,4 +1,4 @@
-import { createClient } from '@supabase/supabase-js'
+import { createClient } from 'npm:@supabase/supabase-js'
 import { sendSellerPlanRenewalReminderEmail } from '../_shared/sendSellerPlanEmail.ts'
 
 const cors = {
