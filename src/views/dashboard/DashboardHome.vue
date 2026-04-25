@@ -251,10 +251,23 @@ function openPlanPicker() {
 }
 
 function closePlanPicker() {
+  if (planCheckoutBusy.value) return;
   planPickerOpen.value = false;
 }
 
 const paystackPlanVerifyBusy = ref(false);
+const planCheckoutBusy = ref(false);
+const planCheckoutPlanId = ref<string | null>(null);
+const planCheckoutBusyPlan = computed(
+  () =>
+    planPickerPlans.value.find((p) => p.id === planCheckoutPlanId.value) ?? null,
+);
+const planCheckoutBusyLabel = computed(() => {
+  if (!planCheckoutBusy.value) return "";
+  return (planCheckoutBusyPlan.value?.monthlyGhs ?? 0) > 0
+    ? "Redirecting to Paystack..."
+    : "Applying plan...";
+});
 
 function paystackReturnReference(): string {
   const raw = route.query.reference ?? route.query.trxref;
@@ -326,72 +339,82 @@ async function consumePaystackPlanReturn() {
 }
 
 async function choosePlanAndDismiss(planId: string) {
+  if (planCheckoutBusy.value) return;
   const plan = pricingPlans.value.find((p) => p.id === planId);
   if (!plan) return;
+  let leavingForPaystack = false;
+  planCheckoutBusy.value = true;
+  planCheckoutPlanId.value = plan.id;
 
-  closePlanPicker();
-  await nextTick();
-
-  if (!isSupabaseConfigured()) {
-    toast.error("Sign in is required to change your plan.");
-    return;
-  }
-  if (!auth.user) {
-    toast.error("Sign in required.");
-    return;
-  }
-
-  const sb = getSupabaseBrowser();
-
-  if (plan.id === "free") {
-    const { error } = await sb.auth.updateUser({
-      data: { ...auth.user.user_metadata, signup_plan: "free" },
-    });
-    if (error) {
-      toast.error(error.message);
+  try {
+    if (!isSupabaseConfigured()) {
+      toast.error("Sign in is required to change your plan.");
       return;
     }
-    await auth.refreshSessionFromSupabase();
-    toast.success("You are on the Free plan.");
-    await router.replace({ name: "dashboard", query: {} });
-    return;
-  }
+    if (!auth.user) {
+      toast.error("Sign in required.");
+      return;
+    }
 
-  if (plan.monthlyGhs <= 0) return;
+    const sb = getSupabaseBrowser();
 
-  const prep = await refreshSessionForEdgeFunctions(sb);
-  if (!prep.ok) {
-    toast.error(prep.message);
-    return;
-  }
-  auth.syncSession(prep.session);
-  const { data, error } = await sb.functions.invoke("paystack-init", {
-    body: { plan_id: plan.id },
-    headers: prep.headers,
-  });
-  if (error) {
-    const bodyErr =
-      data && typeof data === "object" && "error" in data
-        ? String((data as { error?: unknown }).error ?? "")
+    if (plan.id === "free") {
+      const { error } = await sb.auth.updateUser({
+        data: { ...auth.user.user_metadata, signup_plan: "free" },
+      });
+      if (error) {
+        toast.error(error.message);
+        return;
+      }
+      await auth.refreshSessionFromSupabase();
+      toast.success("You are on the Free plan.");
+      closePlanPicker();
+      await router.replace({ name: "dashboard", query: {} });
+      return;
+    }
+
+    if (plan.monthlyGhs <= 0) return;
+
+    const prep = await refreshSessionForEdgeFunctions(sb);
+    if (!prep.ok) {
+      toast.error(prep.message);
+      return;
+    }
+    auth.syncSession(prep.session);
+    const { data, error } = await sb.functions.invoke("paystack-init", {
+      body: { plan_id: plan.id },
+      headers: prep.headers,
+    });
+    if (error) {
+      const bodyErr =
+        data && typeof data === "object" && "error" in data
+          ? String((data as { error?: unknown }).error ?? "")
+          : "";
+      toast.error(
+        bodyErr ||
+          formatFunctionsInvokeError(error, "paystack-init") ||
+          "Could not start checkout.",
+      );
+      return;
+    }
+    const url =
+      data && typeof data === "object" && "authorization_url" in data
+        ? String(
+            (data as { authorization_url?: unknown }).authorization_url ?? "",
+          )
         : "";
-    toast.error(
-      bodyErr ||
-        formatFunctionsInvokeError(error, "paystack-init") ||
-        "Could not start checkout.",
-    );
-    return;
+    if (!url) {
+      toast.error("Could not start checkout.");
+      return;
+    }
+    leavingForPaystack = true;
+    window.location.assign(url);
+  } finally {
+    if (!leavingForPaystack) {
+      planCheckoutBusy.value = false;
+      planCheckoutPlanId.value = null;
+    }
   }
-  const url =
-    data && typeof data === "object" && "authorization_url" in data
-      ? String(
-          (data as { authorization_url?: unknown }).authorization_url ?? "",
-        )
-      : "";
-  if (!url) {
-    toast.error("Could not start checkout.");
-    return;
-  }
-  window.location.assign(url);
 }
 
 watch(
@@ -499,16 +522,19 @@ function onPlanPickerDocKeydown(e: KeyboardEvent) {
   if (!planPickerOpen.value) return;
   if (e.key === "Escape") {
     e.preventDefault();
+    if (planCheckoutBusy.value) return;
     closePlanPicker();
     return;
   }
   if (e.key === "ArrowLeft") {
     e.preventDefault();
+    if (planCheckoutBusy.value) return;
     planSlidePrev();
     return;
   }
   if (e.key === "ArrowRight") {
     e.preventDefault();
+    if (planCheckoutBusy.value) return;
     planSlideNext();
   }
 }
@@ -2377,6 +2403,8 @@ onUnmounted(() => {
               type="button"
               class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-zinc-200/90 bg-white text-zinc-500 shadow-sm transition hover:border-zinc-300 hover:bg-zinc-50 hover:text-zinc-900"
               aria-label="Close"
+              :disabled="planCheckoutBusy"
+              :class="planCheckoutBusy ? 'cursor-not-allowed opacity-50' : ''"
               @click="closePlanPicker"
             >
               <svg
@@ -2407,7 +2435,7 @@ onUnmounted(() => {
                   type="button"
                   class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-zinc-200/90 bg-zinc-50 text-zinc-700 shadow-sm transition hover:border-indigo-200 hover:bg-white hover:text-indigo-900 disabled:pointer-events-none disabled:opacity-30"
                   aria-label="Previous plan"
-                  :disabled="planSlideIndex <= 0"
+                  :disabled="planCheckoutBusy || planSlideIndex <= 0"
                   @click="planSlidePrev"
                 >
                   <svg
@@ -2435,6 +2463,7 @@ onUnmounted(() => {
                     :key="`dot-${p.id}`"
                     type="button"
                     role="tab"
+                    :disabled="planCheckoutBusy"
                     :aria-selected="i === planSlideIndex"
                     :aria-label="`Show ${p.name} plan`"
                     class="h-2 rounded-full transition-all duration-300 ease-out"
@@ -2450,7 +2479,7 @@ onUnmounted(() => {
                   type="button"
                   class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-zinc-200/90 bg-zinc-50 text-zinc-700 shadow-sm transition hover:border-indigo-200 hover:bg-white hover:text-indigo-900 disabled:pointer-events-none disabled:opacity-30"
                   aria-label="Next plan"
-                  :disabled="planSlideIndex >= planSlideCount - 1"
+                  :disabled="planCheckoutBusy || planSlideIndex >= planSlideCount - 1"
                   @click="planSlideNext"
                 >
                   <svg
@@ -2639,15 +2668,25 @@ onUnmounted(() => {
             >
               <button
                 type="button"
-                class="w-full rounded-full py-3 text-center text-sm font-semibold transition active:scale-[0.99]"
+                class="inline-flex w-full items-center justify-center gap-2 rounded-full py-3 text-center text-sm font-semibold transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-70"
                 :class="
                   activePlanSlide.highlighted
                     ? 'bg-zinc-900 text-white hover:bg-zinc-800'
                     : 'border border-zinc-200 bg-white text-zinc-900 hover:bg-zinc-50'
                 "
+                :disabled="planCheckoutBusy"
                 @click="choosePlanAndDismiss(activePlanSlide.id)"
               >
-                Choose {{ activePlanSlide.name }}
+                <span
+                  v-if="planCheckoutBusy"
+                  class="h-4 w-4 animate-spin rounded-full border-2 border-current border-r-transparent"
+                  aria-hidden="true"
+                />
+                {{
+                  planCheckoutBusy
+                    ? planCheckoutBusyLabel
+                    : `Choose ${activePlanSlide.name}`
+                }}
               </button>
             </div>
 
