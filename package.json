@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.103.3",
+    "@unhead/vue": "^3.1.0",
     "echarts": "^6.0.0",
     "pinia": "^3.0.4",
     "qrcode": "^1.5.4",

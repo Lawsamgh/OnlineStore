@@ -1,10 +1,24 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref } from "vue";
+import { useHead } from "@unhead/vue";
 import { RouterLink, useRouter } from "vue-router";
 import PricingPlanCard from "../components/marketing/PricingPlanCard.vue";
 import { useAuthStore } from "../stores/auth";
 import { usePlanPricingSettings } from "../composables/usePlanPricingSettings";
 import happySellerPhone from "../assets/marketing/happy-seller-phone.webp";
+
+useHead({
+  title: "UandITech — Your branded seller storefront",
+  meta: [
+    { name: "description", content: "Create your branded online storefront with cart, checkout, and delivery updates. Built for Ghanaian sellers — share one link on Instagram, SMS, or any social channel." },
+    { property: "og:type", content: "website" },
+    { property: "og:title", content: "UandITech — Your branded seller storefront" },
+    { property: "og:description", content: "Create your branded online storefront with cart, checkout, and delivery updates. Built for Ghanaian sellers." },
+    { name: "twitter:card", content: "summary_large_image" },
+    { name: "twitter:title", content: "UandITech — Your branded seller storefront" },
+    { name: "twitter:description", content: "Create your branded online storefront with cart, checkout, and delivery updates. Built for Ghanaian sellers." },
+  ],
+});
 
 const auth = useAuthStore();
 const router = useRouter();

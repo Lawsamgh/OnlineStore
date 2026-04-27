@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
+import { useHead } from '@unhead/vue'
 import { useRoute } from 'vue-router'
 import { getSupabaseBrowser, isSupabaseConfigured } from '../../lib/supabase'
 import { formatGhs } from '../../lib/formatMoney'
@@ -349,6 +350,26 @@ const whatsappProductLinks = computed(() => {
 })
 
 const storefrontTheme = computed(() => resolveStoreThemeTokens(store.value ?? {}))
+
+useHead(computed(() => {
+  const s = store.value
+  const title = s ? `${s.name} — Shop on UandITech` : 'UandITech Store'
+  const description = s?.description?.trim()
+    ? s.description.trim()
+    : s ? `Browse products at ${s.name}. Cart and checkout available.` : ''
+  return {
+    title,
+    meta: [
+      { name: 'description', content: description },
+      { property: 'og:type', content: 'website' },
+      { property: 'og:title', content: title },
+      { property: 'og:description', content: description },
+      { name: 'twitter:card', content: 'summary_large_image' },
+      { name: 'twitter:title', content: title },
+      { name: 'twitter:description', content: description },
+    ],
+  }
+}))
 
 // ── Auto category icon ─────────────────────────────────────────────────────
 // Ordered from most-specific to most-general so earlier rules win.
